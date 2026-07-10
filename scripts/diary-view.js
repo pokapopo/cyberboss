@@ -62,12 +62,12 @@ function parseEntries(raw) {
   let current = null;
 
   for (const line of lines) {
-    const h2 = line.match(/^##\s+(\d{1,2}:\d{2})\s+(.+)/);
+    const h2 = line.match(/^##\s+(\d{1,2}:\d{2})(?:\s+(.+))?/);
     if (h2) {
       if (current) {
         entries.push(current);
       }
-      current = { time: h2[1], title: h2[2], body: [] };
+      current = { time: h2[1], title: h2[2] || "", body: [] };
       continue;
     }
     if (current && line.trim()) {
@@ -91,12 +91,10 @@ function renderPage(date, entries) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>日记 - ${date}</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,500;0,600;1,500&family=Noto+Serif+SC:wght@400;500;600&display=swap');
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    font-family: "Noto Serif SC", "STSong", "SimSun", Georgia, serif;
+    font-family: "Noto Serif CJK SC", "STSong", "SimSun", serif;
     background: #f5f0e8;
     color: #3a3226;
     padding: 48px 32px 48px 64px;
@@ -145,7 +143,7 @@ function renderPage(date, entries) {
   }
 
   .date-cn {
-    font-family: "Noto Serif SC", "STSong", serif;
+    font-family: "Noto Serif CJK SC", serif;
     font-size: 20px;
     font-weight: 500;
     color: #4a3f32;
@@ -154,7 +152,7 @@ function renderPage(date, entries) {
   }
 
   .date-en {
-    font-family: "Playfair Display", Georgia, serif;
+    font-family: "Noto Serif CJK SC", serif;
     font-size: 12px;
     font-style: italic;
     color: #a09080;
@@ -176,7 +174,7 @@ function renderPage(date, entries) {
   }
 
   .entry-time {
-    font-family: "Playfair Display", Georgia, serif;
+    font-family: "Noto Serif CJK SC", serif;
     font-size: 12px;
     color: #b0a090;
     font-style: italic;
@@ -184,7 +182,7 @@ function renderPage(date, entries) {
   }
 
   .entry-title {
-    font-family: "Noto Serif SC", "STSong", serif;
+    font-family: "Noto Serif CJK SC", serif;
     font-size: 15px;
     font-weight: 600;
     color: #8b4a3a;
@@ -200,7 +198,7 @@ function renderPage(date, entries) {
     margin-top: 48px;
     padding-top: 16px;
     text-align: right;
-    font-family: "Playfair Display", Georgia, serif;
+    font-family: "Noto Serif CJK SC", serif;
     font-size: 13px;
     font-style: italic;
     color: #a09080;
@@ -211,7 +209,6 @@ function renderPage(date, entries) {
     color: #b0a090;
     padding: 60px 0;
     font-size: 14px;
-    font-style: italic;
   }
 </style>
 </head>

@@ -70,6 +70,7 @@ function readConfig() {
     visionApiBaseUrl: readTextEnv("CYBERBOSS_VISION_API_BASE_URL"),
     visionApiKey: readTextEnv("CYBERBOSS_VISION_API_KEY"),
     visionModel: readTextEnv("CYBERBOSS_VISION_MODEL"),
+    visionPrompt: readTextEnv("CYBERBOSS_VISION_PROMPT"),
     visionTimeoutMs: readIntEnv("CYBERBOSS_VISION_TIMEOUT_MS") || 30_000,
     claudeCommand: readTextEnv("CYBERBOSS_CLAUDE_COMMAND") || "claude",
     claudeModel: readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "",

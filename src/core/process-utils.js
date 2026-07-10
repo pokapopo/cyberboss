@@ -21,8 +21,11 @@ function killPidTree(pid) {
       return false;
     }
   }
+  // SIGKILL is non-catchable and guaranteed to terminate the process.
+  // SIGTERM can be caught/ignored — a process stuck in MCP I/O may survive it,
+  // leaving the turn gate locked forever. Always use SIGKILL on Linux.
   try {
-    process.kill(numeric, "SIGTERM");
+    process.kill(numeric, "SIGKILL");
     return true;
   } catch {
     return false;

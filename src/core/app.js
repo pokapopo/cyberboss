@@ -53,6 +53,9 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
 const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
 const MAX_RETRY_COUNT = 3;
+// Safety net: if a turn gate has been locked for >5 min, force-release it.
+// Normal turn timeout is 120s; 5 min gives ample margin for close() retries.
+const STUCK_GATE_MAX_AGE_MS = 300_000;
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -149,6 +152,7 @@ class CyberbossApp {
     console.log(`[cyberboss] syncBuffer=${syncBuffer ? "ready" : "empty"}`);
     console.log(`[cyberboss] runtimeEndpoint=${runtimeState.endpoint || runtimeState.command || "(spawn)"}`);
     console.log(`[cyberboss] runtimeModels=${runtimeState.models?.length || 0}`);
+    console.log(`[cyberboss] vision: mode=${this.config.visionMode} provider=${this.config.visionProvider} baseUrl=${this.config.visionApiBaseUrl || "(empty)"} model=${this.config.visionModel || "(empty)"}`);
     if (this.config.startWithLocationServer) {
       await this.ensureLocationServerStarted();
     }
@@ -189,6 +193,17 @@ class CyberbossApp {
             this.flushPendingSystemMessages(),
             this.flushPendingTimelineScreenshots(account),
           ]);
+          // Safety net: force-release any turn gate that has been stuck
+          // beyond STUCK_GATE_MAX_AGE_MS.  Under normal operation the
+          // 120 s turn timeout handles this, but if the child process
+          // survives SIGKILL or another bug prevents normal release,
+          // this prevents permanent deadlock of ALL message processing.
+          const stuckReleased = this.turnGateStore.releaseStuckScopes(STUCK_GATE_MAX_AGE_MS);
+          if (stuckReleased > 0) {
+            console.error(
+              `[cyberboss] stuck-gate watchdog: force-released ${stuckReleased} scope(s) stuck >${STUCK_GATE_MAX_AGE_MS / 1000}s`
+            );
+          }
           const response = await this.channelAdapter.getUpdates({
             syncBuffer: this.channelAdapter.loadSyncBuffer(),
             timeoutMs: this.resolveLongPollTimeoutMs(),
@@ -569,12 +584,23 @@ class CyberbossApp {
         attachments: [],
       };
     }
+    const attachments = Array.isArray(prepared?.attachments) ? prepared.attachments : [];
+    const imageCount = attachments.filter((item) => item?.kind === "image" || item?.isImage || String(item?.contentType || "").startsWith("image/")).length;
+    if (imageCount > 0) {
+      console.log(`[cyberboss] vision: processing ${imageCount} image(s) mode=${this.config.visionMode} provider=${this.config.visionProvider} model=${this.config.visionModel || "(empty)"}`);
+    }
     const visionContext = await resolveVisionContext({
       prepared,
       config: this.config,
       runtimeAdapter: this.runtimeAdapter,
       model,
     });
+    if (imageCount > 0) {
+      console.log(`[cyberboss] vision: route=${visionContext.route} items=${visionContext.items?.length || 0} errors=${visionContext.errors?.length || 0}`);
+      for (const err of (visionContext.errors || [])) {
+        console.error(`[cyberboss] vision: error source=${err.sourceFileName || err.absolutePath || "?"} reason=${err.reason}`);
+      }
+    }
     return {
       text: assembleRuntimeTurnText({
         prepared,
@@ -891,6 +917,7 @@ class CyberbossApp {
       return buildInboundDraft(normalized);
     }
 
+    console.log(`[cyberboss] attachment: downloading ${attachments.length} attachment(s) kinds=${attachments.map(a => a.kind || '?').join(',')}`);
     const persisted = await persistIncomingWeixinAttachments({
       attachments,
       stateDir: this.config.stateDir,
@@ -899,6 +926,7 @@ class CyberbossApp {
       receivedAt: normalized.receivedAt,
     });
 
+    console.log(`[cyberboss] attachment: download result saved=${persisted.saved.length} failed=${persisted.failed.length}`);
     if (!persisted.saved.length && persisted.failed.length && !String(normalized.text || "").trim()) {
       await this.channelAdapter.sendText({
         userId: normalized.senderId,

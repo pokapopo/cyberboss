@@ -1,7 +1,7 @@
 const fs = require("fs/promises");
 
 const DEFAULT_VISION_TIMEOUT_MS = 30_000;
-const DEFAULT_VISION_PROMPT = "Describe this image concisely for a text-only assistant. Include visible text, people, objects, scene context, and whether it looks like a reusable chat sticker.";
+const DEFAULT_VISION_PROMPT = "Describe this image for a text-only assistant. If the image contains text (screenshots, documents, charts, star charts, UI, tables, etc.), copy every piece of text verbatim — do not summarize, do not omit numbers, labels, or data. Preserve the original wording exactly. If the image is a photo or scene, describe people, objects, setting, colors, and mood as precisely as possible. End with: whether this looks like a reusable chat sticker.";
 
 async function resolveVisionContext({ prepared, config = {}, runtimeAdapter = null, model = "" }) {
   const attachments = Array.isArray(prepared?.attachments) ? prepared.attachments : [];
@@ -100,7 +100,7 @@ async function captionImageWithOpenAiCompatibleProvider({ image, config }) {
       messages: [{
         role: "user",
         content: [
-          { type: "text", text: DEFAULT_VISION_PROMPT },
+          { type: "text", text: config.visionPrompt || DEFAULT_VISION_PROMPT },
           { type: "image_url", image_url: { url: dataUrl } },
         ],
       }],

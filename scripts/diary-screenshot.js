@@ -22,7 +22,7 @@ async function main() {
 
   const browser = await chromium.launch({
     headless: true,
-    channel: "msedge",
+    channel: "chromium",
   });
   try {
     const page = await browser.newPage({
