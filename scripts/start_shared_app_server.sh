@@ -1,7 +1,7 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="${0:A:h:h}"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${CYBERBOSS_SHARED_PORT:-8765}"
 LISTEN_URL="ws://127.0.0.1:${PORT}"
 STATE_DIR="${CYBERBOSS_STATE_DIR:-$HOME/.cyberboss}"

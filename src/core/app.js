@@ -1603,11 +1603,6 @@ class CyberbossApp {
       ].join("\n"),
       contextToken: normalized.contextToken,
     });
-    await this.channelAdapter.sendFile({
-      userId: normalized.senderId,
-      filePath: path.join(__dirname, "../../assets/star-guide.jpg"),
-      contextToken: normalized.contextToken,
-    }).catch(() => {});
   }
 
   async handleHelpCommand(normalized) {

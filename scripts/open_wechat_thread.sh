@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 PORT="${CYBERBOSS_SHARED_PORT:-8765}"

@@ -118,8 +118,12 @@ function killStalePidIfSafe(pidFile) {
   // 两个检查都通过，旧进程还活着且不是父进程，杀掉
   console.log(`[cyberboss] 发现残留主进程 PID ${oldPid}，正在清理...`);
   try {
-    const { execFileSync } = require("child_process");
-    execFileSync("taskkill", ["/F", "/T", "/PID", String(oldPid)], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      const { execFileSync } = require("child_process");
+      execFileSync("taskkill", ["/F", "/T", "/PID", String(oldPid)], { stdio: "ignore" });
+    } else {
+      process.kill(oldPid, "SIGKILL");
+    }
     console.log(`[cyberboss] 已清理残留进程 PID ${oldPid}`);
   } catch (e) {
     // 杀失败不崩，继续启动

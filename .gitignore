@@ -10,3 +10,6 @@ firmware/
 .tmp/
 crash-ck.txt
 temp/
+.vscode/
+cheatsheet-gaoshu.txt
+tmp-cdn-probe.js
