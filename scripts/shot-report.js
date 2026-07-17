@@ -13,7 +13,7 @@ async function main() {
   const outputPath = htmlPath.replace(/\.html$/, ".png");
   const url = "file:///" + htmlPath.replace(/\\/g, "/");
 
-  const browser = await chromium.launch({ headless: true, channel: "msedge" });
+  const browser = await chromium.launch({ headless: true, channel: "chromium" });
   try {
     const page = await browser.newPage({ viewport: { width: 560, height: 900 }, deviceScaleFactor: 2 });
     await page.goto(url, { waitUntil: "networkidle" });
