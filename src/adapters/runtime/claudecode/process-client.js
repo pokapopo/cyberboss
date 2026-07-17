@@ -477,7 +477,7 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
   if (!disableVerbose) {
     args.push("--verbose");
   }
-  args.push("--extended-thinking");
+  args.push("--max-thinking-tokens", "31999");
   if (permissionMode && permissionMode !== "default") {
     args.push("--permission-mode", permissionMode);
   }
