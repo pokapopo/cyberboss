@@ -50,6 +50,7 @@ function buildInstructionRefreshText(config) {
 
 function loadWechatInstructions(config = {}) {
   const persona = loadInstructionFile(config.weixinInstructionsFile, config);
+  const context = loadInstructionFile(config.weixinContextFile, config);
   const operations = loadInstructionFile(config.weixinOperationsFile, config);
   const sections = [];
   if (persona) {
@@ -57,6 +58,9 @@ function loadWechatInstructions(config = {}) {
   }
   if (operations) {
     sections.push(operations);
+  }
+  if (context) {
+    sections.push(context);
   }
   return sections.join("\n\n").trim();
 }
