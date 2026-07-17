@@ -305,12 +305,6 @@ class ClaudeCodeProcessClient {
         ? `unknown control_request subtype: ${request.subtype}`
         : "unknown control_request without subtype";
       console.error(`[claudecode-runtime] ${reason} — auto-denying`);
-      try {
-        require("fs").appendFileSync(
-          "D:/cyberboss-app/crash-ck.txt",
-          `${Date.now()} control_request auto-deny subtype=${request.subtype || "(none)"} requestId=${raw.request_id}\n`
-        );
-      } catch {}
       this.sendResponse(raw.request_id, { decision: "decline" }).catch(() => {});
       return;
     }
@@ -483,6 +477,7 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
   if (!disableVerbose) {
     args.push("--verbose");
   }
+  args.push("--extended-thinking");
   if (permissionMode && permissionMode !== "default") {
     args.push("--permission-mode", permissionMode);
   }

@@ -11,6 +11,18 @@ const WEIXIN_MEDIA_TYPE = {
   FILE: 3,
 };
 
+// WeChat's c2c CDN (novac2c) is optimized for mainland networks. From a
+// non-mainland host, a fraction of its edge nodes intermittently reject the
+// upload with HTTP 500 / x-error-code -5104001. Each attempt re-runs
+// getUploadUrl for fresh params (avoids duplicate-param rejection) and opens a
+// new connection, so retrying lands on a different node and usually succeeds.
+const CDN_UPLOAD_MAX_ATTEMPTS = Math.max(1, Number(process.env.CYBERBOSS_WEIXIN_CDN_MAX_ATTEMPTS) || 8);
+const CDN_UPLOAD_ATTEMPT_TIMEOUT_MS = Math.max(1000, Number(process.env.CYBERBOSS_WEIXIN_CDN_ATTEMPT_TIMEOUT_MS) || 30000);
+const CDN_UPLOAD_BACKOFF_BASE_MS = 300;
+const CDN_UPLOAD_BACKOFF_CAP_MS = 2000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function encryptAesEcb(plaintext, key) {
   const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);
@@ -24,16 +36,20 @@ function buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey }) {
   return `${cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
 }
 
-async function uploadBufferToCdn({ buf, uploadParam, filekey, cdnBaseUrl, aeskey }) {
+async function uploadBufferToCdn({ buf, uploadParam, filekey, cdnBaseUrl, aeskey, signal }) {
   const ciphertext = encryptAesEcb(buf, aeskey);
   const cdnUrl = buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey });
   const response = await fetch(cdnUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: { "Content-Type": "application/octet-stream", Connection: "close" },
     body: new Uint8Array(ciphertext),
+    signal,
   });
   if (response.status !== 200) {
-    const errMsg = response.headers.get("x-error-message") || await response.text();
+    const errMsg =
+      response.headers.get("x-error-message") ||
+      response.headers.get("x-error-code") ||
+      (await response.text());
     throw new Error(`CDN upload failed: ${errMsg || response.status}`);
   }
   const downloadParam = response.headers.get("x-encrypted-param") || "";
@@ -43,11 +59,7 @@ async function uploadBufferToCdn({ buf, uploadParam, filekey, cdnBaseUrl, aeskey
   return { downloadParam };
 }
 
-async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, mediaType }) {
-  const plaintext = await fs.readFile(filePath);
-  const rawsize = plaintext.length;
-  const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
-  const filesize = aesEcbPaddedSize(rawsize);
+async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType }) {
   const filekey = crypto.randomBytes(16).toString("hex");
   const aeskey = crypto.randomBytes(16);
 
@@ -68,20 +80,46 @@ async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, media
     throw new Error("getUploadUrl returned no upload_param");
   }
 
-  const { downloadParam } = await uploadBufferToCdn({
-    buf: plaintext,
-    uploadParam,
-    filekey,
-    cdnBaseUrl,
-    aeskey,
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CDN_UPLOAD_ATTEMPT_TIMEOUT_MS);
+  try {
+    const { downloadParam } = await uploadBufferToCdn({
+      buf: plaintext,
+      uploadParam,
+      filekey,
+      cdnBaseUrl,
+      aeskey,
+      signal: controller.signal,
+    });
+    return {
+      downloadEncryptedQueryParam: downloadParam,
+      aeskey: aeskey.toString("hex"),
+      fileSize: rawsize,
+      fileSizeCiphertext: filesize,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-  return {
-    downloadEncryptedQueryParam: downloadParam,
-    aeskey: aeskey.toString("hex"),
-    fileSize: rawsize,
-    fileSizeCiphertext: filesize,
-  };
+async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, mediaType }) {
+  const plaintext = await fs.readFile(filePath);
+  const rawsize = plaintext.length;
+  const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
+  const filesize = aesEcbPaddedSize(rawsize);
+
+  let lastErr;
+  for (let attempt = 1; attempt <= CDN_UPLOAD_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < CDN_UPLOAD_MAX_ATTEMPTS) {
+        await sleep(Math.min(CDN_UPLOAD_BACKOFF_BASE_MS * attempt, CDN_UPLOAD_BACKOFF_CAP_MS));
+      }
+    }
+  }
+  throw new Error(`CDN upload failed after ${CDN_UPLOAD_MAX_ATTEMPTS} attempts: ${lastErr?.message || "unknown"}`);
 }
 
 function buildMediaRef(uploaded) {

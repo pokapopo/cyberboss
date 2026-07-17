@@ -465,19 +465,15 @@ class CyberbossApp {
 
   scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId, turnId }) {
     this.clearTurnTimeout(threadId);
-    try {
-      require("fs").appendFileSync(
-        "D:/cyberboss-app/crash-ck.txt",
-        `${Date.now()} turn-timeout-armed threadId=${threadId} turnId=${turnId}\n`
-      );
-    } catch {}
+    const turnTimeoutMs = (() => {
+      const raw = Number(process.env.CYBERBOSS_TURN_TIMEOUT_MS);
+      return Number.isFinite(raw) && raw >= 0 ? raw : 600_000;
+    })();
+    if (turnTimeoutMs <= 0) {
+      // Disabled via CYBERBOSS_TURN_TIMEOUT_MS=0 — no turn watchdog.
+      return;
+    }
     const timeout = setTimeout(async () => {
-      try {
-        require("fs").appendFileSync(
-          "D:/cyberboss-app/crash-ck.txt",
-          `${Date.now()} turn-timeout-FIRED threadId=${threadId} turnId=${turnId}\n`
-        );
-      } catch {}
       console.error(`[cyberboss] turn timeout thread=${threadId} turn=${turnId} — cancelling`);
       try {
         await this.runtimeAdapter.cancelTurn({ threadId, turnId, workspaceRoot });
@@ -492,22 +488,16 @@ class CyberbossApp {
       this.turnTimeouts.delete(threadId);
       this.threadStateStore.applyRuntimeEvent({
         type: "runtime.turn.failed",
-        payload: { threadId, turnId, text: "❌ Turn timed out (2 min)" },
+        payload: { threadId, turnId, text: `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
       });
       await this.flushPendingInboundMessages({ bindingKey, workspaceRoot, ignoreBoundary: true }).catch(() => {});
-    }, 120_000);
+    }, turnTimeoutMs);
     this.turnTimeouts.set(threadId, timeout);
   }
 
   clearTurnTimeout(threadId) {
     const timeout = this.turnTimeouts.get(threadId);
     if (timeout) {
-      try {
-        require("fs").appendFileSync(
-          "D:/cyberboss-app/crash-ck.txt",
-          `${Date.now()} turn-timeout-cleared threadId=${threadId}\n`
-        );
-      } catch {}
       clearTimeout(timeout);
       this.turnTimeouts.delete(threadId);
     }
@@ -1330,6 +1320,30 @@ class CyberbossApp {
     }
   }
 
+  async _autoCompactIfNeeded(threadId, linked) {
+    const contextWindow = Number(this.config.claudeContextWindow) || 200000;
+    const reservedOutput = Math.max(0, Number(this.config.claudeMaxOutputTokens) || 0);
+    const availableWindow = contextWindow - reservedOutput;
+    if (availableWindow <= 0) return;
+    const threadState = this.threadStateStore.getThreadState(threadId);
+    const currentTokens = threadState?.context?.currentTokens;
+    if (!Number.isFinite(currentTokens)) return;
+    const usageRatio = currentTokens / availableWindow;
+    if (usageRatio < 0.70) return;
+    if (!this._lastAutoCompactAt) this._lastAutoCompactAt = new Map();
+    const lastCompact = this._lastAutoCompactAt.get(threadId) || 0;
+    if (Date.now() - lastCompact < 600000) return; // 10 min cooldown
+    this._lastAutoCompactAt.set(threadId, Date.now());
+    const sessionStore = this.runtimeAdapter.getSessionStore();
+    const runtimeParams = sessionStore.getRuntimeParamsForWorkspace(linked.bindingKey, linked.workspaceRoot);
+    console.error(`[cyberboss] auto-compact triggered thread=${threadId} usage=${Math.round(usageRatio * 100)}% tokens=${currentTokens}/${availableWindow}`);
+    this.runtimeAdapter.compactThread({
+      threadId,
+      workspaceRoot: linked.workspaceRoot,
+      model: runtimeParams.model,
+    }).catch(err => console.error('[cyberboss] auto-compact failed:', err.message));
+  }
+
   async handleSwitchCommand(normalized, command) {
     const targetThreadId = normalizeThreadId(command.args);
     if (!targetThreadId) {
@@ -1507,15 +1521,9 @@ class CyberbossApp {
       this.runtimeAdapter.getSessionStore().rememberApprovalPrefixForWorkspace(workspaceRoot, approval.commandTokens);
     }
     this.threadStateStore.resolveApproval(threadId, "running");
-    // Re-arm 2-min orphan kill timer after manual approval so post-approval tool execution is protected
+    // Re-arm turn timeout after manual approval so post-approval tool execution is protected
     const resolvedState = this.threadStateStore.getThreadState(threadId);
     if (resolvedState?.turnId && bindingKey && workspaceRoot) {
-      try {
-        require("fs").appendFileSync(
-          "D:/cyberboss-app/crash-ck.txt",
-          `${Date.now()} re-arm-turn-timeout manual-approve threadId=${threadId} turnId=${resolvedState.turnId}\n`
-        );
-      } catch {}
       this.scheduleTurnTimeout({
         bindingKey,
         workspaceRoot,
@@ -1672,6 +1680,10 @@ class CyberbossApp {
             contextToken: pendingOperation.contextToken,
           }).catch(() => {});
         }
+        // Auto-compact: when context usage exceeds threshold, compact silently
+        if (event.type === "runtime.turn.completed" && linked?.bindingKey && linked?.workspaceRoot) {
+          await this._autoCompactIfNeeded(event.payload.threadId, linked);
+        }
         const shouldKeepTyping = linked?.bindingKey && linked?.workspaceRoot
           ? (
             this.turnGateStore.isPending(linked.bindingKey, linked.workspaceRoot)
@@ -1738,15 +1750,9 @@ class CyberbossApp {
     }
     await this.runtimeAdapter.respondApproval(approvalResponse).catch(() => {});
     this.threadStateStore.resolveApproval(event.payload.threadId, "running");
-    // Re-arm 2-min orphan kill timer after auto-approval so post-approval tool execution is protected
+    // Re-arm turn timeout after auto-approval so post-approval tool execution is protected
     const resolvedState = this.threadStateStore.getThreadState(event.payload.threadId);
     if (resolvedState?.turnId && linked?.bindingKey && linked?.workspaceRoot) {
-      try {
-        require("fs").appendFileSync(
-          "D:/cyberboss-app/crash-ck.txt",
-          `${Date.now()} re-arm-turn-timeout auto-approve threadId=${event.payload.threadId} turnId=${resolvedState.turnId}\n`
-        );
-      } catch {}
       this.scheduleTurnTimeout({
         bindingKey: linked.bindingKey,
         workspaceRoot: linked.workspaceRoot,
