@@ -7,17 +7,37 @@ const fs = require("fs");
  * - 每条新消息重置计时
  * - 从第一条消息入队开始计时，超过 maxWaitMs 强制 flush 不再重置
  * - setTimeout 回调内包 try-catch，异常写 crashLogPath
- * - destroy() 清理所有 timer（shutdown 时调用）
+ * - onFlush 失败时保留队列重试（最多 3 次，指数退避）
+ * - destroy() 先 flush 所有积压队列再清理（shutdown 时不丢消息）
  *
  * 带有 attachments 或以 "/" 开头（命令）的消息不进入队列，
  * 返回 { enqueued: false } 让调用方透传；如果此时队列非空则先 flush 积压文本。
  */
 function createMessageDebouncer({ timeoutMs, maxWaitMs, onFlush, crashLogPath }) {
   const pending = new Map();
+  const MAX_RETRIES = 3;
 
   function destroy() {
-    for (const entry of pending.values()) {
+    // Flush all pending queues before clearing — don't lose messages on shutdown
+    const entries = [...pending.entries()];
+    for (const [userId, entry] of entries) {
       if (entry.timer) clearTimeout(entry.timer);
+      pending.delete(userId);
+      const { queue, normalized } = entry;
+      const mergedText = queue.join("\n");
+      console.log(`[cyberboss] debounce destroy-flush userId=${userId} queueLen=${queue.length} text="${mergedText.slice(0, 80)}"`);
+      onFlush({ ...normalized, text: mergedText, attachments: [] }).catch((error) => {
+        const message = error?.stack || error?.message || String(error);
+        console.error(`[cyberboss] debounce destroy-flush failed userId=${userId}: ${message}`);
+        try {
+          fs.appendFileSync(
+            crashLogPath,
+            `[${new Date().toISOString()}] message-debounce destroy-flush: ${message}\n`
+          );
+        } catch {
+          // ignore
+        }
+      });
     }
     pending.clear();
   }
@@ -37,14 +57,39 @@ function createMessageDebouncer({ timeoutMs, maxWaitMs, onFlush, crashLogPath })
         await onFlush({ ...normalized, text: mergedText, attachments: [] });
       } catch (error) {
         const message = error?.stack || error?.message || String(error);
-        console.error(`[cyberboss] debounce timer error: ${message}`);
+        console.error(`[cyberboss] debounce timer error (retry ${entry.retries}/${MAX_RETRIES}): ${message}`);
         try {
           fs.appendFileSync(
             crashLogPath,
             `[${new Date().toISOString()}] message-debounce timer: ${message}\n`
           );
         } catch {
-          // 写 crash.log 失败只能吞掉
+          // ignore
+        }
+        // Re-enqueue for retry instead of silently dropping
+        if (entry.retries < MAX_RETRIES) {
+          entry.retries += 1;
+          const backoffMs = timeoutMs * Math.pow(2, entry.retries);
+          pending.set(userId, entry);
+          console.log(`[cyberboss] debounce RETRY userId=${userId} retry=${entry.retries} backoffMs=${backoffMs}`);
+          entry.timer = setTimeout(() => {
+            const current = pending.get(userId);
+            if (!current) return;
+            pending.delete(userId);
+            const retryText = current.queue.join("\n");
+            onFlush({ ...current.normalized, text: retryText, attachments: [] }).catch((retryError) => {
+              const retryMsg = retryError?.stack || retryError?.message || String(retryError);
+              console.error(`[cyberboss] debounce retry failed userId=${userId}: ${retryMsg}`);
+              try {
+                fs.appendFileSync(
+                  crashLogPath,
+                  `[${new Date().toISOString()}] message-debounce retry exhausted: ${retryMsg}\n`
+                );
+              } catch {
+                // ignore
+              }
+            });
+          }, backoffMs);
         }
       }
     }, timeoutMs);
@@ -95,7 +140,7 @@ function createMessageDebouncer({ timeoutMs, maxWaitMs, onFlush, crashLogPath })
 
     if (!existing) {
       console.log(`[cyberboss] debounce enqueue FIRST userId=${userId} text="${rawText.slice(0, 40)}"`);
-      const entry = { queue: [rawText], timer: null, firstAt: Date.now(), normalized };
+      const entry = { queue: [rawText], timer: null, firstAt: Date.now(), normalized, retries: 0 };
       pending.set(userId, entry);
       startTimer(userId);
       return { enqueued: true };
@@ -118,6 +163,7 @@ function createMessageDebouncer({ timeoutMs, maxWaitMs, onFlush, crashLogPath })
     console.log(`[cyberboss] debounce enqueue RESET userId=${userId} queueLen=${existing.queue.length + 1} text="${rawText.slice(0, 40)}"`);
     existing.queue.push(rawText);
     existing.normalized = normalized;
+    existing.retries = 0; // reset retry count on new message
     clearTimeout(existing.timer);
     startTimer(userId);
     return { enqueued: true };
