@@ -745,6 +745,13 @@ function resolveSystemReplyDelivery(replyText, policy = createSystemReplyPolicy(
     return resolveSystemReplyAction(source.text);
   }
 
+  // Fallback: extract the last valid JSON action from mixed text
+  // (e.g. when streaming produces commentary before the JSON response)
+  const extracted = extractSystemActionJsonCandidate(source.text);
+  if (extracted) {
+    return resolveSystemReplyAction(extracted);
+  }
+
   if (!policy.allowPlainTextSendMessage) {
     return { kind: "invalid", reason: "final reply is not a JSON object" };
   }

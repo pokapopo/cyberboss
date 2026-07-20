@@ -17,9 +17,26 @@ const WEIXIN_MEDIA_TYPE = {
 // getUploadUrl for fresh params (avoids duplicate-param rejection) and opens a
 // new connection, so retrying lands on a different node and usually succeeds.
 const CDN_UPLOAD_MAX_ATTEMPTS = Math.max(1, Number(process.env.CYBERBOSS_WEIXIN_CDN_MAX_ATTEMPTS) || 8);
-const CDN_UPLOAD_ATTEMPT_TIMEOUT_MS = Math.max(1000, Number(process.env.CYBERBOSS_WEIXIN_CDN_ATTEMPT_TIMEOUT_MS) || 30000);
+const CDN_UPLOAD_ATTEMPT_BASE_TIMEOUT_MS = 30_000;
+// Bytes-per-second floor used to scale per-attempt timeout with file size.
+// Empirical test from US VPS → WeChat CDN: ~65 KB/s on good nodes.
+// Use 30 KB/s to give 2× headroom for bad nodes.
+const CDN_UPLOAD_MIN_BYTES_PER_SEC = 30 * 1024;
 const CDN_UPLOAD_BACKOFF_BASE_MS = 300;
 const CDN_UPLOAD_BACKOFF_CAP_MS = 2000;
+
+// WeChat ilink bot approximate limits. Set generously — the real bottleneck
+// is the US→China CDN upload, not WeChat's server-side cap.
+const WEIXIN_MAX_IMAGE_BYTES = 100 * 1024 * 1024;
+const WEIXIN_MAX_VIDEO_BYTES = 100 * 1024 * 1024;
+const WEIXIN_MAX_FILE_BYTES = 100 * 1024 * 1024;
+
+function resolveCdnUploadTimeoutMs(fileSize) {
+  const envOverride = Number(process.env.CYBERBOSS_WEIXIN_CDN_ATTEMPT_TIMEOUT_MS);
+  if (Number.isFinite(envOverride) && envOverride > 0) return Math.max(1000, envOverride);
+  const scaled = Math.ceil((fileSize || 0) / CDN_UPLOAD_MIN_BYTES_PER_SEC) * 1000;
+  return Math.max(CDN_UPLOAD_ATTEMPT_BASE_TIMEOUT_MS, scaled);
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -59,7 +76,7 @@ async function uploadBufferToCdn({ buf, uploadParam, filekey, cdnBaseUrl, aeskey
   return { downloadParam };
 }
 
-async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType }) {
+async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType, timeoutMs }) {
   const filekey = crypto.randomBytes(16).toString("hex");
   const aeskey = crypto.randomBytes(16);
 
@@ -81,7 +98,7 @@ async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, to
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CDN_UPLOAD_ATTEMPT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const { downloadParam } = await uploadBufferToCdn({
       buf: plaintext,
@@ -105,13 +122,24 @@ async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, to
 async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, mediaType }) {
   const plaintext = await fs.readFile(filePath);
   const rawsize = plaintext.length;
+
+  // Fail fast when file exceeds WeChat's known limits.
+  const limit = mediaType === WEIXIN_MEDIA_TYPE.IMAGE ? WEIXIN_MAX_IMAGE_BYTES
+    : mediaType === WEIXIN_MEDIA_TYPE.VIDEO ? WEIXIN_MAX_VIDEO_BYTES
+    : WEIXIN_MAX_FILE_BYTES;
+  if (rawsize > limit) {
+    const limitMB = Math.round(limit / (1024 * 1024));
+    throw new Error(`File too large for WeChat: ${Math.round(rawsize / 1024)} KB exceeds ${limitMB} MB limit`);
+  }
+
   const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
   const filesize = aesEcbPaddedSize(rawsize);
+  const timeoutMs = resolveCdnUploadTimeoutMs(rawsize);
 
   let lastErr;
   for (let attempt = 1; attempt <= CDN_UPLOAD_MAX_ATTEMPTS; attempt++) {
     try {
-      return await uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType });
+      return await uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType, timeoutMs });
     } catch (err) {
       lastErr = err;
       if (attempt < CDN_UPLOAD_MAX_ATTEMPTS) {

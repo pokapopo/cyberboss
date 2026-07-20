@@ -17,29 +17,33 @@ function createMessageDebouncer({ timeoutMs, maxWaitMs, onFlush, crashLogPath })
   const pending = new Map();
   const MAX_RETRIES = 3;
 
-  function destroy() {
+  async function destroy() {
     // Flush all pending queues before clearing — don't lose messages on shutdown
     const entries = [...pending.entries()];
+    const flushes = [];
     for (const [userId, entry] of entries) {
       if (entry.timer) clearTimeout(entry.timer);
       pending.delete(userId);
       const { queue, normalized } = entry;
       const mergedText = queue.join("\n");
       console.log(`[cyberboss] debounce destroy-flush userId=${userId} queueLen=${queue.length} text="${mergedText.slice(0, 80)}"`);
-      onFlush({ ...normalized, text: mergedText, attachments: [] }).catch((error) => {
-        const message = error?.stack || error?.message || String(error);
-        console.error(`[cyberboss] debounce destroy-flush failed userId=${userId}: ${message}`);
-        try {
-          fs.appendFileSync(
-            crashLogPath,
-            `[${new Date().toISOString()}] message-debounce destroy-flush: ${message}\n`
-          );
-        } catch {
-          // ignore
-        }
-      });
+      flushes.push(
+        onFlush({ ...normalized, text: mergedText, attachments: [] }).catch((error) => {
+          const message = error?.stack || error?.message || String(error);
+          console.error(`[cyberboss] debounce destroy-flush failed userId=${userId}: ${message}`);
+          try {
+            fs.appendFileSync(
+              crashLogPath,
+              `[${new Date().toISOString()}] message-debounce destroy-flush: ${message}\n`
+            );
+          } catch {
+            // ignore
+          }
+        })
+      );
     }
     pending.clear();
+    await Promise.all(flushes);
   }
 
   function startTimer(userId) {

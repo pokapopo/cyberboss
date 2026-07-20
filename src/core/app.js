@@ -90,6 +90,7 @@ class CyberbossApp {
     this.turnTimeouts = new Map();
     this.messageDebouncer = null;
     this.systemMessageDispatcher = null;
+    this.pendingUserContexts = new Map();
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
@@ -177,7 +178,7 @@ class CyberbossApp {
     console.log("[cyberboss] message-debounce: timeoutMs=5000 maxWaitMs=30000");
 
     const shutdown = createShutdownController(async () => {
-      this.messageDebouncer?.destroy();
+      await this.messageDebouncer?.destroy();
       this.clearPendingImageInboundTimers();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -538,6 +539,7 @@ class CyberbossApp {
         senderId: prepared.senderId,
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
+      this.pendingUserContexts.set(turn.threadId, prepared.text);
       const replyTarget = {
         userId: prepared.senderId,
         contextToken: prepared.contextToken,
@@ -553,7 +555,6 @@ class CyberbossApp {
         this.streamDelivery.queueReplyTargetForThread(turn.threadId, replyTarget);
       }
       this.scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId: turn.threadId, turnId: turn.turnId });
-      saveTurnContext(prepared.text);
       return true;
     } catch (error) {
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
@@ -1626,8 +1627,15 @@ class CyberbossApp {
         })
       : null;
     await this.streamDelivery.handleRuntimeEvent(event);
-    if (event.type === "runtime.turn.completed" && event.payload?.text) {
-      saveAssistantContext(event.payload.text);
+    if (event.type === "runtime.turn.completed") {
+      const userText = this.pendingUserContexts.get(event.payload.threadId);
+      if (userText) {
+        this.pendingUserContexts.delete(event.payload.threadId);
+        saveTurnContext(userText);
+      }
+      if (event.payload?.text) {
+        saveAssistantContext(event.payload.text);
+      }
     }
     if (!event) {
       return;
@@ -1730,6 +1738,7 @@ class CyberbossApp {
         approval: event.payload,
       }).catch((error) => {
         sessionStore.clearApprovalPrompt(event.payload.threadId);
+        this.threadStateStore.resolveApproval(event.payload.threadId, "idle");
         throw error;
       });
       return;
@@ -1740,7 +1749,9 @@ class CyberbossApp {
       await this.sendApprovalPrompt({
         bindingKey: linked.bindingKey,
         approval: event.payload,
-      }).catch(() => {});
+      }).catch(() => {
+        this.threadStateStore.resolveApproval(event.payload.threadId, "idle");
+      });
       return;
     }
     await this.runtimeAdapter.respondApproval(approvalResponse).catch(() => {});
