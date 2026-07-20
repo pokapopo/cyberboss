@@ -85,3 +85,54 @@ ck("checkpoint-label");
 3. 我还没检查过什么？
 
 回答完再决定下一步。
+
+---
+
+## VS Code Remote ExtHost Watchdog
+
+```
+/root/scripts/claude-code-watchdog.sh
+```
+
+VS Code Remote-SSH 的第一个 Extension Host 有时不会自动激活用户扩展（包括 Claude Code），导致 Code 一直不可用。Watchdog 检测到 ExtHost 启动 90 秒后仍无扩展激活时，SIGKILL 触发 VS Code Server 重建。
+
+### 运行方式
+
+`.bashrc` 中 `nohup` 启动，每次开 VS Code Remote 终端时自动拉起。脚本自带 PID 锁（`/tmp/claude-code-watchdog.lock`），保证只有一个实例。
+
+### 安全检查
+
+| 机制 | 说明 |
+|---|---|
+| PID 锁 | `LOCK_FILE` → 旧 PID 存活则静默退出，僵死则清理 |
+| `trap EXIT` | 退出时自动清锁文件 |
+| 宽限期 | 90s，给 VS Code 足够时间初始化 |
+| 冷却期 | 每次 kill 后 180s 冷却，等替换 ExtHost 激活 |
+| 上限 | 每个 watchdog 生命周期最多 kill 3 次 |
+| 去重 | 同一 PID 不重复 kill |
+| 目标范围 | 只匹配 `bootstrap-fork.*extensionHost`，不碰其他进程 |
+
+### 常见问题
+
+**开了 18 个 watchdog 实例**（已修复）：
+- 根因：`.bashrc` 每次开 shell 都 `&` spawn，无防重复机制
+- 修法：脚本加 PID 锁 → 只有第一个实例存活，后续全部静默退出
+
+**ExtHost 崩溃 ≠ watchdog 干的**：
+- 先看 ExtHost 日志：`/root/.vscode-server/data/logs/<date>/exthostN/remoteexthost.log`
+- 搜 `_doActivateExtension` 看激活数，搜 `Error` 看扩展自身报错
+- 如果日志里没有 `signal 9`/`SIGKILL`，就不是 watchdog 杀的
+- 最近一次 Copilot 扩展报 `Error: e is not iterable`，是 Copilot 自己的 bug
+
+### 手动管理
+
+```bash
+# 查看是否在跑
+cat /tmp/claude-code-watchdog.lock && kill -0 $(cat /tmp/claude-code-watchdog.lock) && echo "running" || echo "dead"
+
+# 停掉
+kill $(cat /tmp/claude-code-watchdog.lock)
+
+# 手动启动
+nohup /root/scripts/claude-code-watchdog.sh &>/dev/null &
+```

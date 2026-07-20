@@ -177,6 +177,9 @@ async function ensureSharedAppServer() {
 }
 
 function findRunningCyberbossPids() {
+  if (process.platform !== "win32") {
+    return [];
+  }
   // Step 1: get all node PIDs via tasklist (works on all Windows versions)
   const pids = new Set();
   try {
@@ -357,7 +360,7 @@ function killPidTree(pid) {
     }
   }
   try {
-    process.kill(numeric, "SIGTERM");
+    process.kill(numeric, "SIGKILL");
     return true;
   } catch {
     return false;
