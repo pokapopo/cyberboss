@@ -160,9 +160,7 @@ class CyberbossApp {
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
     if (this.config.startWithCheckin) {
       console.log("[cyberboss] checkin: enabled");
-      void runSystemCheckinPoller(this.config).catch((error) => {
-        console.error(`[cyberboss] checkin poller stopped: ${error.message}`);
-      });
+      this._startCheckinPoller();
     }
 
     const crashLogPath = path.join(os.homedir(), ".cyberboss", "crash.log");
@@ -1050,6 +1048,23 @@ class CyberbossApp {
     return this.runtimeAdapter.getSessionStore().getActiveWorkspaceRoot(bindingKey) || this.config.workspaceRoot;
   }
 
+  _startCheckinPoller() {
+    const run = async () => {
+      while (true) {
+        try {
+          await runSystemCheckinPoller(this.config);
+        } catch (error) {
+          console.error(`[cyberboss] checkin poller crashed: ${error.message}`);
+          console.error(`[cyberboss] checkin poller restarting in 30s...`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 30_000));
+      }
+    };
+    void run().catch((error) => {
+      console.error(`[cyberboss] checkin poller fatal: ${error.message}`);
+    });
+  }
+
   async dispatchSystemMessage(message) {
     const prepared = this.systemMessageDispatcher?.buildPreparedMessage(message, this.channelAdapter.getKnownContextTokens()[message.senderId] || "");
     if (!prepared) {
@@ -1675,7 +1690,6 @@ class CyberbossApp {
         } else {
           await this.flushPendingInboundMessages();
         }
-        await this.flushPendingSystemMessages();
         if (pendingOperation?.kind === "compact" && event.type === "runtime.turn.completed") {
           await this.channelAdapter.sendText({
             userId: pendingOperation.userId,
@@ -1701,6 +1715,8 @@ class CyberbossApp {
           this.turnBoundaryScopeKeys.delete(scopeKey);
         }
       }
+      // Flush system messages after boundary is cleared so they aren't blocked
+      await this.flushPendingSystemMessages();
       if (linked?.bindingKey && linked?.workspaceRoot && this.hasPendingInboundMessage(linked.bindingKey, linked.workspaceRoot)) {
         await this.flushPendingInboundMessages({
           bindingKey: linked.bindingKey,

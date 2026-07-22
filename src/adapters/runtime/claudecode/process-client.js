@@ -473,6 +473,7 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
     "--output-format", "stream-json",
     "--input-format", "stream-json",
     "--permission-prompt-tool", "stdio",
+    "--setting-sources", "user,project,local",
   ];
   if (!disableVerbose) {
     args.push("--verbose");

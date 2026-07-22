@@ -25,6 +25,13 @@ const CDN_UPLOAD_MIN_BYTES_PER_SEC = 30 * 1024;
 const CDN_UPLOAD_BACKOFF_BASE_MS = 300;
 const CDN_UPLOAD_BACKOFF_CAP_MS = 2000;
 
+// The CDN upload already succeeded — sendMessage just tells WeChat "deliver
+// this uploaded media".  A few lightweight retries here avoid throwing away an
+// expensive upload when the API call flakes.
+const SEND_MEDIA_MAX_ATTEMPTS = 3;
+const SEND_MEDIA_BACKOFF_BASE_MS = 500;
+const SEND_MEDIA_BACKOFF_CAP_MS = 4000;
+
 // WeChat ilink bot approximate limits. Set generously — the real bottleneck
 // is the US→China CDN upload, not WeChat's server-side cap.
 const WEIXIN_MAX_IMAGE_BYTES = 100 * 1024 * 1024;
@@ -159,21 +166,42 @@ function buildMediaRef(uploaded) {
 }
 
 async function sendMediaItem({ to, item, contextToken, baseUrl, token }) {
-  await sendMessage({
-    baseUrl,
-    token,
-    body: {
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: crypto.randomUUID(),
-        message_type: 2,
-        message_state: 2,
-        item_list: [item],
-        context_token: contextToken,
-      },
-    },
-  });
+  let lastError = null;
+  for (let attempt = 1; attempt <= SEND_MEDIA_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await sendMessage({
+        baseUrl,
+        token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: to,
+            client_id: crypto.randomUUID(),
+            message_type: 2,
+            message_state: 2,
+            item_list: [item],
+            context_token: contextToken,
+          },
+        },
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < SEND_MEDIA_MAX_ATTEMPTS) {
+        const backoffMs = Math.min(
+          SEND_MEDIA_BACKOFF_BASE_MS * Math.pow(2, attempt - 1),
+          SEND_MEDIA_BACKOFF_CAP_MS
+        );
+        console.warn(
+          `[cyberboss] sendMediaItem failed (attempt ${attempt}/${SEND_MEDIA_MAX_ATTEMPTS}), retrying in ${backoffMs}ms: ${error.message}`
+        );
+        await sleep(backoffMs);
+      }
+    }
+  }
+  throw new Error(
+    `sendMediaItem failed after ${SEND_MEDIA_MAX_ATTEMPTS} attempts: ${lastError?.message || "unknown"}`
+  );
 }
 
 async function sendWeixinMediaFile({ filePath, to, contextToken, baseUrl, token, cdnBaseUrl }) {

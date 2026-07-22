@@ -112,10 +112,9 @@ test("system send_message JSON may be wrapped in a json fence", async () => {
     provider: "system",
   });
 
-  await runCompletedTurn(streamDelivery, {
+  await runCompletedTurnWithResultOnly(streamDelivery, {
     threadId: "thread-2f",
     turnId: "turn-2f",
-    itemId: "item-2f",
     text: "```json\n{\"action\":\"send_message\",\"message\":\"我来看看你。\"}\n```",
   });
 
@@ -126,7 +125,7 @@ test("system send_message JSON may be wrapped in a json fence", async () => {
   }]);
 });
 
-test("codex system reply rejects plain text", async () => {
+test("codex system reply salvages plain text instead of dropping", async () => {
   const { sent, streamDelivery } = createHarness({ runtimeId: "codex" });
   streamDelivery.queueReplyTargetForThread("thread-2c", {
     userId: "user-2c",
@@ -134,14 +133,17 @@ test("codex system reply rejects plain text", async () => {
     provider: "system",
   });
 
-  await runCompletedTurn(streamDelivery, {
+  await runCompletedTurnWithResultOnly(streamDelivery, {
     threadId: "thread-2c",
     turnId: "turn-2c",
-    itemId: "item-2c",
     text: "在呢，过来摸一下你的状态。",
   });
 
-  assert.deepEqual(sent, []);
+  assert.deepEqual(sent, [{
+    userId: "user-2c",
+    text: "在呢，过来摸一下你的状态。",
+    contextToken: "ctx-2c",
+  }]);
 });
 
 test("claudecode system reply can send short safe plain text", async () => {
@@ -165,7 +167,7 @@ test("claudecode system reply can send short safe plain text", async () => {
   }]);
 });
 
-test("claudecode system plain text still rejects code and protocol fragments", async () => {
+test("claudecode system plain text rejects code fences but salvages stripped safe fragments", async () => {
   const { sent, streamDelivery } = createHarness({ runtimeId: "claudecode" });
   streamDelivery.queueReplyTargetForThread("thread-2unsafe-a", {
     userId: "user-2unsafe",
@@ -189,7 +191,13 @@ test("claudecode system plain text still rejects code and protocol fragments", a
     text: "好的。analysis to=functions.exec_command code?",
   });
 
-  assert.deepEqual(sent, []);
+  // Code fence is rejected; protocol-fragment text is stripped and the leftover
+  // safe fragment ("好的。") is salvaged instead of being dropped.
+  assert.deepEqual(sent, [{
+    userId: "user-2unsafe",
+    text: "好的。",
+    contextToken: "ctx-2unsafe",
+  }]);
 });
 
 test("explicit turn target binding overrides the binding-level fallback", async () => {

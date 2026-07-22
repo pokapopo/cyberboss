@@ -1,6 +1,38 @@
 const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol-leak-monitor");
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
+const SILENCE_FLUSH_MS = 30_000;
+
+function stripAnsi(text) {
+  return String(text || "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
+function looksLikeSystemActionJson(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return false;
+  }
+  // Only block buffering when the entire reply.completed text is a single
+  // JSON object carrying an action key — this is the final turn result,
+  // not a streaming progress update.
+  if (trimmed.indexOf("{", 1) !== -1) {
+    return false; // multiple JSON objects or nested — likely streaming commentary
+  }
+  return trimmed.includes('"action"') || trimmed.includes('"cyberboss_action"');
+}
+
+function formatToolProgressName(toolName) {
+  const name = String(toolName || "").trim();
+  if (!name) return "";
+  // Strip mcp__server__ prefix for readability
+  const stripped = name.startsWith("mcp__")
+    ? name.split("__").slice(2).join("__") || name
+    : name;
+  // Replace underscores with spaces, capitalize first letter
+  return stripped
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 class StreamDelivery {
   constructor({ channelAdapter, sessionStore, runtimeId = "", onDeferredSystemReply, systemReplyRetryScheduleMs, sameTokenRetryDelayMs }) {
@@ -138,13 +170,39 @@ class StreamDelivery {
         });
         return;
       }
+      case "runtime.tool.use": {
+        const state = this.ensureRunState(threadId, turnId);
+        state.turnId = turnId || state.turnId;
+        const provider = state.replyTarget?.provider;
+        if (provider === "weixin" || provider === "system") {
+          const label = formatToolProgressName(event.payload.toolName);
+          if (label) {
+            state.streamBuffer += (state.streamBuffer ? "\n" : "") + `🔧 ${label}`;
+            this._resetBufferTimer(state);
+          }
+        }
+        return;
+      }
       case "runtime.reply.completed": {
         const state = this.ensureRunState(threadId, turnId);
+        state.turnId = turnId || state.turnId;
         this.upsertItem(state, {
           itemId: normalizeText(event.payload.itemId) || `item-${state.itemOrder.length + 1}`,
           text: normalizeLineEndings(event.payload.text),
           completed: true,
         });
+
+        if (state.replyTarget?.provider === "system") {
+          const cleaned = stripAnsi(normalizeLineEndings(event.payload.text));
+          // Don't buffer text that looks like the final system action JSON —
+          // it belongs to turn.completed parsing, not progress push.
+          if (cleaned && !looksLikeSystemActionJson(cleaned)) {
+            state.streamBuffer += (state.streamBuffer ? "\n" : "") + cleaned;
+            this._resetBufferTimer(state);
+          }
+          return;
+        }
+
         await this.flush(state, { force: false });
         return;
       }
@@ -185,6 +243,8 @@ class StreamDelivery {
       flushPromise: null,
       sequence: this.runSequence += 1,
       threadReplyTargetAttached: false,
+      streamBuffer: "",
+      bufferTimer: null,
     };
     this.stateByRunKey.set(runKey, created);
     this.attachReplyTarget(created);
@@ -224,7 +284,13 @@ class StreamDelivery {
 
   captureTurnCompletionText(state, text) {
     const normalized = trimOuterBlankLines(normalizeLineEndings(text));
-    if (!normalized || state.itemOrder.length > 0) {
+    if (!normalized) {
+      return;
+    }
+    // System replies must capture the final turn text even when streaming
+    // items exist, because the JSON action is only in the final result.
+    const isSystem = state.replyTarget?.provider === "system";
+    if (!isSystem && state.itemOrder.length > 0) {
       return;
     }
     this.upsertItem(state, {
@@ -279,6 +345,19 @@ class StreamDelivery {
     current.completed = Boolean(completed);
   }
 
+  _resetBufferTimer(state) {
+    if (state.bufferTimer) clearTimeout(state.bufferTimer);
+    state.bufferTimer = setTimeout(() => {
+      const text = state.streamBuffer.trim();
+      state.streamBuffer = "";
+      if (text && state.replyTarget) {
+        state.sendChain = state.sendChain
+          .then(() => this.sendSystemReply(state, text))
+          .catch(() => {});
+      }
+    }, SILENCE_FLUSH_MS);
+  }
+
   async flush(state, { force }) {
     const previous = state.flushPromise || Promise.resolve();
     const current = previous
@@ -297,6 +376,22 @@ class StreamDelivery {
   async flushNow(state, { force }) {
     if (!state.replyTarget) {
       return;
+    }
+
+    // Drain progress buffer at turn completion for all providers.
+    // Synchronous reset before any async work to avoid timer races.
+    if (force) {
+      if (state.bufferTimer) {
+        clearTimeout(state.bufferTimer);
+        state.bufferTimer = null;
+      }
+      const remaining = state.streamBuffer.trim();
+      state.streamBuffer = "";
+      if (remaining) {
+        state.sendChain = state.sendChain
+          .then(() => this.sendSystemReply(state, remaining))
+          .catch(() => {});
+      }
     }
 
     if (state.replyTarget.provider === "system") {
@@ -345,15 +440,27 @@ class StreamDelivery {
       return;
     }
 
-    if (resolved.kind !== "send_message") {
+    let message;
+    if (resolved.kind === "send_message") {
+      message = resolved.message;
+    } else {
+      // Invalid structured reply — try to salvage plain text before dropping
       console.error(
         `[cyberboss] invalid system reply thread=${state.threadId} reason=${resolved.reason} preview=${JSON.stringify(replyText.slice(0, 160))}`
       );
-      return;
+      const sanitized = sanitizeReplyText(replyText);
+      if (!sanitized || sanitized.length > 280 || sanitized.split("\n").length > 3 || containsPlainTextSystemHazard(sanitized)) {
+        // Can't salvage — nothing readable or contains hazards
+        return;
+      }
+      console.warn(
+        `[cyberboss] salvaging invalid system reply as plain text thread=${state.threadId} preview=${JSON.stringify(sanitized.slice(0, 120))}`
+      );
+      message = sanitized;
     }
 
     state.sendChain = state.sendChain.then(async () => {
-      await this.sendSystemReply(state, resolved.message);
+      await this.sendSystemReply(state, message);
       this.markAllItemsSent(state);
     }).catch((error) => {
       console.error(`[cyberboss] failed to deliver system reply thread=${state.threadId}: ${error.message}`);
@@ -405,48 +512,60 @@ class StreamDelivery {
   }
 
   async sendTextWithRetry(state, payload, { kind }) {
-    const initialTarget = state.replyTarget;
-    try {
-      await this.channelAdapter.sendText(payload);
-      return;
-    } catch (error) {
-      const retryTarget = this.resolveRetriableReplyTarget(initialTarget, error);
-      if (!retryTarget) {
-        const deferred = await this.deferSystemReply(state, payload.text, error, kind);
-        if (deferred) {
-          return;
-        }
-        throw error;
-      }
-      console.warn(
-        `[cyberboss] system reply retrying with refreshed context token thread=${state.threadId} user=${retryTarget.userId}`
-      );
+    const MAX_ATTEMPTS = 3;
+    const preserveBlock = payload.preserveBlock === true;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       try {
-        const retryPayload = {
-          userId: retryTarget.userId,
-          text: payload.text,
-          contextToken: retryTarget.contextToken,
-        };
-        if (payload.preserveBlock) {
-          retryPayload.preserveBlock = true;
+        await this.channelAdapter.sendText(payload);
+        return;
+      } catch (error) {
+        lastError = error;
+
+        // Context-token failure on any attempt → refresh and retry immediately
+        const refreshTarget = this.resolveRetriableReplyTarget(state.replyTarget, error);
+        if (refreshTarget) {
+          console.warn(
+            `[cyberboss] system reply refreshing context token thread=${state.threadId} user=${refreshTarget.userId} attempt=${attempt}/${MAX_ATTEMPTS}`
+          );
+          payload = {
+            userId: refreshTarget.userId,
+            text: payload.text,
+            contextToken: refreshTarget.contextToken,
+          };
+          if (preserveBlock) {
+            payload.preserveBlock = true;
+          }
+          state.replyTarget = refreshTarget;
+          if (state.bindingKey) {
+            this.replyTargetByBindingKey.set(state.bindingKey, {
+              userId: refreshTarget.userId,
+              contextToken: refreshTarget.contextToken,
+              provider: refreshTarget.provider,
+            });
+          }
+          continue;
         }
-        await this.channelAdapter.sendText(retryPayload);
-        state.replyTarget = retryTarget;
-        if (state.bindingKey) {
-          this.replyTargetByBindingKey.set(state.bindingKey, {
-            userId: retryTarget.userId,
-            contextToken: retryTarget.contextToken,
-            provider: retryTarget.provider,
-          });
+
+        // Non-context error — backoff and retry
+        if (attempt < MAX_ATTEMPTS) {
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+          console.warn(
+            `[cyberboss] system reply send failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${backoffMs}ms thread=${state.threadId}: ${error.message}`
+          );
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
         }
-      } catch (retryError) {
-        const deferred = await this.deferSystemReply(state, payload.text, retryError, kind);
-        if (deferred) {
-          return;
-        }
-        throw retryError;
       }
     }
+
+    // All attempts exhausted — defer if possible, otherwise throw
+    const deferred = await this.deferSystemReply(state, payload.text, lastError, kind);
+    if (deferred) {
+      return;
+    }
+    throw lastError;
   }
 
   async deferSystemReply(state, text, error, kind = "plain_reply") {
@@ -504,6 +623,10 @@ class StreamDelivery {
     const normalizedRunKey = normalizeText(runKey);
     if (!normalizedRunKey) {
       return;
+    }
+    const state = this.stateByRunKey.get(normalizedRunKey);
+    if (state?.bufferTimer) {
+      clearTimeout(state.bufferTimer);
     }
     this.replyTargetByTurnKey.delete(normalizedRunKey);
     this.stateByRunKey.delete(normalizedRunKey);

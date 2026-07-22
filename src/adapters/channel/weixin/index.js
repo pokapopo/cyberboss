@@ -149,10 +149,8 @@ function createWeixinChannelAdapter(config) {
         getUpdatesBuf: syncBuffer,
         timeoutMs,
       });
-      const newBuf = typeof response?.get_updates_buf === "string" ? response.get_updates_buf.trim() : "";
-      if (newBuf && newBuf !== syncBuffer) {
-        this.saveSyncBuffer(newBuf);
-      }
+      // Persist context tokens BEFORE advancing the sync buffer so a crash
+      // between the two doesn't lose tokens for messages already consumed.
       const messages = Array.isArray(response?.msgs) ? response.msgs : [];
       for (const message of messages) {
         const userId = typeof message?.from_user_id === "string" ? message.from_user_id.trim() : "";
@@ -160,6 +158,10 @@ function createWeixinChannelAdapter(config) {
         if (userId && contextToken) {
           rememberContextToken(userId, contextToken);
         }
+      }
+      const newBuf = typeof response?.get_updates_buf === "string" ? response.get_updates_buf.trim() : "";
+      if (newBuf && newBuf !== syncBuffer) {
+        this.saveSyncBuffer(newBuf);
       }
       return response;
     },
@@ -344,43 +346,46 @@ function packChunksForWeixinDelivery(chunks, maxMessages = 10, maxChunkChars = 3
     return normalizedChunks;
   }
 
-  const packed = normalizedChunks.slice(0, Math.max(0, maxMessages - 1));
-  const tailChunks = normalizedChunks.slice(Math.max(0, maxMessages - 1));
-  if (!tailChunks.length) {
-    return packed;
-  }
-
-  const tailText = tailChunks.join("") || "Completed.";
+  // Fast path: merge all overflow chunks into a single tail message.
+  const tailText = normalizedChunks.slice(maxMessages - 1).join("\n\n");
   if (tailText.length <= maxChunkChars) {
-    packed.push(tailText);
+    const packed = normalizedChunks.slice(0, maxMessages - 1);
+    packed.push(tailText || "Completed.");
     return packed;
   }
 
-  const tailHardChunks = splitUtf8(tailText, maxChunkChars);
-  if (tailHardChunks.length === 1) {
-    packed.push(tailHardChunks[0]);
-    return packed;
-  }
+  // Tail doesn't fit in one message.  Iteratively reduce the preserved prefix
+  // and re-bundle the growing tail, joining adjacent chunks with a paragraph
+  // break so the merged messages stay readable.
+  for (let prefixCount = maxMessages - 2; prefixCount >= 0; prefixCount -= 1) {
+    const prefix = normalizedChunks.slice(0, prefixCount);
+    const tail = normalizedChunks.slice(prefixCount);
 
-  const preserveCount = Math.max(0, maxMessages - tailHardChunks.length);
-  const preserved = normalizedChunks.slice(0, preserveCount);
-  const rebundledTail = normalizedChunks.slice(preserveCount);
-  const groupedTail = [];
-  let current = "";
-  for (const chunk of rebundledTail) {
-    const joined = current ? `${current}${chunk}` : chunk;
-    if (current && joined.length > maxChunkChars) {
-      groupedTail.push(current);
-      current = chunk;
-      continue;
+    const merged = [];
+    let buf = "";
+    for (const chunk of tail) {
+      const candidate = buf ? `${buf}\n\n${chunk}` : chunk;
+      if (buf && candidate.length > maxChunkChars) {
+        merged.push(buf);
+        buf = chunk;
+      } else {
+        buf = candidate;
+      }
     }
-    current = joined;
-  }
-  if (current) {
-    groupedTail.push(current);
+    if (buf) merged.push(buf);
+
+    const result = prefix.concat(merged);
+    if (result.length <= maxMessages) {
+      return result.map((item) => normalizeLineEndings(item) || "Completed.");
+    }
   }
 
-  return preserved.concat(groupedTail.map((item) => normalizeLineEndings(item) || "Completed.")).slice(0, maxMessages);
+  // Absolute last resort: the full text can't be packed into maxMessages even
+  // when every chunk is maxed out.  Hard-split and keep only what fits.
+  const allText = normalizedChunks.join("\n\n");
+  return splitUtf8(allText, maxChunkChars)
+    .slice(0, maxMessages)
+    .map((item) => normalizeLineEndings(item) || "Completed.");
 }
 
 function splitTextAtBoundaries(text, boundaries) {

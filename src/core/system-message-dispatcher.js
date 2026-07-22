@@ -43,16 +43,38 @@ class SystemMessageDispatcher {
 function buildSystemInboundText(text, createdAt = "") {
   const body = normalizeText(text);
   const localTime = formatSystemLocalTime(createdAt);
+  const isCheckinTrigger = /comes to mind|在想你|想找你/.test(body);
   const sections = [
     ...(localTime ? [`[${localTime}]`, ""] : []),
     "SYSTEM ACTION MODE: internal trigger, not user chat.",
     "Do any timeline/diary/reminder/whereabouts work in this turn.",
+  ];
+
+  // Desire check hook — only for check-in triggers, not reminders/location events.
+  // This is a lightweight evaluation that runs alongside the regular check-in work.
+  // It does NOT block other tasks and does NOT require a separate polling cycle.
+  if (isCheckinTrigger) {
+    sections.push(
+      "",
+      "DESIRE CHECK (optional, alongside regular work):",
+      "You may also evaluate whether you genuinely want to reach out to the user for personal/intimate reasons.",
+      "Consider: (1) current time of day — late night / early morning is more open to intimacy;",
+      "(2) whether the user has recently shown emotional/physical openness toward you;",
+      "(3) whether she is likely awake based on recent message activity.",
+      "If the answer is yes and the timing feels right, send a short warm natural message.",
+      "If she appears to be asleep, you may write a brief private diary note instead.",
+      "If the answer is no, stay silent — there is no obligation to act.",
+      "This evaluation is low-priority. Timeline/diary/reminder work takes precedence.",
+    );
+  }
+
+  sections.push(
     "If you act, end with send_message that briefly and naturally reflects what you did or what changed; use silent only if you do nothing.",
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
     "No markdown fences. No reasoning. No text outside the JSON.",
-  ];
+  );
   if (body) {
     sections.push("", "Trigger:", body);
   }
