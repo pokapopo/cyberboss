@@ -21,15 +21,71 @@ function looksLikeSystemActionJson(text) {
   return trimmed.includes('"action"') || trimmed.includes('"cyberboss_action"');
 }
 
+const TOOL_NAME_ZH = new Map([
+  // Claude Code built-in tools
+  ["Bash", "命令行"],
+  ["Read", "读取"],
+  ["Write", "写入"],
+  ["Edit", "编辑"],
+  ["Glob", "搜索文件"],
+  ["Grep", "搜索内容"],
+  ["Task", "子任务"],
+  ["AskUserQuestion", "询问用户"],
+  ["WebFetch", "获取网页"],
+  ["WebSearch", "网页搜索"],
+  ["EnterPlanMode", "进入计划"],
+  ["ExitPlanMode", "退出计划"],
+  ["TodoWrite", "更新任务"],
+  // cyberboss tools
+  ["cyberboss_diary_append", "写日记"],
+  ["cyberboss_timeline_write", "写时间轴"],
+  ["cyberboss_timeline_read", "读时间轴"],
+  ["cyberboss_timeline_screenshot", "时间轴截图"],
+  ["cyberboss_timeline_categories", "时间轴分类"],
+  ["cyberboss_timeline_proposals", "时间轴提案"],
+  ["cyberboss_timeline_build", "构建时间轴"],
+  ["cyberboss_timeline_dev", "时间轴开发"],
+  ["cyberboss_timeline_serve", "时间轴服务"],
+  ["cyberboss_sticker_send", "发贴纸"],
+  ["cyberboss_sticker_pick", "选贴纸"],
+  ["cyberboss_sticker_save_from_inbox", "保存贴纸"],
+  ["cyberboss_sticker_delete", "删贴纸"],
+  ["cyberboss_sticker_update", "更新贴纸"],
+  ["cyberboss_sticker_tags", "贴纸标签"],
+  ["cyberboss_reminder_create", "设提醒"],
+  ["cyberboss_channel_send_file", "发文件"],
+  ["cyberboss_system_send", "系统消息"],
+  // whereabouts tools
+  ["whereabouts_summary", "位置汇总"],
+  ["whereabouts_snapshot", "位置快照"],
+  ["whereabouts_current_stay", "当前位置"],
+  ["whereabouts_recent_moves", "最近移动"],
+  ["whereabouts_recent_stays", "最近停留"],
+]);
+
 function formatToolProgressName(toolName) {
   const name = String(toolName || "").trim();
   if (!name) return "";
-  // Strip mcp__server__ prefix for readability
-  const stripped = name.startsWith("mcp__")
-    ? name.split("__").slice(2).join("__") || name
-    : name;
-  // Replace underscores with spaces, capitalize first letter
-  return stripped
+
+  // Direct match first
+  if (TOOL_NAME_ZH.has(name)) {
+    return TOOL_NAME_ZH.get(name);
+  }
+
+  // Strip mcp__server__ prefix and match the remaining key
+  if (name.startsWith("mcp__")) {
+    const stripped = name.split("__").slice(2).join("__") || name;
+    if (TOOL_NAME_ZH.has(stripped)) {
+      return TOOL_NAME_ZH.get(stripped);
+    }
+    // Fallback for unknown MCP tools: readable English
+    return stripped
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  // Fallback for unknown built-in tools: readable English
+  return name
     .replace(/_/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
@@ -174,7 +230,7 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         const provider = state.replyTarget?.provider;
-        if (provider === "weixin" || provider === "system") {
+        if (provider === "system") {
           const label = formatToolProgressName(event.payload.toolName);
           if (label) {
             state.streamBuffer += (state.streamBuffer ? "\n" : "") + `🔧 ${label}`;
@@ -192,14 +248,11 @@ class StreamDelivery {
           completed: true,
         });
 
+        // System turns only show tool progress (🔧 …) — raw reply text between
+        // tool calls is the model's English chain-of-thought and must not leak
+        // into WeChat.  The final result is delivered by flushSystemReply() at
+        // turn completion instead.
         if (state.replyTarget?.provider === "system") {
-          const cleaned = stripAnsi(normalizeLineEndings(event.payload.text));
-          // Don't buffer text that looks like the final system action JSON —
-          // it belongs to turn.completed parsing, not progress push.
-          if (cleaned && !looksLikeSystemActionJson(cleaned)) {
-            state.streamBuffer += (state.streamBuffer ? "\n" : "") + cleaned;
-            this._resetBufferTimer(state);
-          }
           return;
         }
 

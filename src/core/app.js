@@ -2,7 +2,9 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
+const { resolveSelectedAccount } = require("../adapters/channel/weixin/account-store");
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
+const { SessionStore } = require("../adapters/runtime/codex/session-store");
 const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/channel/weixin/config-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
@@ -42,7 +44,7 @@ const {
   normalizeCommandTokens,
   splitCommandLine,
 } = require("../adapters/runtime/shared/approval-command");
-const { runSystemCheckinPoller } = require("../app/system-checkin-poller");
+const { runCheckinPoller, runDiaryTimelinePoller } = require("../app/system-checkin-poller");
 const { createProjectTooling } = require("../tools/create-project-tooling");
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MIN_LONG_POLL_TIMEOUT_MS = 2_000;
@@ -91,6 +93,7 @@ class CyberbossApp {
     this.messageDebouncer = null;
     this.systemMessageDispatcher = null;
     this.pendingUserContexts = new Map();
+    this._systemTurnThreadIds = new Set();
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
@@ -538,6 +541,9 @@ class CyberbossApp {
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
       this.pendingUserContexts.set(turn.threadId, prepared.text);
+      if (prepared.provider === "system") {
+        this._systemTurnThreadIds.add(turn.threadId);
+      }
       const replyTarget = {
         userId: prepared.senderId,
         contextToken: prepared.contextToken,
@@ -1049,20 +1055,78 @@ class CyberbossApp {
   }
 
   _startCheckinPoller() {
+    console.log("[cyberboss] checkin: enabled (diary + checkin pollers)");
+    this._startPollerLoop(runDiaryTimelinePoller, "diary");
+    this._startPollerLoop(runCheckinPoller, "checkin");
+    this._startDiarySummaryScheduler();
+  }
+
+  _startPollerLoop(pollerFn, name) {
     const run = async () => {
       while (true) {
         try {
-          await runSystemCheckinPoller(this.config);
+          await pollerFn(this.config);
         } catch (error) {
-          console.error(`[cyberboss] checkin poller crashed: ${error.message}`);
-          console.error(`[cyberboss] checkin poller restarting in 30s...`);
+          console.error(`[cyberboss] ${name} poller crashed: ${error.message}`);
+          console.error(`[cyberboss] ${name} poller restarting in 30s...`);
         }
         await new Promise((resolve) => setTimeout(resolve, 30_000));
       }
     };
     void run().catch((error) => {
-      console.error(`[cyberboss] checkin poller fatal: ${error.message}`);
+      console.error(`[cyberboss] ${name} poller fatal: ${error.message}`);
     });
+  }
+
+  _startDiarySummaryScheduler() {
+    const schedule = () => {
+      const now = new Date();
+      const target = new Date(now);
+      // 23:00 Asia/Shanghai
+      target.setHours(23, 0, 0, 0);
+      if (target <= now) {
+        target.setDate(target.getDate() + 1);
+      }
+      const delayMs = target.getTime() - now.getTime();
+      console.log(`[cyberboss] diary summary scheduled at ${target.toISOString()} (in ${Math.round(delayMs / 60000)}m)`);
+      setTimeout(async () => {
+        try {
+          const account = resolveSelectedAccount(this.config);
+          if (!account?.accountId) {
+            console.error("[cyberboss] diary summarize skipped: no active account");
+          } else {
+            const sessionStore = new SessionStore({ filePath: this.config.sessionsFile });
+            const senderId = resolvePreferredSenderId({
+              config: this.config,
+              accountId: account.accountId,
+              explicitUser: process.env.CYBERBOSS_CHECKIN_USER_ID || "",
+              sessionStore,
+            });
+            const workspaceRoot = resolvePreferredWorkspaceRoot({
+              config: this.config,
+              accountId: account.accountId,
+              senderId,
+              explicitWorkspace: process.env.CYBERBOSS_CHECKIN_WORKSPACE || "",
+              sessionStore,
+            });
+            const queued = this.systemMessageQueue.enqueue({
+              id: crypto.randomUUID(),
+              accountId: account.accountId,
+              senderId,
+              workspaceRoot,
+              text: "DIARY_FINALIZE",
+              triggerKind: "diary_finalize",
+              createdAt: new Date().toISOString(),
+            });
+            console.log(`[cyberboss] diary summarize queued id=${queued.id}`);
+          }
+        } catch (error) {
+          console.error(`[cyberboss] diary summarize enqueue failed: ${error.message}`);
+        }
+        schedule(); // schedule next day
+      }, delayMs);
+    };
+    schedule();
   }
 
   async dispatchSystemMessage(message) {
@@ -1080,6 +1144,37 @@ class CyberbossApp {
       return false;
     }
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+  }
+
+  async _enqueueTimelineEventCheck({ linked, event }) {
+    const contextToken = this.channelAdapter?.getKnownContextTokens?.()?.[linked.senderId] || "";
+    const prepared = this.systemMessageDispatcher?.buildPreparedMessage({
+      id: `timeline-ev:${event.payload.threadId}`,
+      accountId: linked.accountId,
+      senderId: linked.senderId,
+      workspaceRoot: linked.workspaceRoot,
+      text: "TIMELINE_EVENT_DRIVEN",
+      triggerKind: "timeline_event",
+      createdAt: new Date().toISOString(),
+    }, contextToken);
+    if (!prepared) {
+      return;
+    }
+    if (this.isTurnDispatchBlocked(linked.bindingKey, linked.workspaceRoot)) {
+      // Blocked by another turn — enqueue for later flush
+      this.systemMessageQueue.enqueue({
+        id: `timeline-ev:${event.payload.threadId}`,
+        accountId: linked.accountId,
+        senderId: linked.senderId,
+        workspaceRoot: linked.workspaceRoot,
+        text: "TIMELINE_EVENT_DRIVEN",
+        triggerKind: "timeline_event",
+        createdAt: new Date().toISOString(),
+      });
+      console.log(`[cyberboss] timeline event check queued (blocked) thread=${event.payload.threadId}`);
+      return;
+    }
+    await this.dispatchPreparedTurn({ bindingKey: linked.bindingKey, workspaceRoot: linked.workspaceRoot, prepared });
   }
 
   async dispatchChannelCommand(normalized, command) {
@@ -1337,6 +1432,12 @@ class CyberbossApp {
   }
 
   async _autoCompactIfNeeded(threadId, linked) {
+    // Defer when the user has work in flight — a turn is running or messages
+    // are queued waiting for the gate.  Compact will be reconsidered after
+    // the next turn completes, when the user isn't waiting any more.
+    if (this.turnGateStore.isPending(linked.bindingKey, linked.workspaceRoot)) return;
+    if (this.hasPendingInboundMessage(linked.bindingKey, linked.workspaceRoot)) return;
+
     const contextWindow = Number(this.config.claudeContextWindow) || 200000;
     const reservedOutput = Math.max(0, Number(this.config.claudeMaxOutputTokens) || 0);
     const availableWindow = contextWindow - reservedOutput;
@@ -1648,6 +1749,7 @@ class CyberbossApp {
         this.pendingUserContexts.delete(event.payload.threadId);
         saveTurnContext(userText);
       }
+      this._systemTurnThreadIds.delete(event.payload.threadId);
       if (event.payload?.text) {
         saveAssistantContext(event.payload.text);
       }
@@ -1717,6 +1819,20 @@ class CyberbossApp {
       }
       // Flush system messages after boundary is cleared so they aren't blocked
       await this.flushPendingSystemMessages();
+
+      // Event-driven timeline: after a non-system work turn completes, enqueue a
+      // dedicated timeline-check message so the turn's work is recorded immediately.
+      if (
+        event.type === "runtime.turn.completed"
+        && linked?.bindingKey
+        && linked?.workspaceRoot
+        && !this._systemTurnThreadIds.has(event.payload.threadId)
+      ) {
+        await this._enqueueTimelineEventCheck({ linked, event }).catch((error) => {
+          console.error(`[cyberboss] timeline event check failed: ${error.message}`);
+        });
+      }
+
       if (linked?.bindingKey && linked?.workspaceRoot && this.hasPendingInboundMessage(linked.bindingKey, linked.workspaceRoot)) {
         await this.flushPendingInboundMessages({
           bindingKey: linked.bindingKey,

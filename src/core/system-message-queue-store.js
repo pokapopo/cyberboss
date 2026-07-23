@@ -96,6 +96,7 @@ function normalizeSystemMessage(message) {
     senderId,
     workspaceRoot,
     text,
+    triggerKind: normalizeText(message.triggerKind),
     createdAt: createdAt || new Date().toISOString(),
   };
 }

@@ -4,6 +4,9 @@ const path = require("path");
 const DEFAULT_MIN_INTERVAL_MS = 3 * 60_000;
 const DEFAULT_MAX_INTERVAL_MS = 60 * 60_000;
 
+const DEFAULT_DIARY_MIN_INTERVAL_MS = 30 * 60_000;
+const DEFAULT_DIARY_MAX_INTERVAL_MS = 60 * 60_000;
+
 class CheckinConfigStore {
   constructor({ filePath }) {
     this.filePath = filePath;
@@ -20,7 +23,14 @@ class CheckinConfigStore {
     try {
       const raw = fs.readFileSync(this.filePath, "utf8");
       const parsed = JSON.parse(raw);
-      this.state = normalizePersistedRange(parsed) || {};
+      // Migrate old flat format {minIntervalMs, maxIntervalMs} → {checkin: {...}}
+      if (normalizePersistedRange(parsed)) {
+        this.state = { checkin: parsed };
+      } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        this.state = parsed;
+      } else {
+        this.state = {};
+      }
     } catch {
       this.state = {};
     }
@@ -32,15 +42,36 @@ class CheckinConfigStore {
 
   getRange(fallbackRange = resolveDefaultCheckinRange()) {
     this.load();
-    return normalizeIntervalRange(this.state, fallbackRange);
+    return normalizeIntervalRange(this.state?.checkin, fallbackRange);
   }
 
   setRange(range) {
     const normalized = normalizeIntervalRange(range);
-    this.state = normalized;
+    this.state = { ...this.state, checkin: normalized };
     this.save();
     return { ...normalized };
   }
+
+  getDiaryRange(fallbackRange = resolveDefaultDiaryRange()) {
+    this.load();
+    return normalizeIntervalRange(this.state?.diary, fallbackRange);
+  }
+
+  setDiaryRange(range) {
+    const normalized = normalizeIntervalRange(range);
+    this.state = { ...this.state, diary: normalized };
+    this.save();
+    return { ...normalized };
+  }
+}
+
+function resolveDefaultDiaryRange(env = process.env) {
+  const minIntervalMs = readIntervalMs(env?.CYBERBOSS_DIARY_MIN_INTERVAL_MS, DEFAULT_DIARY_MIN_INTERVAL_MS);
+  const maxIntervalMs = Math.max(
+    minIntervalMs,
+    readIntervalMs(env?.CYBERBOSS_DIARY_MAX_INTERVAL_MS, DEFAULT_DIARY_MAX_INTERVAL_MS)
+  );
+  return { minIntervalMs, maxIntervalMs };
 }
 
 function resolveDefaultCheckinRange(env = process.env) {
@@ -104,6 +135,9 @@ module.exports = {
   CheckinConfigStore,
   DEFAULT_MIN_INTERVAL_MS,
   DEFAULT_MAX_INTERVAL_MS,
+  DEFAULT_DIARY_MIN_INTERVAL_MS,
+  DEFAULT_DIARY_MAX_INTERVAL_MS,
   parseCheckinRangeMinutes,
   resolveDefaultCheckinRange,
+  resolveDefaultDiaryRange,
 };

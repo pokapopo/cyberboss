@@ -2,33 +2,57 @@ const crypto = require("crypto");
 
 const { resolveSelectedAccount } = require("../adapters/channel/weixin/account-store");
 const { SessionStore } = require("../adapters/runtime/codex/session-store");
-const { CheckinConfigStore, resolveDefaultCheckinRange } = require("../core/checkin-config-store");
+const {
+  CheckinConfigStore,
+  resolveDefaultCheckinRange,
+  resolveDefaultDiaryRange,
+} = require("../core/checkin-config-store");
 const { resolvePreferredSenderId, resolvePreferredWorkspaceRoot } = require("../core/default-targets");
 const { SystemMessageQueueStore } = require("../core/system-message-queue-store");
 
 const INTERNAL_CHECKIN_TRIGGER_TEMPLATE = "%USER% comes to mind again.";
+const DIARY_TIMELINE_TRIGGER = "DIARY_TIMELINE_INCREMENTAL";
 
-async function runSystemCheckinPoller(config) {
+async function runCheckinPoller(config) {
+  return runPollerLoop({
+    config,
+    name: "checkin",
+    defaultRange: resolveDefaultCheckinRange(),
+    getRange: (store, fallback) => store.getRange(fallback),
+    buildTrigger: (cfg) => buildCheckinTrigger(cfg),
+  });
+}
+
+async function runDiaryTimelinePoller(config) {
+  return runPollerLoop({
+    config,
+    name: "diary",
+    defaultRange: resolveDefaultDiaryRange(),
+    getRange: (store, fallback) => store.getDiaryRange(fallback),
+    buildTrigger: () => DIARY_TIMELINE_TRIGGER,
+  });
+}
+
+async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigger }) {
   const account = resolveSelectedAccount(config);
   const queue = new SystemMessageQueueStore({ filePath: config.systemMessageQueueFile });
   const checkinConfigStore = new CheckinConfigStore({ filePath: config.checkinConfigFile });
   const sessionStore = new SessionStore({ filePath: config.sessionsFile });
   const target = resolvePollerTarget({ config, account, sessionStore });
-  const defaultRange = resolveDefaultCheckinRange();
-  let currentRange = checkinConfigStore.getRange(defaultRange);
+  let currentRange = getRange(checkinConfigStore, defaultRange);
 
-  console.log(`[cyberboss] checkin poller ready user=${target.senderId} workspace=${target.workspaceRoot}`);
-  console.log(`[cyberboss] checkin interval range ${formatRangeMinutes(currentRange)}`);
+  console.log(`[cyberboss] ${name} poller ready user=${target.senderId} workspace=${target.workspaceRoot}`);
+  console.log(`[cyberboss] ${name} interval range ${formatRangeMinutes(currentRange)}`);
 
   while (true) {
-    currentRange = checkinConfigStore.getRange(defaultRange);
+    currentRange = getRange(checkinConfigStore, defaultRange);
     const delayMs = pickRandomDelayMs(currentRange.minIntervalMs, currentRange.maxIntervalMs);
     const wakeAt = formatLocalTime(Date.now() + delayMs);
-    console.log(`[cyberboss] next checkin in ${Math.round(delayMs / 60000)}m at ${wakeAt}`);
+    console.log(`[cyberboss] ${name} next in ${Math.round(delayMs / 60000)}m at ${wakeAt}`);
     await sleep(delayMs);
 
     if (queue.hasPendingForAccount(account.accountId)) {
-      console.log("[cyberboss] checkin skipped: pending system message still in queue");
+      console.log(`[cyberboss] ${name} skipped: pending system message still in queue`);
       continue;
     }
 
@@ -37,10 +61,11 @@ async function runSystemCheckinPoller(config) {
       accountId: account.accountId,
       senderId: target.senderId,
       workspaceRoot: target.workspaceRoot,
-      text: buildCheckinTrigger(config),
+      text: buildTrigger(config),
+      triggerKind: name === "diary" ? "diary_incremental" : "checkin",
       createdAt: new Date().toISOString(),
     });
-    console.log(`[cyberboss] checkin queued id=${queued.id}`);
+    console.log(`[cyberboss] ${name} queued id=${queued.id} triggerKind=${queued.triggerKind}`);
   }
 }
 
@@ -110,4 +135,4 @@ function buildCheckinTrigger(config) {
   return INTERNAL_CHECKIN_TRIGGER_TEMPLATE.replace("%USER%", userName);
 }
 
-module.exports = { runSystemCheckinPoller };
+module.exports = { runSystemCheckinPoller: runCheckinPoller, runCheckinPoller, runDiaryTimelinePoller };
