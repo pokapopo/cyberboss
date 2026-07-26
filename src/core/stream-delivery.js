@@ -21,6 +21,18 @@ function looksLikeSystemActionJson(text) {
   return trimmed.includes('"action"') || trimmed.includes('"cyberboss_action"');
 }
 
+function isChineseProgressText(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return false;
+  // Must contain Chinese characters — filters out English chain-of-thought
+  if (!/[一-鿿㐀-䶿]/.test(normalized)) return false;
+  // Short progress note, not a full analysis block
+  if (normalized.length > 200) return false;
+  // Must not contain code fences or tool-protocol markers
+  if (containsPlainTextSystemHazard(normalized)) return false;
+  return true;
+}
+
 const TOOL_NAME_ZH = new Map([
   // Claude Code built-in tools
   ["Bash", "命令行"],
@@ -227,16 +239,6 @@ class StreamDelivery {
         return;
       }
       case "runtime.tool.use": {
-        const state = this.ensureRunState(threadId, turnId);
-        state.turnId = turnId || state.turnId;
-        const provider = state.replyTarget?.provider;
-        if (provider === "system") {
-          const label = formatToolProgressName(event.payload.toolName);
-          if (label) {
-            state.streamBuffer += (state.streamBuffer ? "\n" : "") + `🔧 ${label}`;
-            this._resetBufferTimer(state);
-          }
-        }
         return;
       }
       case "runtime.reply.completed": {
@@ -248,11 +250,15 @@ class StreamDelivery {
           completed: true,
         });
 
-        // System turns only show tool progress (🔧 …) — raw reply text between
-        // tool calls is the model's English chain-of-thought and must not leak
-        // into WeChat.  The final result is delivered by flushSystemReply() at
-        // turn completion instead.
+        // System turns: buffer short Chinese progress notes the model writes
+        // between tool calls.  Skip the final JSON action (it belongs to
+        // turn.completed parsing) and skip English reasoning.
         if (state.replyTarget?.provider === "system") {
+          const cleaned = stripAnsi(normalizeLineEndings(event.payload.text));
+          if (cleaned && !looksLikeSystemActionJson(cleaned) && isChineseProgressText(cleaned)) {
+            state.streamBuffer += (state.streamBuffer ? "\n" : "") + cleaned;
+            this._ensureBufferTimer(state);
+          }
           return;
         }
 
@@ -340,11 +346,16 @@ class StreamDelivery {
     if (!normalized) {
       return;
     }
-    // System replies must capture the final turn text even when streaming
-    // items exist, because the JSON action is only in the final result.
     const isSystem = state.replyTarget?.provider === "system";
     if (!isSystem && state.itemOrder.length > 0) {
       return;
+    }
+    if (isSystem) {
+      // System turns: the turn completion text IS the definitive reply.
+      // Replace all intermediate reply items to prevent double-JSON
+      // concatenation when buildReplyText joins everything.
+      state.itemOrder = [];
+      state.items = new Map();
     }
     this.upsertItem(state, {
       itemId: `result-${state.turnId || state.threadId}`,
@@ -398,9 +409,9 @@ class StreamDelivery {
     current.completed = Boolean(completed);
   }
 
-  _resetBufferTimer(state) {
-    if (state.bufferTimer) clearTimeout(state.bufferTimer);
-    state.bufferTimer = setTimeout(() => {
+  _ensureBufferTimer(state) {
+    if (state.bufferTimer) return;
+    state.bufferTimer = setInterval(() => {
       const text = state.streamBuffer.trim();
       state.streamBuffer = "";
       if (text && state.replyTarget) {
@@ -435,7 +446,7 @@ class StreamDelivery {
     // Synchronous reset before any async work to avoid timer races.
     if (force) {
       if (state.bufferTimer) {
-        clearTimeout(state.bufferTimer);
+        clearInterval(state.bufferTimer);
         state.bufferTimer = null;
       }
       const remaining = state.streamBuffer.trim();
@@ -679,7 +690,7 @@ class StreamDelivery {
     }
     const state = this.stateByRunKey.get(normalizedRunKey);
     if (state?.bufferTimer) {
-      clearTimeout(state.bufferTimer);
+      clearInterval(state.bufferTimer);
     }
     this.replyTargetByTurnKey.delete(normalizedRunKey);
     this.stateByRunKey.delete(normalizedRunKey);
@@ -918,7 +929,17 @@ function resolveSystemReplyDelivery(replyText, policy = createSystemReplyPolicy(
 
   const source = normalizeSystemReplySource(normalized);
   if (source.requiresStructuredAction || source.text.startsWith("{")) {
-    return resolveSystemReplyAction(source.text);
+    const directResult = resolveSystemReplyAction(source.text);
+    if (directResult.kind !== "invalid") {
+      return directResult;
+    }
+    // Direct parse failed — try extracting the last valid JSON action
+    // (handles multi-object / concatenated replies from multiple reply items)
+    const extracted = extractSystemActionJsonCandidate(source.text);
+    if (extracted) {
+      return resolveSystemReplyAction(extracted);
+    }
+    return directResult;
   }
 
   // Fallback: extract the last valid JSON action from mixed text

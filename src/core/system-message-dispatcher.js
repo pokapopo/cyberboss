@@ -51,8 +51,6 @@ function buildSystemInboundText({ triggerText, triggerKind, createdAt }) {
   switch (triggerKind) {
     case "diary_incremental":
       return buildDiaryIncrementalPrompt(timeHeader);
-    case "timeline_event":
-      return buildTimelineEventPrompt(timeHeader);
     case "checkin":
       return buildCheckinPrompt(timeHeader, triggerText);
     case "diary_finalize":
@@ -91,31 +89,12 @@ function buildDiaryIncrementalPrompt(timeHeader) {
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No reasoning. No text outside the JSON.",
-  ].join("\n").trim();
-}
-
-function buildTimelineEventPrompt(timeHeader) {
-  return [...timeHeader,
-    "TIMELINE CHECK — a work turn just completed.",
+    "No markdown fences. No text on the same line as the final JSON.",
     "",
-    "The user just finished a conversation turn that involved real work (code, debugging,",
-    "analysis, decisions, writing). The details are still fresh in the conversation above.",
-    "",
-    "Your task:",
-    "1. Review the work that was done in the most recent turn.",
-    "2. Write a timeline entry for it NOW. Do not defer — event-driven timeline entries",
-    "   are the primary way the timeline stays accurate.",
-    "3. Return silent after writing. No need to send a message to the user — this is a",
-    "   background task.",
-    "",
-    "Only return silent without writing if the turn was trivial (simple greeting, short",
-    "status check, no substantive work).",
-    "",
-    "Return exactly one JSON object after any tool calls:",
-    "{\"action\":\"silent\"}",
-    "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No reasoning. No text outside the JSON.",
+    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
+    "These are sent to the user as live progress updates. Be natural and brief.",
+    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
+    "Keep each line short — you're narrating your work, not explaining it.",
   ].join("\n").trim();
 }
 
@@ -142,7 +121,12 @@ function buildCheckinPrompt(timeHeader, triggerText) {
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No reasoning. No text outside the JSON.",
+    "No markdown fences. No text on the same line as the final JSON.",
+    "",
+    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
+    "These are sent to the user as live progress updates. Be natural and brief.",
+    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
+    "Keep each line short — you're narrating your work, not explaining it.",
   ];
   if (body) {
     sections.push("", "Trigger:", body);
@@ -166,7 +150,12 @@ function buildDiaryFinalizePrompt(timeHeader) {
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No reasoning. No text outside the JSON.",
+    "No markdown fences. No text on the same line as the final JSON.",
+    "",
+    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
+    "These are sent to the user as live progress updates. Be natural and brief.",
+    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
+    "Keep each line short — you're narrating your work, not explaining it.",
   ].join("\n").trim();
 }
 
@@ -200,7 +189,12 @@ function buildLegacyPrompt(timeHeader, triggerText) {
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No reasoning. No text outside the JSON.",
+    "No markdown fences. No text on the same line as the final JSON.",
+    "",
+    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
+    "These are sent to the user as live progress updates. Be natural and brief.",
+    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
+    "Keep each line short — you're narrating your work, not explaining it.",
   );
   if (body) {
     sections.push("", "Trigger:", body);

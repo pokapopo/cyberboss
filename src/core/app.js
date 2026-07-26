@@ -93,7 +93,6 @@ class CyberbossApp {
     this.messageDebouncer = null;
     this.systemMessageDispatcher = null;
     this.pendingUserContexts = new Map();
-    this._systemTurnThreadIds = new Set();
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
@@ -541,9 +540,6 @@ class CyberbossApp {
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
       this.pendingUserContexts.set(turn.threadId, prepared.text);
-      if (prepared.provider === "system") {
-        this._systemTurnThreadIds.add(turn.threadId);
-      }
       const replyTarget = {
         userId: prepared.senderId,
         contextToken: prepared.contextToken,
@@ -1146,37 +1142,6 @@ class CyberbossApp {
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
   }
 
-  async _enqueueTimelineEventCheck({ linked, event }) {
-    const contextToken = this.channelAdapter?.getKnownContextTokens?.()?.[linked.senderId] || "";
-    const prepared = this.systemMessageDispatcher?.buildPreparedMessage({
-      id: `timeline-ev:${event.payload.threadId}`,
-      accountId: linked.accountId,
-      senderId: linked.senderId,
-      workspaceRoot: linked.workspaceRoot,
-      text: "TIMELINE_EVENT_DRIVEN",
-      triggerKind: "timeline_event",
-      createdAt: new Date().toISOString(),
-    }, contextToken);
-    if (!prepared) {
-      return;
-    }
-    if (this.isTurnDispatchBlocked(linked.bindingKey, linked.workspaceRoot)) {
-      // Blocked by another turn — enqueue for later flush
-      this.systemMessageQueue.enqueue({
-        id: `timeline-ev:${event.payload.threadId}`,
-        accountId: linked.accountId,
-        senderId: linked.senderId,
-        workspaceRoot: linked.workspaceRoot,
-        text: "TIMELINE_EVENT_DRIVEN",
-        triggerKind: "timeline_event",
-        createdAt: new Date().toISOString(),
-      });
-      console.log(`[cyberboss] timeline event check queued (blocked) thread=${event.payload.threadId}`);
-      return;
-    }
-    await this.dispatchPreparedTurn({ bindingKey: linked.bindingKey, workspaceRoot: linked.workspaceRoot, prepared });
-  }
-
   async dispatchChannelCommand(normalized, command) {
     switch (command.name) {
       case "bind":
@@ -1749,7 +1714,6 @@ class CyberbossApp {
         this.pendingUserContexts.delete(event.payload.threadId);
         saveTurnContext(userText);
       }
-      this._systemTurnThreadIds.delete(event.payload.threadId);
       if (event.payload?.text) {
         saveAssistantContext(event.payload.text);
       }
@@ -1819,19 +1783,6 @@ class CyberbossApp {
       }
       // Flush system messages after boundary is cleared so they aren't blocked
       await this.flushPendingSystemMessages();
-
-      // Event-driven timeline: after a non-system work turn completes, enqueue a
-      // dedicated timeline-check message so the turn's work is recorded immediately.
-      if (
-        event.type === "runtime.turn.completed"
-        && linked?.bindingKey
-        && linked?.workspaceRoot
-        && !this._systemTurnThreadIds.has(event.payload.threadId)
-      ) {
-        await this._enqueueTimelineEventCheck({ linked, event }).catch((error) => {
-          console.error(`[cyberboss] timeline event check failed: ${error.message}`);
-        });
-      }
 
       if (linked?.bindingKey && linked?.workspaceRoot && this.hasPendingInboundMessage(linked.bindingKey, linked.workspaceRoot)) {
         await this.flushPendingInboundMessages({
