@@ -276,3 +276,39 @@ test("startup converts a run owned by an old process into one durable error", as
   assert.equal(service.store.snapshot().runs.length, 0);
   await service.close();
 });
+
+test("startup removes legacy system runs without sending a false interruption", async () => {
+  const filePath = createTempFile();
+  const oldStore = new WeixinDeliveryOutboxStore({ filePath });
+  oldStore.registerRun({
+    runKey: "thread-system:turn-system",
+    threadId: "thread-system",
+    turnId: "turn-system",
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "system",
+    instanceId: "old-process",
+    status: "running",
+    startedAt: "2026-07-28T00:00:00.000Z",
+    updatedAt: "2026-07-28T00:00:00.000Z",
+  });
+  const sent = [];
+  const service = new WeixinDeliveryService({
+    filePath,
+    instanceId: "new-process",
+    channelAdapter: {
+      getKnownContextTokens() {
+        return { "user-1": "ctx-1" };
+      },
+      async sendTextChunk(payload) {
+        sent.push(payload);
+      },
+    },
+  });
+
+  await service.start();
+
+  assert.equal(sent.length, 0);
+  assert.equal(service.store.snapshot().runs.length, 0);
+  await service.close();
+});

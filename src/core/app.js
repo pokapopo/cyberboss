@@ -600,12 +600,14 @@ class CyberbossApp {
       } else {
         this.streamDelivery.queueReplyTargetForThread(turn.threadId, replyTarget);
       }
-      this.weixinDeliveryService?.registerRun?.({
-        runKey: buildRunKey(turn.threadId, turn.turnId),
-        threadId: turn.threadId,
-        turnId: turn.turnId,
-        target: replyTarget,
-      });
+      if (replyTarget.provider === "weixin") {
+        this.weixinDeliveryService?.registerRun?.({
+          runKey: buildRunKey(turn.threadId, turn.turnId),
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          target: replyTarget,
+        });
+      }
       this.scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId: turn.threadId, turnId: turn.turnId });
       return true;
     } catch (error) {

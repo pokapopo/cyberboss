@@ -232,6 +232,15 @@ class WeixinDeliveryOutboxStore {
     });
   }
 
+  removeRun(runKey) {
+    return this.updateLocked(() => {
+      const normalizedRunKey = normalizeText(runKey);
+      const before = this.state.runs.length;
+      this.state.runs = this.state.runs.filter((run) => run.runKey !== normalizedRunKey);
+      return this.state.runs.length !== before;
+    });
+  }
+
   snapshot() {
     this.load();
     return clone(this.state);
@@ -447,6 +456,10 @@ class WeixinDeliveryService {
   async recoverInterruptedRuns() {
     const orphaned = this.store.listOrphanedRuns(this.instanceId);
     for (const run of orphaned) {
+      if (run.provider !== "weixin") {
+        this.store.removeRun(run.runKey);
+        continue;
+      }
       await this.enqueue({
         runKey: run.runKey,
         threadId: run.threadId,
