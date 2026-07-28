@@ -8,7 +8,13 @@ const DEFERRED_PLAIN_REPLY_HEADER = "===== 上轮对话遗留内容 =====";
 const DEFERRED_SYSTEM_REPLY_HEADER = "===== 期间模型主动联系 =====";
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 
-function createHarness({ sendText, getKnownContextTokens, runtimeId = "" } = {}) {
+function createHarness({
+  sendText,
+  getKnownContextTokens,
+  runtimeId = "",
+  onTaskDelivery,
+  streamOptions = {},
+} = {}) {
   const sent = [];
   const channelAdapter = {
     async sendText(payload) {
@@ -33,7 +39,13 @@ function createHarness({ sendText, getKnownContextTokens, runtimeId = "" } = {})
     },
   };
 
-  const streamDelivery = new StreamDelivery({ channelAdapter, sessionStore, runtimeId });
+  const streamDelivery = new StreamDelivery({
+    channelAdapter,
+    sessionStore,
+    runtimeId,
+    onTaskDelivery,
+    ...streamOptions,
+  });
   return { sent, streamDelivery, bindingByThreadId };
 }
 
@@ -571,4 +583,161 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
     contextToken: "ctx-8",
     preserveBlock: true,
   });
+});
+
+test("durable Weixin turns emit one natural progress delivery on every interval", async () => {
+  const deliveries = [];
+  let nowMs = 0;
+  let intervalCallback = null;
+  let cleared = false;
+  const fakeTimer = { unref() {} };
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      progressIntervalMs: 30_000,
+      now: () => nowMs,
+      setIntervalFn(callback, intervalMs) {
+        assert.equal(intervalMs, 30_000);
+        intervalCallback = callback;
+        return fakeTimer;
+      },
+      clearIntervalFn(timer) {
+        assert.equal(timer, fakeTimer);
+        cleared = true;
+      },
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-progress", {
+    userId: "user-progress",
+    contextToken: "ctx-progress",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-progress", turnId: "turn-progress" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      itemId: "item-progress",
+      text: "我先检查消息投递链路。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      toolName: "Read",
+    },
+  });
+
+  nowMs = 30_000;
+  intervalCallback();
+  await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "progress");
+  assert.match(deliveries[0].text, /^进度：/);
+  assert.match(deliveries[0].text, /检查消息投递链路/);
+  assert.match(deliveries[0].text, /正在读取/);
+
+  nowMs = 60_000;
+  intervalCallback();
+  await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[1].text, "还在处理中，任务已运行约 1 分钟。");
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      text: "已经修复消息投递。",
+    },
+  });
+  assert.equal(cleared, true);
+  assert.equal(deliveries.length, 3);
+  assert.equal(deliveries[2].kind, "final");
+  assert.equal(deliveries[2].text, "已经修复消息投递。");
+  assert.equal(streamDelivery.stateByRunKey.has("thread-progress:turn-progress"), false);
+});
+
+test("durable Weixin completion persists an explicit error when Claude returns no text", async () => {
+  const deliveries = [];
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      setIntervalFn() {
+        return { unref() {} };
+      },
+      clearIntervalFn() {},
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-empty", {
+    userId: "user-empty",
+    contextToken: "ctx-empty",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-empty", turnId: "turn-empty" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-empty", turnId: "turn-empty", text: "" },
+  });
+
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "error");
+  assert.match(deliveries[0].text, /没有返回可发送的结果/);
+});
+
+test("binding a new Claude Code turn starts progress even when the early start event had no session id", async () => {
+  const deliveries = [];
+  let intervalCallback = null;
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      setIntervalFn(callback) {
+        intervalCallback = callback;
+        return { unref() {} };
+      },
+      clearIntervalFn() {},
+    },
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "", turnId: "turn-new-session" },
+  });
+  streamDelivery.bindReplyTargetForTurn({
+    threadId: "thread-new-session",
+    turnId: "turn-new-session",
+    target: {
+      userId: "user-new-session",
+      contextToken: "ctx-new-session",
+      provider: "weixin",
+    },
+  });
+
+  assert.equal(typeof intervalCallback, "function");
+  intervalCallback();
+  await streamDelivery.stateByRunKey
+    .get("thread-new-session:turn-new-session")
+    .sendChain;
+
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "progress");
+  assert.match(deliveries[0].text, /还在处理中/);
 });

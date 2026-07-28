@@ -57,6 +57,7 @@ function mapClaudeCodeMessageToRuntimeEvent(message, raw) {
         type: "runtime.approval.requested",
         payload: {
           threadId: message.sessionId,
+          turnId: message.turnId,
           requestId: message.requestId,
           reason: `Tool: ${readableToolName || ""}`,
           command: formatToolCommand(message.toolName, message.input),

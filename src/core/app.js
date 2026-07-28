@@ -35,6 +35,7 @@ const { SystemMessageDispatcher } = require("./system-message-dispatcher");
 const { TimelineScreenshotQueueStore } = require("./timeline-screenshot-queue-store");
 const { TurnGateStore } = require("./turn-gate-store");
 const { createMessageDebouncer } = require("./message-debounce");
+const { WeixinDeliveryService } = require("./weixin-delivery-outbox");
 const { ReminderQueueStore } = require("../adapters/channel/weixin/reminder-queue-store");
 const {
   matchesCommandPrefix,
@@ -93,11 +94,16 @@ class CyberbossApp {
     this.messageDebouncer = null;
     this.systemMessageDispatcher = null;
     this.pendingUserContexts = new Map();
+    this.weixinDeliveryService = new WeixinDeliveryService({
+      filePath: config.weixinDeliveryOutboxFile || path.join(config.stateDir, "weixin-delivery-outbox.json"),
+      channelAdapter: this.channelAdapter,
+    });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
       runtimeId: this.runtimeAdapter.describe().id,
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
+      onTaskDelivery: (payload) => this.weixinDeliveryService.enqueue(payload),
     });
     this.pendingOperationByRunKey = new Map();
     this.runtimeEventChain = Promise.resolve();
@@ -142,6 +148,8 @@ class CyberbossApp {
     const runtimeState = await this.runtimeAdapter.initialize();
     const knownContextTokens = Object.keys(this.channelAdapter.getKnownContextTokens()).length;
     const syncBuffer = this.channelAdapter.loadSyncBuffer();
+    await this.weixinDeliveryService.start();
+    await this.migrateDeferredPlainRepliesToOutbox();
     await this.restoreBoundThreadSubscriptions();
 
     console.log("[cyberboss] bootstrap ok");
@@ -180,6 +188,7 @@ class CyberbossApp {
     const shutdown = createShutdownController(async () => {
       await this.messageDebouncer?.destroy();
       this.clearPendingImageInboundTimers();
+      await this.weixinDeliveryService.close();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
     });
@@ -241,6 +250,7 @@ class CyberbossApp {
     } finally {
       shutdown.dispose();
       this.clearPendingImageInboundTimers();
+      await this.weixinDeliveryService.close();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
     }
@@ -385,10 +395,38 @@ class CyberbossApp {
     });
   }
 
+  async migrateDeferredPlainRepliesToOutbox() {
+    const pending = this.deferredSystemReplyQueue.listByKind("plain_reply");
+    if (!pending.length) {
+      return 0;
+    }
+    const knownTokens = this.channelAdapter.getKnownContextTokens();
+    let migrated = 0;
+    for (const reply of pending) {
+      await this.weixinDeliveryService.enqueue({
+        runKey: `legacy:${reply.threadId || reply.id}`,
+        threadId: reply.threadId,
+        target: {
+          userId: reply.senderId,
+          contextToken: knownTokens[reply.senderId] || "",
+          provider: "weixin",
+        },
+        kind: "final",
+        text: reply.text,
+        idempotencyKey: `legacy-deferred:${reply.id}`,
+      });
+      this.deferredSystemReplyQueue.removeById(reply.id);
+      migrated += 1;
+    }
+    console.log(`[cyberboss] migrated deferred plain replies to outbox count=${migrated}`);
+    return migrated;
+  }
+
   primeDeferredRepliesForSender(normalized) {
     if (!normalized?.accountId || !normalized?.senderId || !normalized?.contextToken) {
       return;
     }
+    this.weixinDeliveryService.wakeUser(normalized.senderId, normalized.contextToken);
     const pendingReplies = this.deferredSystemReplyQueue.drainForSender(normalized.accountId, normalized.senderId);
     if (!pendingReplies.length) {
       return;
@@ -491,6 +529,14 @@ class CyberbossApp {
         type: "runtime.turn.failed",
         payload: { threadId, turnId, text: `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
       });
+      await this.sendFailureToThread(
+        threadId,
+        `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)`,
+        null,
+        turnId,
+      ).catch((error) => {
+        console.error(`[cyberboss] failed to persist turn timeout reply: ${error.message}`);
+      });
       await this.flushPendingInboundMessages({ bindingKey, workspaceRoot, ignoreBoundary: true }).catch(() => {});
     }, turnTimeoutMs);
     this.turnTimeouts.set(threadId, timeout);
@@ -554,16 +600,38 @@ class CyberbossApp {
       } else {
         this.streamDelivery.queueReplyTargetForThread(turn.threadId, replyTarget);
       }
+      this.weixinDeliveryService?.registerRun?.({
+        runKey: buildRunKey(turn.threadId, turn.turnId),
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+        target: replyTarget,
+      });
       this.scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId: turn.threadId, turnId: turn.turnId });
       return true;
     } catch (error) {
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
       const messageText = error instanceof Error ? error.message : String(error || "unknown error");
-      await this.channelAdapter.sendText({
+      const failurePayload = {
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
         contextToken: prepared.contextToken,
-      }).catch(() => {});
+      };
+      if (this.weixinDeliveryService?.enqueue) {
+        await this.weixinDeliveryService.enqueue({
+          runKey: `dispatch:${prepared.messageId || Date.now()}`,
+          target: {
+            userId: prepared.senderId,
+            contextToken: prepared.contextToken,
+            provider: prepared.provider,
+          },
+          kind: "error",
+          text: failurePayload.text,
+        }).catch((deliveryError) => {
+          console.error(`[cyberboss] failed to persist request failure: ${deliveryError.message}`);
+        });
+      } else {
+        await this.channelAdapter.sendText(failurePayload).catch(() => {});
+      }
       return false;
     }
   }
@@ -1745,6 +1813,7 @@ class CyberbossApp {
             event.payload.threadId,
             event.payload.text || "❌ Execution failed",
             failureReplyTarget,
+            event.payload.turnId,
           );
         }
         if (linked?.bindingKey && linked?.workspaceRoot) {
@@ -1864,19 +1933,35 @@ class CyberbossApp {
     }).catch(() => {});
   }
 
-  async sendFailureToThread(threadId, text, fallbackTarget = null) {
+  async sendFailureToThread(threadId, text, fallbackTarget = null, turnId = "") {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
     const target = normalizeReplyTarget(
       linked?.bindingKey ? this.resolveReplyTargetForBinding(linked.bindingKey) : null
     ) || normalizeReplyTarget(fallbackTarget);
     if (!target) {
+      const run = this.weixinDeliveryService?.store?.getRun?.(buildRunKey(threadId, turnId));
+      if (!run?.userId) {
+        throw new Error(`failure reply target missing thread=${threadId}`);
+      }
+    }
+    const runKey = buildRunKey(threadId, turnId);
+    if (!this.weixinDeliveryService?.enqueue) {
+      await this.channelAdapter.sendText({
+        userId: target.userId,
+        text: normalizeText(text) || "❌ Execution failed",
+        contextToken: target.contextToken,
+      }).catch(() => {});
       return;
     }
-    await this.channelAdapter.sendText({
-      userId: target.userId,
+    await this.weixinDeliveryService.enqueue({
+      runKey,
+      threadId,
+      turnId,
+      target,
+      kind: "error",
       text: normalizeText(text) || "❌ Execution failed",
-      contextToken: target.contextToken,
-    }).catch(() => {});
+      idempotencyKey: `error:${runKey}`,
+    });
   }
 
   async sendApprovalPrompt({ bindingKey, approval }) {
@@ -1895,14 +1980,28 @@ class CyberbossApp {
       status: 0,
       contextToken: target.contextToken,
     }).catch(() => {});
-    await this.channelAdapter.sendText({
-      userId: target.userId,
+    const runKey = buildRunKey(approval?.threadId, approval?.turnId);
+    if (!this.weixinDeliveryService?.enqueue) {
+      await this.channelAdapter.sendText({
+        userId: target.userId,
+        text: buildApprovalPromptText(approval),
+        contextToken: target.contextToken,
+        preserveBlock: true,
+      });
+      return;
+    }
+    await this.weixinDeliveryService.enqueue({
+      runKey,
+      threadId: approval?.threadId,
+      turnId: approval?.turnId,
+      target,
+      kind: "approval",
       text: buildApprovalPromptText(approval),
-      contextToken: target.contextToken,
       preserveBlock: true,
+      idempotencyKey: `approval:${runKey}:${approval?.requestId || ""}`,
     });
     console.log(
-      `[cyberboss] approval prompt delivered binding=${bindingKey} user=${target.userId} requestId=${approval?.requestId || ""}`
+      `[cyberboss] approval prompt queued binding=${bindingKey} user=${target.userId} requestId=${approval?.requestId || ""}`
     );
   }
 

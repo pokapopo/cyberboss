@@ -59,37 +59,46 @@ function createWeixinChannelAdapter(config) {
     return ensureContextTokenCache()[normalizedUserId] || "";
   }
 
-  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false }) {
-    const account = ensureAccount();
-    const resolvedToken = resolveContextToken(userId, contextToken);
-    if (!resolvedToken) {
-      throw new Error(`Missing context_token. Cannot reply to user ${userId}.`);
-    }
+  function prepareTextDelivery({ text, preserveBlock = false }) {
     const content = String(text || "");
     if (!content.trim()) {
-      return Promise.resolve();
+      return [];
     }
     const normalizedContent = normalizeWeixinReplyText(content);
     const textChunks = preserveBlock ? null : chunkReplyTextForWeixin(normalizedContent, minWeixinChunk);
-    const sendChunks = preserveBlock
+    return preserveBlock
       ? splitUtf8(normalizedContent || "Completed.", MAX_WEIXIN_CHUNK)
       : packChunksForWeixinDelivery(
         textChunks?.length ? textChunks : ["Completed."],
         WEIXIN_MAX_DELIVERY_MESSAGES,
         MAX_WEIXIN_CHUNK
       );
+  }
+
+  async function sendTextChunk({ userId, text, contextToken = "", clientId = "" }) {
+    const account = ensureAccount();
+    const resolvedToken = resolveContextToken(userId, contextToken);
+    if (!resolvedToken) {
+      throw new Error(`Missing context_token. Cannot reply to user ${userId}.`);
+    }
+    const deliveryChunk = finalizeWeixinDeliveryChunk(text);
+    if (!deliveryChunk) {
+      return null;
+    }
+    return sendText({
+      baseUrl: account.baseUrl,
+      token: account.token,
+      toUserId: userId,
+      text: deliveryChunk,
+      contextToken: resolvedToken,
+      clientId: clientId || `cb-${crypto.randomUUID()}`,
+    });
+  }
+
+  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false }) {
+    const sendChunks = prepareTextDelivery({ text, preserveBlock });
     return sendChunks.reduce((promise, chunk, index) => promise
-      .then(() => {
-        const deliveryChunk = finalizeWeixinDeliveryChunk(chunk) || "Completed.";
-        return sendText({
-          baseUrl: account.baseUrl,
-          token: account.token,
-          toUserId: userId,
-          text: deliveryChunk,
-          contextToken: resolvedToken,
-          clientId: `cb-${crypto.randomUUID()}`,
-        });
-      })
+      .then(() => sendTextChunk({ userId, text: chunk, contextToken }))
       .then(() => {
         if (index < sendChunks.length - 1) {
           return sleep(SEND_MESSAGE_CHUNK_INTERVAL_MS);
@@ -132,6 +141,8 @@ function createWeixinChannelAdapter(config) {
     getKnownContextTokens() {
       return { ...ensureContextTokenCache() };
     },
+    prepareTextDelivery,
+    sendTextChunk,
     loadSyncBuffer() {
       const account = ensureAccount();
       return loadSyncBuffer(config, account.accountId);

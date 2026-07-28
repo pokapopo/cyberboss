@@ -2,6 +2,7 @@ const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 const SILENCE_FLUSH_MS = 30_000;
+const TASK_PROGRESS_INTERVAL_MS = 30_000;
 
 function stripAnsi(text) {
   return String(text || "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
@@ -103,12 +104,29 @@ function formatToolProgressName(toolName) {
 }
 
 class StreamDelivery {
-  constructor({ channelAdapter, sessionStore, runtimeId = "", onDeferredSystemReply, systemReplyRetryScheduleMs, sameTokenRetryDelayMs }) {
+  constructor({
+    channelAdapter,
+    sessionStore,
+    runtimeId = "",
+    onDeferredSystemReply,
+    onTaskDelivery,
+    progressIntervalMs = TASK_PROGRESS_INTERVAL_MS,
+    now = () => Date.now(),
+    setIntervalFn = setInterval,
+    clearIntervalFn = clearInterval,
+    systemReplyRetryScheduleMs,
+    sameTokenRetryDelayMs,
+  }) {
     this.channelAdapter = channelAdapter;
     this.sessionStore = sessionStore;
     this.runtimeId = normalizeRuntimeId(runtimeId);
     this.systemReplyPolicy = createSystemReplyPolicy(this.runtimeId);
     this.onDeferredSystemReply = typeof onDeferredSystemReply === "function" ? onDeferredSystemReply : null;
+    this.onTaskDelivery = typeof onTaskDelivery === "function" ? onTaskDelivery : null;
+    this.progressIntervalMs = Math.max(10, Number(progressIntervalMs) || TASK_PROGRESS_INTERVAL_MS);
+    this.now = now;
+    this.setIntervalFn = setIntervalFn;
+    this.clearIntervalFn = clearIntervalFn;
     this.systemReplyRetryScheduleMs = Array.isArray(systemReplyRetryScheduleMs) && systemReplyRetryScheduleMs.length
       ? systemReplyRetryScheduleMs.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
       : [1_500, 2_500, 4_000, 6_000];
@@ -157,10 +175,10 @@ class StreamDelivery {
 
     const runKey = buildRunKey(normalizedThreadId, normalizedTurnId);
     this.replyTargetByTurnKey.set(runKey, normalizedTarget);
-    const activeState = this.stateByRunKey.get(runKey);
-    if (activeState) {
-      this.applyThreadReplyTarget(activeState, normalizedTarget);
-    }
+    const state = this.ensureRunState(normalizedThreadId, normalizedTurnId);
+    state.turnStarted = true;
+    state.startedAtMs ||= this.now();
+    this.applyThreadReplyTarget(state, normalizedTarget);
   }
 
   setDeferredReplyPrefix(bindingKey, text) {
@@ -226,7 +244,10 @@ class StreamDelivery {
       case "runtime.turn.started": {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
+        state.turnStarted = true;
+        state.startedAtMs ||= this.now();
         this.attachReplyTarget(state);
+        this.ensureTaskProgressTimer(state);
         return;
       }
       case "runtime.reply.delta": {
@@ -239,6 +260,24 @@ class StreamDelivery {
         return;
       }
       case "runtime.tool.use": {
+        const state = this.ensureRunState(threadId, turnId);
+        state.turnId = turnId || state.turnId;
+        if (this.isDurableWeixinRun(state)) {
+          const label = formatToolProgressName(event.payload.toolName);
+          if (label) {
+            this.addTaskProgressSignal(state, `正在${label}。`);
+          }
+          this.ensureTaskProgressTimer(state);
+        }
+        return;
+      }
+      case "runtime.approval.requested": {
+        const state = this.ensureRunState(threadId, turnId);
+        state.turnId = turnId || state.turnId;
+        if (this.isDurableWeixinRun(state)) {
+          this.addTaskProgressSignal(state, "正在等待你的授权。");
+          this.ensureTaskProgressTimer(state);
+        }
         return;
       }
       case "runtime.reply.completed": {
@@ -249,6 +288,12 @@ class StreamDelivery {
           text: normalizeLineEndings(event.payload.text),
           completed: true,
         });
+
+        if (this.isDurableWeixinRun(state)) {
+          this.addTaskProgressSignal(state, event.payload.text);
+          this.ensureTaskProgressTimer(state);
+          return;
+        }
 
         // System turns: buffer short Chinese progress notes the model writes
         // between tool calls.  Skip the final JSON action (it belongs to
@@ -268,14 +313,30 @@ class StreamDelivery {
       case "runtime.turn.completed": {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
+        if (this.isDurableWeixinRun(state)) {
+          this.clearTaskProgressTimer(state);
+          const finalText = resolveTaskFinalText(state, event.payload.text);
+          await this.enqueueTaskDelivery(state, {
+            kind: finalText ? "final" : "error",
+            text: finalText || "❌ 任务已结束，但 Claude Code 没有返回可发送的结果。",
+            idempotencyKey: `${finalText ? "final" : "empty-final"}:${state.runKey}`,
+          });
+          this.disposeRunState(state.runKey);
+          return;
+        }
         this.captureTurnCompletionText(state, event.payload.text);
         await this.flush(state, { force: true });
         this.disposeRunState(state.runKey);
         return;
       }
-      case "runtime.turn.failed":
+      case "runtime.turn.failed": {
+        const state = this.stateByRunKey.get(buildRunKey(threadId, turnId));
+        if (state) {
+          this.clearTaskProgressTimer(state);
+        }
         this.disposeRunState(buildRunKey(threadId, turnId));
         return;
+      }
       default:
         return;
     }
@@ -304,6 +365,11 @@ class StreamDelivery {
       threadReplyTargetAttached: false,
       streamBuffer: "",
       bufferTimer: null,
+      turnStarted: false,
+      startedAtMs: 0,
+      progressSignals: [],
+      progressTimer: null,
+      progressTick: 0,
     };
     this.stateByRunKey.set(runKey, created);
     this.attachReplyTarget(created);
@@ -420,6 +486,85 @@ class StreamDelivery {
           .catch(() => {});
       }
     }, SILENCE_FLUSH_MS);
+  }
+
+  isDurableWeixinRun(state) {
+    return state?.replyTarget?.provider === "weixin"
+      && typeof this.onTaskDelivery === "function";
+  }
+
+  ensureTaskProgressTimer(state) {
+    if (!state?.turnStarted || !this.isDurableWeixinRun(state) || state.progressTimer) {
+      return;
+    }
+    state.startedAtMs ||= this.now();
+    state.progressTimer = this.setIntervalFn(() => {
+      state.sendChain = state.sendChain
+        .catch(() => {})
+        .then(() => this.emitTaskProgress(state))
+        .catch((error) => {
+          console.error(
+            `[cyberboss] failed to persist task progress thread=${state.threadId}: ${error.message}`
+          );
+        });
+    }, this.progressIntervalMs);
+    state.progressTimer.unref?.();
+  }
+
+  clearTaskProgressTimer(state) {
+    if (!state?.progressTimer) {
+      return;
+    }
+    this.clearIntervalFn(state.progressTimer);
+    state.progressTimer = null;
+  }
+
+  addTaskProgressSignal(state, value) {
+    const plain = sanitizeReplyText(markdownToPlainText(stripAnsi(normalizeLineEndings(value))));
+    if (!plain || looksLikeSystemActionJson(plain) || containsPlainTextSystemHazard(plain)) {
+      return;
+    }
+    const compact = compactProgressSignal(plain);
+    if (!compact || !/[一-鿿㐀-䶿]/.test(compact)) {
+      return;
+    }
+    const previous = state.progressSignals[state.progressSignals.length - 1];
+    if (previous !== compact) {
+      state.progressSignals.push(compact);
+      if (state.progressSignals.length > 12) {
+        state.progressSignals.splice(0, state.progressSignals.length - 12);
+      }
+    }
+  }
+
+  async emitTaskProgress(state) {
+    if (!this.isDurableWeixinRun(state)) {
+      return;
+    }
+    state.progressTick += 1;
+    const signals = [...state.progressSignals];
+    const text = buildTaskProgressText(signals, Math.max(0, this.now() - state.startedAtMs));
+    await this.enqueueTaskDelivery(state, {
+      kind: "progress",
+      text,
+      idempotencyKey: `progress:${state.runKey}:${state.progressTick}`,
+    });
+    state.progressSignals.splice(0, signals.length);
+  }
+
+  async enqueueTaskDelivery(state, { kind, text, idempotencyKey = "" }) {
+    if (typeof this.onTaskDelivery !== "function") {
+      throw new Error("task delivery callback is not configured");
+    }
+    return this.onTaskDelivery({
+      runKey: state.runKey,
+      threadId: state.threadId,
+      turnId: state.turnId,
+      target: normalizeReplyTarget(state.replyTarget),
+      kind,
+      text,
+      idempotencyKey,
+    });
   }
 
   async flush(state, { force }) {
@@ -692,6 +837,7 @@ class StreamDelivery {
     if (state?.bufferTimer) {
       clearInterval(state.bufferTimer);
     }
+    this.clearTaskProgressTimer(state);
     this.replyTargetByTurnKey.delete(normalizedRunKey);
     this.stateByRunKey.delete(normalizedRunKey);
   }
@@ -739,6 +885,7 @@ class StreamDelivery {
       provider: target.provider,
     };
     state.threadReplyTargetAttached = true;
+    this.ensureTaskProgressTimer(state);
   }
 
   markAllItemsSent(state) {
@@ -773,6 +920,57 @@ function buildReplyText(state, { completedOnly }) {
     }
   }
   return parts.join("\n\n");
+}
+
+function resolveTaskFinalText(state, completionText) {
+  const definitive = sanitizeReplyText(markdownToPlainText(completionText));
+  if (definitive) {
+    return definitive;
+  }
+  for (let index = state.itemOrder.length - 1; index >= 0; index -= 1) {
+    const item = state.items.get(state.itemOrder[index]);
+    const source = item?.completedText || item?.currentText || "";
+    const candidate = sanitizeReplyText(markdownToPlainText(source));
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function compactProgressSignal(value) {
+  const normalized = trimOuterBlankLines(normalizeLineEndings(value))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return "";
+  }
+  const firstSentence = normalized.match(/^.*?[。！？!?](?:\s|$)/)?.[0]?.trim() || normalized;
+  return firstSentence.length > 100
+    ? `${firstSentence.slice(0, 99).trimEnd()}…`
+    : firstSentence;
+}
+
+function buildTaskProgressText(signals, elapsedMs) {
+  const unique = [];
+  for (const signal of signals) {
+    const normalized = compactProgressSignal(signal);
+    if (normalized && !unique.includes(normalized)) {
+      unique.push(normalized);
+    }
+  }
+  if (unique.length) {
+    const latest = unique.slice(-3)
+      .map((item) => item.replace(/[。；;]\s*$/u, ""))
+      .join("；");
+    const body = latest.length > 170 ? `${latest.slice(0, 169).trimEnd()}…` : latest;
+    return `进度：${body}。`;
+  }
+  const seconds = Math.max(30, Math.round(elapsedMs / 1_000));
+  const elapsed = seconds < 60
+    ? `约 ${seconds} 秒`
+    : `约 ${Math.max(1, Math.round(seconds / 60))} 分钟`;
+  return `还在处理中，任务已运行${elapsed}。`;
 }
 
 function collectPendingReplyDeliveries(state, { force }) {

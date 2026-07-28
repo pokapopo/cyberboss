@@ -73,6 +73,28 @@ class DeferredSystemReplyStore {
       return drained;
     });
   }
+
+  listByKind(kind) {
+    this.load();
+    const normalizedKind = normalizeDeferredReplyKind(kind);
+    return this.state.replies
+      .filter((reply) => reply.kind === normalizedKind)
+      .map((reply) => ({ ...reply }));
+  }
+
+  removeById(id) {
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalizedId = normalizeText(id);
+      const before = this.state.replies.length;
+      this.state.replies = this.state.replies.filter((reply) => reply.id !== normalizedId);
+      if (this.state.replies.length !== before) {
+        this.save();
+        return true;
+      }
+      return false;
+    });
+  }
 }
 
 function normalizeDeferredSystemReply(reply) {
