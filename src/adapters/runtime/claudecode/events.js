@@ -39,6 +39,7 @@ function mapClaudeCodeMessageToRuntimeEvent(message, raw) {
           threadId: message.sessionId,
           turnId: message.turnId,
           toolName: message.toolName || "",
+          input: message.input && typeof message.input === "object" ? message.input : null,
         },
       };
     case "turn.completed":

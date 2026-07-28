@@ -585,7 +585,7 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
   });
 });
 
-test("durable Weixin turns emit one natural progress delivery on every interval", async () => {
+test("durable Weixin turns send confirmed Claude progress naturally and hide tool names", async () => {
   const deliveries = [];
   let nowMs = 0;
   let intervalCallback = null;
@@ -628,6 +628,8 @@ test("durable Weixin turns emit one natural progress delivery on every interval"
       text: "我先检查消息投递链路。",
     },
   });
+  assert.equal(deliveries.length, 0);
+
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.tool.use",
     payload: {
@@ -636,21 +638,41 @@ test("durable Weixin turns emit one natural progress delivery on every interval"
       toolName: "Read",
     },
   });
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "progress");
+  assert.equal(deliveries[0].text, "我先检查消息投递链路。");
 
   nowMs = 30_000;
   intervalCallback();
   await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
-  assert.equal(deliveries.length, 1);
-  assert.equal(deliveries[0].kind, "progress");
-  assert.match(deliveries[0].text, /^进度：/);
-  assert.match(deliveries[0].text, /检查消息投递链路/);
-  assert.match(deliveries[0].text, /正在读取/);
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[1].text, "我还在看相关内容，正在把整个链路理清楚。");
+  assert.doesNotMatch(deliveries[1].text, /Read|读取|TaskUpdate|命令行/);
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      itemId: "item-progress",
+      text: "我找到一个可疑的状态清理分支，再确认一下。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      toolName: "TaskUpdate",
+    },
+  });
 
   nowMs = 60_000;
   intervalCallback();
   await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
-  assert.equal(deliveries.length, 2);
-  assert.equal(deliveries[1].text, "还在处理中，任务已运行约 1 分钟。");
+  assert.equal(deliveries.length, 3);
+  assert.equal(deliveries[2].text, "我找到一个可疑的状态清理分支，再确认一下。");
+  assert.doesNotMatch(deliveries[2].text, /TaskUpdate/);
 
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.turn.completed",
@@ -661,10 +683,57 @@ test("durable Weixin turns emit one natural progress delivery on every interval"
     },
   });
   assert.equal(cleared, true);
-  assert.equal(deliveries.length, 3);
-  assert.equal(deliveries[2].kind, "final");
-  assert.equal(deliveries[2].text, "已经修复消息投递。");
+  assert.equal(deliveries.length, 4);
+  assert.equal(deliveries[3].kind, "final");
+  assert.equal(deliveries[3].text, "已经修复消息投递。");
   assert.equal(streamDelivery.stateByRunKey.has("thread-progress:turn-progress"), false);
+});
+
+test("a Claude reply without a following tool is sent once as the final answer", async () => {
+  const deliveries = [];
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      setIntervalFn() {
+        return { unref() {} };
+      },
+      clearIntervalFn() {},
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-direct", {
+    userId: "user-direct",
+    contextToken: "ctx-direct",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-direct", turnId: "turn-direct" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-direct",
+      turnId: "turn-direct",
+      itemId: "item-direct",
+      text: "这是直接回答。",
+    },
+  });
+  assert.equal(deliveries.length, 0);
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: {
+      threadId: "thread-direct",
+      turnId: "turn-direct",
+      text: "这是直接回答。",
+    },
+  });
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "final");
+  assert.equal(deliveries[0].text, "这是直接回答。");
 });
 
 test("durable Weixin completion persists an explicit error when Claude returns no text", async () => {
@@ -739,5 +808,5 @@ test("binding a new Claude Code turn starts progress even when the early start e
 
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0].kind, "progress");
-  assert.match(deliveries[0].text, /还在处理中/);
+  assert.match(deliveries[0].text, /还在处理/);
 });

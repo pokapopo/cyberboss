@@ -34,75 +34,6 @@ function isChineseProgressText(text) {
   return true;
 }
 
-const TOOL_NAME_ZH = new Map([
-  // Claude Code built-in tools
-  ["Bash", "命令行"],
-  ["Read", "读取"],
-  ["Write", "写入"],
-  ["Edit", "编辑"],
-  ["Glob", "搜索文件"],
-  ["Grep", "搜索内容"],
-  ["Task", "子任务"],
-  ["AskUserQuestion", "询问用户"],
-  ["WebFetch", "获取网页"],
-  ["WebSearch", "网页搜索"],
-  ["EnterPlanMode", "进入计划"],
-  ["ExitPlanMode", "退出计划"],
-  ["TodoWrite", "更新任务"],
-  // cyberboss tools
-  ["cyberboss_diary_append", "写日记"],
-  ["cyberboss_timeline_write", "写时间轴"],
-  ["cyberboss_timeline_read", "读时间轴"],
-  ["cyberboss_timeline_screenshot", "时间轴截图"],
-  ["cyberboss_timeline_categories", "时间轴分类"],
-  ["cyberboss_timeline_proposals", "时间轴提案"],
-  ["cyberboss_timeline_build", "构建时间轴"],
-  ["cyberboss_timeline_dev", "时间轴开发"],
-  ["cyberboss_timeline_serve", "时间轴服务"],
-  ["cyberboss_sticker_send", "发贴纸"],
-  ["cyberboss_sticker_pick", "选贴纸"],
-  ["cyberboss_sticker_save_from_inbox", "保存贴纸"],
-  ["cyberboss_sticker_delete", "删贴纸"],
-  ["cyberboss_sticker_update", "更新贴纸"],
-  ["cyberboss_sticker_tags", "贴纸标签"],
-  ["cyberboss_reminder_create", "设提醒"],
-  ["cyberboss_channel_send_file", "发文件"],
-  ["cyberboss_system_send", "系统消息"],
-  // whereabouts tools
-  ["whereabouts_summary", "位置汇总"],
-  ["whereabouts_snapshot", "位置快照"],
-  ["whereabouts_current_stay", "当前位置"],
-  ["whereabouts_recent_moves", "最近移动"],
-  ["whereabouts_recent_stays", "最近停留"],
-]);
-
-function formatToolProgressName(toolName) {
-  const name = String(toolName || "").trim();
-  if (!name) return "";
-
-  // Direct match first
-  if (TOOL_NAME_ZH.has(name)) {
-    return TOOL_NAME_ZH.get(name);
-  }
-
-  // Strip mcp__server__ prefix and match the remaining key
-  if (name.startsWith("mcp__")) {
-    const stripped = name.split("__").slice(2).join("__") || name;
-    if (TOOL_NAME_ZH.has(stripped)) {
-      return TOOL_NAME_ZH.get(stripped);
-    }
-    // Fallback for unknown MCP tools: readable English
-    return stripped
-      .replace(/_/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-
-  // Fallback for unknown built-in tools: readable English
-  return name
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
 class StreamDelivery {
   constructor({
     channelAdapter,
@@ -263,10 +194,8 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         if (this.isDurableWeixinRun(state)) {
-          const label = formatToolProgressName(event.payload.toolName);
-          if (label) {
-            this.addTaskProgressSignal(state, `正在${label}。`);
-          }
+          await this.confirmNaturalProgressBeforeTool(state);
+          this.addTaskToolSignal(state, event.payload.toolName, event.payload.input);
           this.ensureTaskProgressTimer(state);
         }
         return;
@@ -275,7 +204,7 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         if (this.isDurableWeixinRun(state)) {
-          this.addTaskProgressSignal(state, "正在等待你的授权。");
+          state.toolProgressKinds.push("approval");
           this.ensureTaskProgressTimer(state);
         }
         return;
@@ -290,7 +219,7 @@ class StreamDelivery {
         });
 
         if (this.isDurableWeixinRun(state)) {
-          this.addTaskProgressSignal(state, event.payload.text);
+          state.pendingNaturalProgress = normalizeNaturalProgress(event.payload.text);
           this.ensureTaskProgressTimer(state);
           return;
         }
@@ -367,7 +296,10 @@ class StreamDelivery {
       bufferTimer: null,
       turnStarted: false,
       startedAtMs: 0,
-      progressSignals: [],
+      pendingNaturalProgress: "",
+      confirmedNaturalProgress: [],
+      toolProgressKinds: [],
+      kickoffSent: false,
       progressTimer: null,
       progressTick: 0,
     };
@@ -519,20 +451,36 @@ class StreamDelivery {
     state.progressTimer = null;
   }
 
-  addTaskProgressSignal(state, value) {
-    const plain = sanitizeReplyText(markdownToPlainText(stripAnsi(normalizeLineEndings(value))));
-    if (!plain || looksLikeSystemActionJson(plain) || containsPlainTextSystemHazard(plain)) {
+  async confirmNaturalProgressBeforeTool(state) {
+    const natural = state.pendingNaturalProgress;
+    state.pendingNaturalProgress = "";
+    if (!natural) {
       return;
     }
-    const compact = compactProgressSignal(plain);
-    if (!compact || !/[一-鿿㐀-䶿]/.test(compact)) {
+    if (!state.kickoffSent) {
+      state.kickoffSent = true;
+      await this.enqueueTaskDelivery(state, {
+        kind: "progress",
+        text: natural,
+        idempotencyKey: `kickoff:${state.runKey}`,
+      });
       return;
     }
-    const previous = state.progressSignals[state.progressSignals.length - 1];
-    if (previous !== compact) {
-      state.progressSignals.push(compact);
-      if (state.progressSignals.length > 12) {
-        state.progressSignals.splice(0, state.progressSignals.length - 12);
+    const previous = state.confirmedNaturalProgress[state.confirmedNaturalProgress.length - 1];
+    if (previous !== natural) {
+      state.confirmedNaturalProgress.push(natural);
+      if (state.confirmedNaturalProgress.length > 6) {
+        state.confirmedNaturalProgress.splice(0, state.confirmedNaturalProgress.length - 6);
+      }
+    }
+  }
+
+  addTaskToolSignal(state, toolName, input = null) {
+    const kind = classifyTaskToolProgress(toolName, input);
+    if (kind && kind !== "internal") {
+      state.toolProgressKinds.push(kind);
+      if (state.toolProgressKinds.length > 20) {
+        state.toolProgressKinds.splice(0, state.toolProgressKinds.length - 20);
       }
     }
   }
@@ -542,14 +490,20 @@ class StreamDelivery {
       return;
     }
     state.progressTick += 1;
-    const signals = [...state.progressSignals];
-    const text = buildTaskProgressText(signals, Math.max(0, this.now() - state.startedAtMs));
+    const natural = state.confirmedNaturalProgress.at(-1) || "";
+    const toolKinds = [...state.toolProgressKinds];
+    const text = natural || buildTaskProgressText(
+      toolKinds,
+      Math.max(0, this.now() - state.startedAtMs),
+      state.progressTick,
+    );
     await this.enqueueTaskDelivery(state, {
       kind: "progress",
       text,
       idempotencyKey: `progress:${state.runKey}:${state.progressTick}`,
     });
-    state.progressSignals.splice(0, signals.length);
+    state.confirmedNaturalProgress = [];
+    state.toolProgressKinds = [];
   }
 
   async enqueueTaskDelivery(state, { kind, text, idempotencyKey = "" }) {
@@ -945,32 +899,81 @@ function compactProgressSignal(value) {
   if (!normalized) {
     return "";
   }
-  const firstSentence = normalized.match(/^.*?[。！？!?](?:\s|$)/)?.[0]?.trim() || normalized;
+  const firstSentence = normalized.match(/^.*?[。！？!?]/u)?.[0]?.trim() || normalized;
   return firstSentence.length > 100
     ? `${firstSentence.slice(0, 99).trimEnd()}…`
     : firstSentence;
 }
 
-function buildTaskProgressText(signals, elapsedMs) {
-  const unique = [];
-  for (const signal of signals) {
-    const normalized = compactProgressSignal(signal);
-    if (normalized && !unique.includes(normalized)) {
-      unique.push(normalized);
-    }
+function normalizeNaturalProgress(value) {
+  const plain = sanitizeReplyText(markdownToPlainText(stripAnsi(normalizeLineEndings(value))));
+  if (!plain || looksLikeSystemActionJson(plain) || containsPlainTextSystemHazard(plain)) {
+    return "";
   }
-  if (unique.length) {
-    const latest = unique.slice(-3)
-      .map((item) => item.replace(/[。；;]\s*$/u, ""))
-      .join("；");
-    const body = latest.length > 170 ? `${latest.slice(0, 169).trimEnd()}…` : latest;
-    return `进度：${body}。`;
+  const compact = compactProgressSignal(plain);
+  return /[一-鿿㐀-䶿]/.test(compact) ? compact : "";
+}
+
+function classifyTaskToolProgress(toolName, input = null) {
+  const raw = String(toolName || "").trim();
+  const name = raw.startsWith("mcp__")
+    ? raw.split("__").slice(2).join("__")
+    : raw;
+  const normalized = name.toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  const command = typeof input?.command === "string"
+    ? input.command.toLowerCase()
+    : "";
+  if (command && /(?:^|\s)(?:npm\s+(?:run\s+)?test|node\s+--test|pytest|cargo\s+test|go\s+test|check:syntax|lint)(?:\s|$)/.test(command)) {
+    return "verify";
+  }
+  if (/taskupdate|todowrite|enterplanmode|exitplanmode/.test(normalized)) {
+    return "internal";
+  }
+  if (/approval|askuserquestion/.test(normalized)) {
+    return "approval";
+  }
+  if (/write|edit|patch|delete|create|save|append|update/.test(normalized)) {
+    return "modify";
+  }
+  if (/read|grep|glob|search|find|fetch|summary|snapshot|recent|current/.test(normalized)) {
+    return "inspect";
+  }
+  if (/test|verify|check|browser|screenshot/.test(normalized)) {
+    return "verify";
+  }
+  return "work";
+}
+
+function buildTaskProgressText(toolKinds, elapsedMs, progressTick = 1) {
+  const kinds = new Set(toolKinds);
+  if (kinds.has("approval")) {
+    return "我这边正在等你确认授权，确认后我就继续。";
+  }
+  if (kinds.has("modify")) {
+    return "问题已经有些眉目了，我正在调整实现并继续确认。";
+  }
+  if (kinds.has("verify")) {
+    return "我正在核对结果，确认清楚后就一起告诉你。";
+  }
+  if (kinds.has("inspect")) {
+    return "我还在看相关内容，正在把整个链路理清楚。";
+  }
+  if (kinds.has("work")) {
+    return "我还在继续处理，正在确认目前的结果。";
   }
   const seconds = Math.max(30, Math.round(elapsedMs / 1_000));
   const elapsed = seconds < 60
     ? `约 ${seconds} 秒`
     : `约 ${Math.max(1, Math.round(seconds / 60))} 分钟`;
-  return `还在处理中，任务已运行${elapsed}。`;
+  const heartbeats = [
+    `我还在处理，已经进行了${elapsed}，暂时没有新的结论，再等我一下。`,
+    `还在继续，任务已经进行了${elapsed}，我正在把剩下的部分确认完。`,
+    `我还在这边处理，已经进行了${elapsed}，完成后马上把结果告诉你。`,
+  ];
+  return heartbeats[(Math.max(1, progressTick) - 1) % heartbeats.length];
 }
 
 function collectPendingReplyDeliveries(state, { force }) {
