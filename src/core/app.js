@@ -103,7 +103,7 @@ class CyberbossApp {
       sessionStore: this.runtimeAdapter.getSessionStore(),
       runtimeId: this.runtimeAdapter.describe().id,
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
-      onTaskDelivery: (payload) => this.weixinDeliveryService.enqueue(payload),
+      onTaskDelivery: (payload) => this.weixinDeliveryService.enqueueTaskDelivery(payload),
     });
     this.pendingOperationByRunKey = new Map();
     this.runtimeEventChain = Promise.resolve();

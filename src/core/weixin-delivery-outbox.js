@@ -311,6 +311,17 @@ class WeixinDeliveryService {
     });
   }
 
+  async enqueueTaskDelivery(payload) {
+    const run = this.store.getRun(payload?.runKey);
+    if (!run || run.provider !== "weixin" || run.status !== "running") {
+      console.warn(
+        `[cyberboss] ignored unregistered task delivery run=${normalizeText(payload?.runKey)} kind=${normalizeDeliveryKind(payload?.kind)}`
+      );
+      return null;
+    }
+    return this.enqueue(payload);
+  }
+
   async enqueue({
     runKey,
     threadId = "",

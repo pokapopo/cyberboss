@@ -312,3 +312,35 @@ test("startup removes legacy system runs without sending a false interruption", 
   assert.equal(service.store.snapshot().runs.length, 0);
   await service.close();
 });
+
+test("task delivery rejects an unregistered system turn before it can notify Weixin", async () => {
+  const filePath = createTempFile();
+  const sent = [];
+  const service = new WeixinDeliveryService({
+    filePath,
+    channelAdapter: {
+      prepareTextDelivery({ text }) {
+        return [text];
+      },
+      getKnownContextTokens() {
+        return { "user-1": "ctx-1" };
+      },
+      async sendTextChunk(payload) {
+        sent.push(payload);
+      },
+    },
+  });
+
+  const delivery = await service.enqueueTaskDelivery({
+    runKey: "thread-system:turn-system",
+    target: createTarget(),
+    kind: "error",
+    text: "❌ 任务已结束，但 Claude Code 没有返回可发送的结果。",
+  });
+  await service.drain();
+
+  assert.equal(delivery, null);
+  assert.equal(sent.length, 0);
+  assert.equal(service.store.snapshot().deliveries.length, 0);
+  await service.close();
+});
