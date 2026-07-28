@@ -2,6 +2,11 @@ const fs = require("fs");
 const path = require("path");
 const { normalizeModelCatalog } = require("./model-catalog");
 const { normalizeCommandTokens } = require("../shared/approval-command");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("../../../core/json-state-file");
 
 class SessionStore {
   constructor({ filePath, runtimeId = "" }) {
@@ -17,29 +22,28 @@ class SessionStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && parsed.bindings) {
-        this.state = {
-          ...createEmptyState(),
-          ...parsed,
-          bindings: parsed.bindings || {},
-          approvalCommandAllowlistByWorkspaceRoot: parsed.approvalCommandAllowlistByWorkspaceRoot || {},
-          approvalPromptStateByThreadId: parsed.approvalPromptStateByThreadId || {},
-          availableModelCatalog: parsed.availableModelCatalog || {
-            models: [],
-            updatedAt: "",
-          },
-        };
-      }
-    } catch {
+    const parsed = readJsonFileSync(this.filePath, createEmptyState, {
+      label: "session state",
+    });
+    if (parsed && typeof parsed === "object" && parsed.bindings) {
+      this.state = {
+        ...createEmptyState(),
+        ...parsed,
+        bindings: parsed.bindings || {},
+        approvalCommandAllowlistByWorkspaceRoot: parsed.approvalCommandAllowlistByWorkspaceRoot || {},
+        approvalPromptStateByThreadId: parsed.approvalPromptStateByThreadId || {},
+        availableModelCatalog: parsed.availableModelCatalog || {
+          models: [],
+          updatedAt: "",
+        },
+      };
+    } else {
       this.state = createEmptyState();
     }
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   getBinding(bindingKey) {
@@ -58,12 +62,15 @@ class SessionStore {
   }
 
   updateBinding(bindingKey, nextBinding) {
-    this.state.bindings[bindingKey] = {
-      ...(this.state.bindings[bindingKey] || {}),
-      ...(nextBinding || {}),
-    };
-    this.save();
-    return this.state.bindings[bindingKey];
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state.bindings[bindingKey] = mergeBindingState(
+        this.state.bindings[bindingKey],
+        nextBinding,
+      );
+      this.save();
+      return this.state.bindings[bindingKey];
+    });
   }
 
   getThreadIdForWorkspace(bindingKey, workspaceRoot, runtimeId = this.runtimeId) {
@@ -251,16 +258,19 @@ class SessionStore {
     if (!normalizedWorkspaceRoot || !normalizedTokens.length) {
       return this.getApprovalCommandAllowlistForWorkspace(workspaceRoot);
     }
-    const current = this.getApprovalCommandAllowlistForWorkspace(normalizedWorkspaceRoot);
-    if (!current.some((entry) => isSameTokenList(entry, normalizedTokens))) {
-      current.push(normalizedTokens);
-      this.state.approvalCommandAllowlistByWorkspaceRoot = {
-        ...(this.state.approvalCommandAllowlistByWorkspaceRoot || {}),
-        [normalizedWorkspaceRoot]: current,
-      };
-      this.save();
-    }
-    return current;
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const current = this.getApprovalCommandAllowlistForWorkspace(normalizedWorkspaceRoot);
+      if (!current.some((entry) => isSameTokenList(entry, normalizedTokens))) {
+        current.push(normalizedTokens);
+        this.state.approvalCommandAllowlistByWorkspaceRoot = {
+          ...(this.state.approvalCommandAllowlistByWorkspaceRoot || {}),
+          [normalizedWorkspaceRoot]: current,
+        };
+        this.save();
+      }
+      return current;
+    });
   }
 
   getApprovalPromptState(threadId) {
@@ -286,29 +296,38 @@ class SessionStore {
     if (!normalizedThreadId || !normalizedRequestId) {
       return null;
     }
-    this.state.approvalPromptStateByThreadId = {
-      ...(this.state.approvalPromptStateByThreadId || {}),
-      [normalizedThreadId]: {
-        requestId: normalizedRequestId,
-        signature: normalizedSignature,
-        promptedAt: new Date().toISOString(),
-      },
-    };
-    this.save();
-    return this.getApprovalPromptState(normalizedThreadId);
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state.approvalPromptStateByThreadId = {
+        ...(this.state.approvalPromptStateByThreadId || {}),
+        [normalizedThreadId]: {
+          requestId: normalizedRequestId,
+          signature: normalizedSignature,
+          promptedAt: new Date().toISOString(),
+        },
+      };
+      this.save();
+      return this.getApprovalPromptState(normalizedThreadId);
+    });
   }
 
   clearApprovalPrompt(threadId) {
     const normalizedThreadId = normalizeValue(threadId);
-    if (!normalizedThreadId || !this.state.approvalPromptStateByThreadId?.[normalizedThreadId]) {
+    if (!normalizedThreadId) {
       return;
     }
-    const next = {
-      ...(this.state.approvalPromptStateByThreadId || {}),
-    };
-    delete next[normalizedThreadId];
-    this.state.approvalPromptStateByThreadId = next;
-    this.save();
+    withFileLockSync(this.filePath, () => {
+      this.load();
+      if (!this.state.approvalPromptStateByThreadId?.[normalizedThreadId]) {
+        return;
+      }
+      const next = {
+        ...(this.state.approvalPromptStateByThreadId || {}),
+      };
+      delete next[normalizedThreadId];
+      this.state.approvalPromptStateByThreadId = next;
+      this.save();
+    });
   }
 
   getAvailableModelCatalog() {
@@ -329,12 +348,15 @@ class SessionStore {
     if (!normalizedModels.length) {
       return null;
     }
-    this.state.availableModelCatalog = {
-      models: normalizedModels,
-      updatedAt: new Date().toISOString(),
-    };
-    this.save();
-    return this.state.availableModelCatalog;
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state.availableModelCatalog = {
+        models: normalizedModels,
+        updatedAt: new Date().toISOString(),
+      };
+      this.save();
+      return this.state.availableModelCatalog;
+    });
   }
 
   buildBindingKey({ workspaceId, accountId, senderId }) {
@@ -352,6 +374,45 @@ function createEmptyState() {
       updatedAt: "",
     },
   };
+}
+
+function mergeBindingState(current = {}, incoming = {}) {
+  const next = {
+    ...(current || {}),
+    ...(incoming || {}),
+  };
+  next.threadIdByWorkspaceRoot = mergeFlatMap(
+    current?.threadIdByWorkspaceRoot,
+    incoming?.threadIdByWorkspaceRoot,
+  );
+  next.codexParamsByWorkspaceRoot = mergeFlatMap(
+    current?.codexParamsByWorkspaceRoot,
+    incoming?.codexParamsByWorkspaceRoot,
+  );
+  next.threadIdByWorkspaceRootByRuntime = mergeRuntimeScopedMap(
+    current?.threadIdByWorkspaceRootByRuntime,
+    incoming?.threadIdByWorkspaceRootByRuntime,
+  );
+  next.runtimeParamsByWorkspaceRootByRuntime = mergeRuntimeScopedMap(
+    current?.runtimeParamsByWorkspaceRootByRuntime,
+    incoming?.runtimeParamsByWorkspaceRootByRuntime,
+  );
+  return next;
+}
+
+function mergeFlatMap(current, incoming) {
+  return {
+    ...(current && typeof current === "object" ? current : {}),
+    ...(incoming && typeof incoming === "object" ? incoming : {}),
+  };
+}
+
+function mergeRuntimeScopedMap(current, incoming) {
+  const merged = mergeFlatMap(current, incoming);
+  for (const runtimeId of Object.keys(merged)) {
+    merged[runtimeId] = mergeFlatMap(current?.[runtimeId], incoming?.[runtimeId]);
+  }
+  return merged;
 }
 
 function normalizeValue(value) {

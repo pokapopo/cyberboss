@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { CyberbossApp } = require("../src/core/app");
 const { TurnGateStore } = require("../src/core/turn-gate-store");
+const { handleRuntimeEventForTest } = require("./helpers/app-fixture");
 
 test("turn gate tracks pending scopes until the turn is released", () => {
   const gate = new TurnGateStore();
@@ -261,6 +262,8 @@ test("dispatchPreparedTurn binds reply target to the explicit turn id when runti
         queuedBindings.push({ threadId, target });
       },
     },
+    pendingUserContexts: new Map(),
+    scheduleTurnTimeout() {},
   };
 
   const dispatched = await CyberbossApp.prototype.dispatchPreparedTurn.call(appLike, {
@@ -335,12 +338,12 @@ test("completed turns flush queued inbound work before system messages", async (
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.turn.completed",
     payload: { threadId: "thread-1", turnId: "turn-1" },
   });
 
-  assert.deepEqual(calls, ["releaseThread", "flushInbound:ignoreBoundary", "flushSystem", "stopTyping"]);
+  assert.deepEqual(calls, ["releaseThread", "flushInbound:ignoreBoundary", "stopTyping", "flushSystem"]);
 });
 
 test("completed turns keep the boundary closed until queued inbound work has been flushed", async () => {
@@ -387,12 +390,12 @@ test("completed turns keep the boundary closed until queued inbound work has bee
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.turn.completed",
     payload: { threadId: "thread-1", turnId: "turn-1" },
   });
 
-  assert.deepEqual(calls, ["releaseThread", "flushInbound:ignoreBoundary", "flushSystem"]);
+  assert.deepEqual(calls, ["releaseThread", "flushInbound:ignoreBoundary", "flushSystem", "flushInbound:default"]);
   assert.equal(appLike.turnBoundaryScopeKeys.has("binding-1::/workspace"), false);
 });
 
@@ -438,12 +441,12 @@ test("completed turns flush queued inbound work before system messages", async (
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.turn.completed",
     payload: { threadId: "thread-1", turnId: "turn-1" },
   });
 
-  assert.deepEqual(calls, ["releaseThread", "flushInbound", "flushSystem", "stopTyping"]);
+  assert.deepEqual(calls, ["releaseThread", "flushInbound", "stopTyping", "flushSystem"]);
 });
 
 test("failed turns still send error back when thread binding lookup is missing", async () => {
@@ -498,7 +501,7 @@ test("failed turns still send error back when thread binding lookup is missing",
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.turn.failed",
     payload: {
       threadId: "thread-1",

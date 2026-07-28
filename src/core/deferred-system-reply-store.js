@@ -1,5 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("./json-state-file");
 
 class DeferredSystemReplyStore {
   constructor({ filePath }) {
@@ -14,58 +19,59 @@ class DeferredSystemReplyStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      const replies = Array.isArray(parsed?.replies) ? parsed.replies : [];
-      this.state = {
-        replies: replies
-          .map(normalizeDeferredSystemReply)
-          .filter(Boolean)
-          .sort(compareDeferredReplies),
-      };
-    } catch {
-      this.state = { replies: [] };
-    }
+    const parsed = readJsonFileSync(this.filePath, () => ({ replies: [] }), {
+      label: "deferred system reply queue",
+    });
+    const replies = Array.isArray(parsed?.replies) ? parsed.replies : [];
+    this.state = {
+      replies: replies
+        .map(normalizeDeferredSystemReply)
+        .filter(Boolean)
+        .sort(compareDeferredReplies),
+    };
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   enqueue(reply) {
-    this.load();
-    const normalized = normalizeDeferredSystemReply(reply);
-    if (!normalized) {
-      throw new Error("invalid deferred system reply");
-    }
-    this.state.replies.push(normalized);
-    this.state.replies.sort(compareDeferredReplies);
-    this.save();
-    return normalized;
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalized = normalizeDeferredSystemReply(reply);
+      if (!normalized) {
+        throw new Error("invalid deferred system reply");
+      }
+      this.state.replies.push(normalized);
+      this.state.replies.sort(compareDeferredReplies);
+      this.save();
+      return normalized;
+    });
   }
 
   drainForSender(accountId, senderId) {
-    this.load();
-    const normalizedAccountId = normalizeText(accountId);
-    const normalizedSenderId = normalizeText(senderId);
-    const drained = [];
-    const pending = [];
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalizedAccountId = normalizeText(accountId);
+      const normalizedSenderId = normalizeText(senderId);
+      const drained = [];
+      const pending = [];
 
-    for (const reply of this.state.replies) {
-      if (reply.accountId === normalizedAccountId && reply.senderId === normalizedSenderId) {
-        drained.push(reply);
-      } else {
-        pending.push(reply);
+      for (const reply of this.state.replies) {
+        if (reply.accountId === normalizedAccountId && reply.senderId === normalizedSenderId) {
+          drained.push(reply);
+        } else {
+          pending.push(reply);
+        }
       }
-    }
 
-    if (drained.length) {
-      this.state.replies = pending;
-      this.save();
-    }
+      if (drained.length) {
+        this.state.replies = pending;
+        this.save();
+      }
 
-    return drained;
+      return drained;
+    });
   }
 }
 

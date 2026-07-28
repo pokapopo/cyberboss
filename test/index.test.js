@@ -98,9 +98,14 @@ test("killStalePidIfSafe", async (t) => {
 
     killStalePidIfSafe("/fake/pid");
 
-    // execFileSync 被调用，EPERM 在 Windows 上说明进程存在 → 杀掉
-    assert.ok(execMock.mock.calls.length >= 1, "execFileSync should be called for EPERM");
-    assert.strictEqual(execMock.mock.calls[0].arguments[0], "taskkill");
+    if (process.platform === "win32") {
+      assert.ok(execMock.mock.calls.length >= 1, "execFileSync should be called for EPERM");
+      assert.strictEqual(execMock.mock.calls[0].arguments[0], "taskkill");
+    } else {
+      assert.strictEqual(execMock.mock.calls.length, 0);
+      assert.strictEqual(process.kill.mock.calls.length, 2);
+      assert.deepStrictEqual(process.kill.mock.calls[1].arguments, [FAKE_PID, "SIGKILL"]);
+    }
 
     restoreAll();
   });
@@ -115,12 +120,17 @@ test("killStalePidIfSafe", async (t) => {
 
     killStalePidIfSafe("/fake/pid");
 
-    // 确认 execFileSync 被调用，且参数正确
-    assert.ok(execMock.mock.calls.length >= 1, "execFileSync should be called");
-    const callArgs = execMock.mock.calls[0].arguments;
-    assert.strictEqual(callArgs[0], "taskkill");
-    assert.deepStrictEqual(callArgs[1], ["/F", "/T", "/PID", String(FAKE_PID)]);
-    assert.deepStrictEqual(callArgs[2], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      assert.ok(execMock.mock.calls.length >= 1, "execFileSync should be called");
+      const callArgs = execMock.mock.calls[0].arguments;
+      assert.strictEqual(callArgs[0], "taskkill");
+      assert.deepStrictEqual(callArgs[1], ["/F", "/T", "/PID", String(FAKE_PID)]);
+      assert.deepStrictEqual(callArgs[2], { stdio: "ignore" });
+    } else {
+      assert.strictEqual(execMock.mock.calls.length, 0);
+      assert.strictEqual(process.kill.mock.calls.length, 2);
+      assert.deepStrictEqual(process.kill.mock.calls[1].arguments, [FAKE_PID, "SIGKILL"]);
+    }
 
     restoreAll();
   });

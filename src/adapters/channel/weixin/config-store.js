@@ -1,5 +1,9 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  writeJsonFileAtomicSync,
+} = require("../../../core/json-state-file");
 
 const DEFAULT_MIN_WEIXIN_CHUNK = 20;
 const MAX_MIN_WEIXIN_CHUNK = 3800;
@@ -13,15 +17,12 @@ function loadWeixinConfig(config) {
   if (!filePath) {
     return { minChunkChars: envDefault };
   }
-  try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      minChunkChars: normalizeMinChunkChars(parsed?.minChunkChars, envDefault),
-    };
-  } catch {
-    return { minChunkChars: envDefault };
-  }
+  const parsed = readJsonFileSync(filePath, () => ({}), {
+    label: "WeChat config",
+  });
+  return {
+    minChunkChars: normalizeMinChunkChars(parsed?.minChunkChars, envDefault),
+  };
 }
 
 function saveWeixinConfig(config, values) {
@@ -29,17 +30,9 @@ function saveWeixinConfig(config, values) {
   if (!filePath) {
     return;
   }
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify(
-      {
-        minChunkChars: normalizeMinChunkChars(values?.minChunkChars),
-      },
-      null,
-      2,
-    ),
-  );
+  writeJsonFileAtomicSync(filePath, {
+    minChunkChars: normalizeMinChunkChars(values?.minChunkChars),
+  });
 }
 
 function normalizeMinChunkChars(value, defaultValue = DEFAULT_MIN_WEIXIN_CHUNK) {

@@ -89,11 +89,10 @@ test("chunkReplyText keeps repeated punctuation together when splitting", () => 
   assert.deepEqual(chunkReplyText("1234567890。。。\n1234567890", 20), ["1234567890。。。\n", "1234567890"]);
 });
 
-test("chunkReplyTextForWeixin merges short natural boundaries", () => {
-  // Each unit is below MIN_WEIXIN_CHUNK (20), so they get merged
-  const text = "A。\n\nB。\n\nC。";
+test("chunkReplyTextForWeixin merges short punctuation boundaries within a paragraph", () => {
+  const text = "A。 B。 C。";
   const chunks = chunkReplyTextForWeixin(text);
-  assert.deepEqual(chunks, ["A。\n\nB。\n\nC。"]);
+  assert.deepEqual(chunks, ["A。 B。 C。"]);
 });
 
 test("chunkReplyTextForWeixin does not merge chunks above min length", () => {
@@ -106,11 +105,10 @@ test("chunkReplyTextForWeixin does not merge chunks above min length", () => {
   assert.equal(chunks[1], longB);
 });
 
-test("chunkReplyTextForWeixin merges short adjacent chunks", () => {
+test("chunkReplyTextForWeixin preserves explicit paragraph boundaries", () => {
   const text = ["短1", "短2", "这是一段比较长的话，不应该和前面的短句合并在一起"].join("\n\n");
   const chunks = chunkReplyTextForWeixin(text);
-  assert.equal(chunks[0], "短1\n\n短2\n\n");
-  assert.ok(!chunks[1].startsWith("短2"));
+  assert.deepEqual(chunks, ["短1\n\n", "短2\n\n", "这是一段比较长的话，不应该和前面的短句合并在一起"]);
 });
 
 test("mergeShortChunks only merges when both sides are short", () => {

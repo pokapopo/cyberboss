@@ -1,5 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("../core/json-state-file");
 
 class RuntimeContextStore {
   constructor({ filePath }) {
@@ -10,21 +15,20 @@ class RuntimeContextStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && parsed.contextsByWorkspaceRoot) {
-        this.state = {
-          contextsByWorkspaceRoot: parsed.contextsByWorkspaceRoot,
-        };
-      }
-    } catch {
+    const parsed = readJsonFileSync(this.filePath, () => ({ contextsByWorkspaceRoot: {} }), {
+      label: "runtime context",
+    });
+    if (parsed && typeof parsed === "object" && parsed.contextsByWorkspaceRoot) {
+      this.state = {
+        contextsByWorkspaceRoot: parsed.contextsByWorkspaceRoot,
+      };
+    } else {
       this.state = { contextsByWorkspaceRoot: {} };
     }
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   setActiveContext({
@@ -48,11 +52,14 @@ class RuntimeContextStore {
       senderId: normalizeText(senderId),
       updatedAt: new Date().toISOString(),
     };
-    this.state.contextsByWorkspaceRoot = {
-      ...(this.state.contextsByWorkspaceRoot || {}),
-      [normalizedWorkspaceRoot]: next,
-    };
-    this.save();
+    withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state.contextsByWorkspaceRoot = {
+        ...(this.state.contextsByWorkspaceRoot || {}),
+        [normalizedWorkspaceRoot]: next,
+      };
+      this.save();
+    });
     return next;
   }
 

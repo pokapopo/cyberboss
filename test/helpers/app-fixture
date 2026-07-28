@@ -1,0 +1,16 @@
+const { CyberbossApp } = require("../../src/core/app");
+
+function handleRuntimeEventForTest(appLike, event) {
+  appLike.pendingUserContexts ||= new Map();
+  appLike.pendingOperationByRunKey ||= new Map();
+  appLike.turnTimeouts ||= new Map();
+  appLike.turnBoundaryScopeKeys ||= new Set();
+  appLike.threadStateStore ||= {};
+  appLike.threadStateStore.getThreadState ||= () => null;
+  appLike.clearTurnTimeout ||= CyberbossApp.prototype.clearTurnTimeout.bind(appLike);
+  appLike.scheduleTurnTimeout ||= () => {};
+  appLike._autoCompactIfNeeded ||= async () => {};
+  return CyberbossApp.prototype.handleRuntimeEvent.call(appLike, event);
+}
+
+module.exports = { handleRuntimeEventForTest };

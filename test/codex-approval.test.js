@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { CyberbossApp } = require("../src/core/app");
 const { mapCodexMessageToRuntimeEvent } = require("../src/adapters/runtime/codex/events");
 const { buildCodexMcpConfigArgs } = require("../src/adapters/runtime/codex/mcp-config");
+const { handleRuntimeEventForTest } = require("./helpers/app-fixture");
 
 test("codex MCP config auto-approves cyberboss tools", () => {
   const args = buildCodexMcpConfigArgs({
@@ -117,7 +118,7 @@ test("handleRuntimeEvent auto-approves project-native Codex MCP elicitation appr
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       kind: "mcp_elicitation",

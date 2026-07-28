@@ -9,6 +9,7 @@ const { promisify } = require("util");
 const { resolveSelectedAccount } = require("../adapters/channel/weixin/account-store");
 const { loadPersistedContextTokens } = require("../adapters/channel/weixin/context-token-store");
 const { resolvePreferredSenderId } = require("../core/default-targets");
+const { writeJsonFileAtomicSync } = require("../core/json-state-file");
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_PICK_LIMIT = 5;
@@ -625,13 +626,11 @@ function isUnderDirectory(filePath, parentDir) {
 }
 
 async function writeJsonFile(filePath, value) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  writeJsonFileAtomicSync(filePath, value);
 }
 
 function writeJsonFileSync(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  writeJsonFileAtomicSync(filePath, value);
 }
 
 module.exports = {

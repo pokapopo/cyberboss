@@ -1,5 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("./json-state-file");
 
 class TimelineScreenshotQueueStore {
   constructor({ filePath }) {
@@ -14,57 +19,58 @@ class TimelineScreenshotQueueStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
-      this.state = {
-        jobs: jobs
-          .map(normalizeTimelineScreenshotJob)
-          .filter(Boolean)
-          .sort(compareTimelineScreenshotJobs),
-      };
-    } catch {
-      this.state = { jobs: [] };
-    }
+    const parsed = readJsonFileSync(this.filePath, () => ({ jobs: [] }), {
+      label: "timeline screenshot queue",
+    });
+    const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    this.state = {
+      jobs: jobs
+        .map(normalizeTimelineScreenshotJob)
+        .filter(Boolean)
+        .sort(compareTimelineScreenshotJobs),
+    };
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   enqueue(job) {
-    this.load();
-    const normalized = normalizeTimelineScreenshotJob(job);
-    if (!normalized) {
-      throw new Error("invalid timeline screenshot job");
-    }
-    this.state.jobs.push(normalized);
-    this.state.jobs.sort(compareTimelineScreenshotJobs);
-    this.save();
-    return normalized;
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalized = normalizeTimelineScreenshotJob(job);
+      if (!normalized) {
+        throw new Error("invalid timeline screenshot job");
+      }
+      this.state.jobs.push(normalized);
+      this.state.jobs.sort(compareTimelineScreenshotJobs);
+      this.save();
+      return normalized;
+    });
   }
 
   drainForAccount(accountId) {
-    this.load();
-    const normalizedAccountId = normalizeText(accountId);
-    const drained = [];
-    const pending = [];
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalizedAccountId = normalizeText(accountId);
+      const drained = [];
+      const pending = [];
 
-    for (const job of this.state.jobs) {
-      if (job.accountId === normalizedAccountId) {
-        drained.push(job);
-      } else {
-        pending.push(job);
+      for (const job of this.state.jobs) {
+        if (job.accountId === normalizedAccountId) {
+          drained.push(job);
+        } else {
+          pending.push(job);
+        }
       }
-    }
 
-    if (drained.length) {
-      this.state.jobs = pending;
-      this.save();
-    }
+      if (drained.length) {
+        this.state.jobs = pending;
+        this.save();
+      }
 
-    return drained;
+      return drained;
+    });
   }
 
   hasPendingForAccount(accountId) {

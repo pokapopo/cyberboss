@@ -1,5 +1,9 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  writeJsonFileAtomicSync,
+} = require("../../../core/json-state-file");
 
 function normalizeAccountId(raw) {
   return String(raw || "")
@@ -48,12 +52,7 @@ function saveWeixinAccount(config, rawAccountId, update) {
     userId: typeof update.userId === "string" ? update.userId.trim() : existing.userId || "",
     savedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(filePath, JSON.stringify(next, null, 2), "utf8");
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // best effort
-  }
+  writeJsonFileAtomicSync(filePath, next);
   return next;
 }
 
@@ -62,23 +61,22 @@ function loadWeixinAccount(config, accountId) {
   if (!normalized) {
     return null;
   }
-  try {
-    const raw = fs.readFileSync(resolveAccountPath(config, normalized), "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    return {
-      accountId: normalized,
-      rawAccountId: typeof parsed.rawAccountId === "string" ? parsed.rawAccountId : "",
-      token: typeof parsed.token === "string" ? parsed.token : "",
-      baseUrl: typeof parsed.baseUrl === "string" && parsed.baseUrl.trim() ? parsed.baseUrl.trim() : config.weixinBaseUrl,
-      userId: typeof parsed.userId === "string" ? parsed.userId : "",
-      savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : "",
-    };
-  } catch {
+  const parsed = readJsonFileSync(
+    resolveAccountPath(config, normalized),
+    () => null,
+    { label: `WeChat account ${normalized}` },
+  );
+  if (!parsed || typeof parsed !== "object") {
     return null;
   }
+  return {
+    accountId: normalized,
+    rawAccountId: typeof parsed.rawAccountId === "string" ? parsed.rawAccountId : "",
+    token: typeof parsed.token === "string" ? parsed.token : "",
+    baseUrl: typeof parsed.baseUrl === "string" && parsed.baseUrl.trim() ? parsed.baseUrl.trim() : config.weixinBaseUrl,
+    userId: typeof parsed.userId === "string" ? parsed.userId : "",
+    savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : "",
+  };
 }
 
 function listWeixinAccounts(config) {

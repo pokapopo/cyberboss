@@ -1,6 +1,11 @@
 const fs = require("fs");
 const path = require("path");
 const { normalizeAccountId } = require("./account-store");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("../../../core/json-state-file");
 
 function ensureAccountsDir(config) {
   fs.mkdirSync(config.accountsDir, { recursive: true });
@@ -12,24 +17,18 @@ function resolveContextTokenPath(config, accountId) {
 }
 
 function loadPersistedContextTokens(config, accountId) {
-  try {
-    const filePath = resolveContextTokenPath(config, accountId);
-    if (!fs.existsSync(filePath)) {
-      return {};
-    }
-    const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return {};
-    }
-    return Object.fromEntries(
-      Object.entries(parsed)
-        .filter(([userId, token]) => typeof userId === "string" && userId.trim() && typeof token === "string" && token.trim())
-        .map(([userId, token]) => [userId.trim(), token.trim()])
-    );
-  } catch {
+  const filePath = resolveContextTokenPath(config, accountId);
+  const parsed = readJsonFileSync(filePath, () => ({}), {
+    label: "WeChat context tokens",
+  });
+  if (!parsed || typeof parsed !== "object") {
     return {};
   }
+  return Object.fromEntries(
+    Object.entries(parsed)
+      .filter(([userId, token]) => typeof userId === "string" && userId.trim() && typeof token === "string" && token.trim())
+      .map(([userId, token]) => [userId.trim(), token.trim()])
+  );
 }
 
 function savePersistedContextTokens(config, accountId, tokens) {
@@ -39,12 +38,7 @@ function savePersistedContextTokens(config, accountId, tokens) {
       .map(([userId, token]) => [userId.trim(), token.trim()])
   );
   const filePath = resolveContextTokenPath(config, accountId);
-  fs.writeFileSync(filePath, JSON.stringify(normalizedTokens, null, 2), "utf8");
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // best effort
-  }
+  writeJsonFileAtomicSync(filePath, normalizedTokens);
   return normalizedTokens;
 }
 
@@ -54,13 +48,16 @@ function persistContextToken(config, accountId, userId, token) {
   if (!normalizedUserId || !normalizedToken) {
     return loadPersistedContextTokens(config, accountId);
   }
-  const existing = loadPersistedContextTokens(config, accountId);
-  if (existing[normalizedUserId] === normalizedToken) {
-    return existing;
-  }
-  return savePersistedContextTokens(config, accountId, {
-    ...existing,
-    [normalizedUserId]: normalizedToken,
+  const filePath = resolveContextTokenPath(config, accountId);
+  return withFileLockSync(filePath, () => {
+    const existing = loadPersistedContextTokens(config, accountId);
+    if (existing[normalizedUserId] === normalizedToken) {
+      return existing;
+    }
+    return savePersistedContextTokens(config, accountId, {
+      ...existing,
+      [normalizedUserId]: normalizedToken,
+    });
   });
 }
 

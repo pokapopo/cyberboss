@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { writeJsonFileAtomicSync } = require("../../../core/json-state-file");
 
 function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "" } = {}) {
   const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
@@ -21,7 +22,7 @@ function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "" } = {}
   };
 
   if (!jsonEquals(current, next)) {
-    fs.writeFileSync(configPath, JSON.stringify(next, null, 2) + "\n", "utf8");
+    writeJsonFileAtomicSync(configPath, next);
   }
 
   return {

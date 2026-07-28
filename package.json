@@ -24,16 +24,18 @@
     "shared:start": "node ./scripts/shared-start.js",
     "shared:open": "node ./scripts/shared-open.js",
     "shared:status": "node ./scripts/shared-status.js",
-    "check": "node --check ./src/index.js && node --check ./src/core/config.js && node --check ./src/core/app.js && node --check ./src/core/inbound-turn.js && node --check ./src/core/default-targets.js && node --check ./src/core/stream-delivery.js && node --check ./src/adapters/channel/weixin/index.js"
+    "check:syntax": "node ./scripts/check-syntax.js",
+    "test": "node --test",
+    "check": "npm run check:syntax && npm test"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
+    "patch-package": "^8.0.1",
     "playwright-core": "^1.59.1",
     "qrcode-terminal": "0.12.0",
     "sharp": "^0.35.2",
     "timeline-for-agent": "github:WenXiaoWendy/timeline-for-agent#main",
     "whereabouts-mcp": "github:WenXiaoWendy/whereabouts-mcp#main",
-    "ws": "^8.19.0"
-  },
-  "devDependencies": {}
+    "ws": "^8.21.1"
+  }
 }

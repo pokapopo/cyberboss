@@ -9,6 +9,7 @@ const { mapClaudeCodeMessageToRuntimeEvent } = require("../src/adapters/runtime/
 const { createClaudeCodeRuntimeAdapter } = require("../src/adapters/runtime/claudecode");
 const { ClaudeCodeProcessClient } = require("../src/adapters/runtime/claudecode/process-client");
 const { SessionStore } = require("../src/adapters/runtime/codex/session-store");
+const { handleRuntimeEventForTest } = require("./helpers/app-fixture");
 
 test("claudecode approval events extract command tokens from exec_command input", () => {
   const event = mapClaudeCodeMessageToRuntimeEvent({
@@ -165,11 +166,12 @@ test("claudecode adapter dispatches turns only after a real session id is availa
   fs.writeFileSync(commandFile, [
     "#!/usr/bin/env node",
     `const fs = require("node:fs");`,
+    `console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
     "process.stdin.on(\"data\", (chunk) => {",
     `  fs.appendFileSync(${JSON.stringify(captureFile)}, chunk);`,
     `  console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
-    "  process.exit(0);",
     "});",
+    "process.stdin.on(\"end\", () => process.exit(0));",
   ].join("\n"));
   fs.chmodSync(commandFile, 0o755);
 
@@ -321,10 +323,11 @@ test("claudecode adapter does not pass a codex-selected model to Claude Code", a
     "#!/usr/bin/env node",
     `const fs = require("node:fs");`,
     `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));`,
+    `  console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
     "process.stdin.on(\"data\", () => {",
     `  console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
-    "  process.exit(0);",
     "});",
+    "process.stdin.on(\"end\", () => process.exit(0));",
   ].join("\n"));
   fs.chmodSync(commandFile, 0o755);
 
@@ -437,7 +440,7 @@ test("handleRuntimeEvent prompts for project shell commands instead of auto-appr
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -724,7 +727,7 @@ test("handleRuntimeEvent reports compact completion back to WeChat", async () =>
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.turn.completed",
     payload: {
       threadId: "thread-1",
@@ -765,7 +768,7 @@ test("handleRuntimeEvent auto-approves built-in view_image approvals without pro
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -808,7 +811,7 @@ test("handleRuntimeEvent auto-approves project-native MCP tool approvals without
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -852,7 +855,7 @@ test("handleRuntimeEvent auto-approves inbox image reads for claudecode without 
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -897,7 +900,7 @@ test("handleRuntimeEvent auto-approves any state-dir file operation without prom
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -950,7 +953,7 @@ test("handleRuntimeEvent still prompts for non-inbox image reads", async () => {
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -996,7 +999,7 @@ test("handleRuntimeEvent auto-approves allowlisted prefixes for claudecode appro
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",
@@ -1038,7 +1041,7 @@ test("handleRuntimeEvent auto-approves allowlisted MCP tool approvals", async ()
     },
   };
 
-  await CyberbossApp.prototype.handleRuntimeEvent.call(appLike, {
+  await handleRuntimeEventForTest(appLike, {
     type: "runtime.approval.requested",
     payload: {
       threadId: "thread-1",

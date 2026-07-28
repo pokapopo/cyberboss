@@ -1,5 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("./json-state-file");
 
 const DEFAULT_MIN_INTERVAL_MS = 3 * 60_000;
 const DEFAULT_MAX_INTERVAL_MS = 60 * 60_000;
@@ -20,24 +25,21 @@ class CheckinConfigStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      // Migrate old flat format {minIntervalMs, maxIntervalMs} → {checkin: {...}}
-      if (normalizePersistedRange(parsed)) {
-        this.state = { checkin: parsed };
-      } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        this.state = parsed;
-      } else {
-        this.state = {};
-      }
-    } catch {
+    const parsed = readJsonFileSync(this.filePath, () => ({}), {
+      label: "checkin config",
+    });
+    // Migrate old flat format {minIntervalMs, maxIntervalMs} → {checkin: {...}}
+    if (normalizePersistedRange(parsed)) {
+      this.state = { checkin: parsed };
+    } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      this.state = parsed;
+    } else {
       this.state = {};
     }
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   getRange(fallbackRange = resolveDefaultCheckinRange()) {
@@ -47,8 +49,11 @@ class CheckinConfigStore {
 
   setRange(range) {
     const normalized = normalizeIntervalRange(range);
-    this.state = { ...this.state, checkin: normalized };
-    this.save();
+    withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state = { ...this.state, checkin: normalized };
+      this.save();
+    });
     return { ...normalized };
   }
 
@@ -59,8 +64,11 @@ class CheckinConfigStore {
 
   setDiaryRange(range) {
     const normalized = normalizeIntervalRange(range);
-    this.state = { ...this.state, diary: normalized };
-    this.save();
+    withFileLockSync(this.filePath, () => {
+      this.load();
+      this.state = { ...this.state, diary: normalized };
+      this.save();
+    });
     return { ...normalized };
   }
 }

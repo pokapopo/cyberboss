@@ -1,5 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const {
+  readJsonFileSync,
+  withFileLockSync,
+  writeJsonFileAtomicSync,
+} = require("../../../core/json-state-file");
 
 class ReminderQueueStore {
   constructor({ filePath }) {
@@ -14,56 +19,57 @@ class ReminderQueueStore {
   }
 
   load() {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      const reminders = Array.isArray(parsed?.reminders) ? parsed.reminders : [];
-      this.state = {
-        reminders: reminders
-          .map(normalizeReminder)
-          .filter(Boolean)
-          .sort((left, right) => left.dueAtMs - right.dueAtMs),
-      };
-    } catch {
-      this.state = { reminders: [] };
-    }
+    const parsed = readJsonFileSync(this.filePath, () => ({ reminders: [] }), {
+      label: "reminder queue",
+    });
+    const reminders = Array.isArray(parsed?.reminders) ? parsed.reminders : [];
+    this.state = {
+      reminders: reminders
+        .map(normalizeReminder)
+        .filter(Boolean)
+        .sort((left, right) => left.dueAtMs - right.dueAtMs),
+    };
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+    writeJsonFileAtomicSync(this.filePath, this.state);
   }
 
   enqueue(reminder) {
-    this.load();
-    const normalized = normalizeReminder(reminder);
-    if (!normalized) {
-      throw new Error("invalid reminder");
-    }
-    this.state.reminders.push(normalized);
-    this.state.reminders.sort((left, right) => left.dueAtMs - right.dueAtMs);
-    this.save();
-    return normalized;
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const normalized = normalizeReminder(reminder);
+      if (!normalized) {
+        throw new Error("invalid reminder");
+      }
+      this.state.reminders.push(normalized);
+      this.state.reminders.sort((left, right) => left.dueAtMs - right.dueAtMs);
+      this.save();
+      return normalized;
+    });
   }
 
   listDue(nowMs = Date.now()) {
-    this.load();
-    const due = [];
-    const pending = [];
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const due = [];
+      const pending = [];
 
-    for (const reminder of this.state.reminders) {
-      if (reminder.dueAtMs <= nowMs) {
-        due.push(reminder);
-      } else {
-        pending.push(reminder);
+      for (const reminder of this.state.reminders) {
+        if (reminder.dueAtMs <= nowMs) {
+          due.push(reminder);
+        } else {
+          pending.push(reminder);
+        }
       }
-    }
 
-    if (due.length) {
-      this.state.reminders = pending;
-      this.save();
-    }
+      if (due.length) {
+        this.state.reminders = pending;
+        this.save();
+      }
 
-    return due;
+      return due;
+    });
   }
 
   peekNextDueAtMs() {
