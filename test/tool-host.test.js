@@ -290,6 +290,49 @@ test("tool host accepts structured timeline screenshot input", async () => {
   assert.equal(result.data.delivery.filePath, "/tmp/shot.png");
 });
 
+test("timeline screenshot can capture without sending", async () => {
+  const host = createHost();
+  let sendCount = 0;
+  host.services.channelFile.sendToCurrentChat = async () => {
+    sendCount += 1;
+    return {};
+  };
+
+  const result = await host.invokeTool("cyberboss_timeline_screenshot", {
+    date: "2026-04-21",
+    send: false,
+  }, {});
+
+  assert.equal(sendCount, 0);
+  assert.equal(result.text, "Timeline screenshot captured locally without sending: /tmp/shot.png");
+  assert.equal(result.data.delivery, null);
+});
+
+test("timeline screenshot delivery failure returns a model-facing friendly result", async () => {
+  const host = createHost();
+  host.services.channelFile.sendToCurrentChat = async () => {
+    throw new Error("CDN upload failed after 8 attempts: -5104001");
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const result = await host.invokeTool("cyberboss_timeline_screenshot", {
+      date: "2026-04-21",
+    }, {});
+
+    assert.match(result.text, /Tell the user naturally/);
+    assert.match(result.text, /Do not retry automatically/);
+    assert.doesNotMatch(result.text, /-5104001|CDN upload/i);
+    assert.deepEqual(result.data.delivery, {
+      sent: false,
+      reason: "weixin_media_delivery_failed",
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
 test("tool host descriptions include schema summary for models that only surface descriptions", () => {
   const host = createHost();
   const timelineWrite = host.listTools().find((tool) => tool.name === "cyberboss_timeline_write");

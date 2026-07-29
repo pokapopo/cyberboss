@@ -507,14 +507,15 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_timeline_screenshot",
-    description: "Capture a timeline screenshot and send it back to the current WeChat chat.",
-    shortHint: "Capture a timeline screenshot with structured selection fields.",
+    description: "Capture a timeline screenshot and optionally send it back to the current WeChat chat. Set send=false to capture locally without attempting WeChat delivery.",
+    shortHint: "Capture a timeline screenshot; set send=false for capture-only.",
     topics: ["timeline"],
     inputSchema: {
       type: "object",
       properties: {
         userId: { type: "string", description: "Optional explicit WeChat user id." },
         outputFile: { type: "string", description: "Optional absolute output path for the PNG file." },
+        send: { type: "boolean", description: "Whether to send the captured image to WeChat. Defaults to true; false captures only." },
         selector: { type: "string", description: "main, timeline, analytics, events, or a custom CSS selector." },
         range: { type: "string", description: "Optional range: day, week, or month." },
         date: { type: "string", description: "Optional day selector YYYY-MM-DD." },
@@ -530,11 +531,43 @@ const PROJECT_TOOLS = [
       additionalProperties: false,
     },
     async handler({ services, args, context }) {
-      const captured = await services.timeline.captureScreenshot(args);
-      const delivery = await services.channelFile.sendToCurrentChat({
-        userId: args.userId,
-        filePath: captured.outputFile,
-      }, context);
+      const { send = true, ...captureArgs } = args;
+      const captured = await services.timeline.captureScreenshot(captureArgs);
+      if (send === false) {
+        return {
+          text: `Timeline screenshot captured locally without sending: ${captured.outputFile}`,
+          data: {
+            ...captured,
+            delivery: null,
+          },
+        };
+      }
+      let delivery;
+      try {
+        delivery = await services.channelFile.sendToCurrentChat({
+          userId: args.userId,
+          filePath: captured.outputFile,
+        }, context);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "unknown error");
+        console.error(
+          `[cyberboss] timeline screenshot WeChat delivery failed output=${captured.outputFile} error=${message}`
+        );
+        return {
+          text: [
+            "Timeline screenshot was captured, but WeChat delivery failed.",
+            "Tell the user naturally that the image could not be sent.",
+            "Do not expose transport errors or internal codes. Do not retry automatically.",
+          ].join(" "),
+          data: {
+            ...captured,
+            delivery: {
+              sent: false,
+              reason: "weixin_media_delivery_failed",
+            },
+          },
+        };
+      }
       return {
         text: `Timeline screenshot sent: ${captured.outputFile}`,
         data: {

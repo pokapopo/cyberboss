@@ -18,6 +18,10 @@ const WEIXIN_MEDIA_TYPE = {
 // new connection, so retrying lands on a different node and usually succeeds.
 const CDN_UPLOAD_MAX_ATTEMPTS = Math.max(1, Number(process.env.CYBERBOSS_WEIXIN_CDN_MAX_ATTEMPTS) || 8);
 const CDN_UPLOAD_ATTEMPT_BASE_TIMEOUT_MS = 30_000;
+const CDN_UPLOAD_TOTAL_BUDGET_MS = Math.max(
+  1_000,
+  Number(process.env.CYBERBOSS_WEIXIN_CDN_TOTAL_TIMEOUT_MS) || 60_000,
+);
 // Bytes-per-second floor used to scale per-attempt timeout with file size.
 // Empirical test from US VPS → WeChat CDN: ~65 KB/s on good nodes.
 // Use 30 KB/s to give 2× headroom for bad nodes.
@@ -126,7 +130,16 @@ async function uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, to
   }
 }
 
-async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, mediaType }) {
+async function uploadMediaToWeixin(
+  { filePath, toUserId, opts, cdnBaseUrl, mediaType },
+  {
+    maxAttempts = CDN_UPLOAD_MAX_ATTEMPTS,
+    totalTimeoutMs = CDN_UPLOAD_TOTAL_BUDGET_MS,
+    now = () => Date.now(),
+    sleepFn = sleep,
+    uploadAttemptFn = uploadMediaAttempt,
+  } = {},
+) {
   const plaintext = await fs.readFile(filePath);
   const rawsize = plaintext.length;
 
@@ -141,20 +154,53 @@ async function uploadMediaToWeixin({ filePath, toUserId, opts, cdnBaseUrl, media
 
   const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
   const filesize = aesEcbPaddedSize(rawsize);
-  const timeoutMs = resolveCdnUploadTimeoutMs(rawsize);
+  const attemptTimeoutMs = resolveCdnUploadTimeoutMs(rawsize);
+  const normalizedMaxAttempts = Math.max(1, Number.parseInt(maxAttempts, 10) || CDN_UPLOAD_MAX_ATTEMPTS);
+  const normalizedBudgetMs = Math.max(1_000, Number(totalTimeoutMs) || CDN_UPLOAD_TOTAL_BUDGET_MS);
+  const deadlineMs = now() + normalizedBudgetMs;
 
   let lastErr;
-  for (let attempt = 1; attempt <= CDN_UPLOAD_MAX_ATTEMPTS; attempt++) {
+  let attemptCount = 0;
+  for (let attempt = 1; attempt <= normalizedMaxAttempts; attempt++) {
+    const remainingMs = deadlineMs - now();
+    if (remainingMs <= 0) {
+      break;
+    }
+    attemptCount = attempt;
     try {
-      return await uploadMediaAttempt({ plaintext, rawsize, rawfilemd5, filesize, toUserId, opts, cdnBaseUrl, mediaType, timeoutMs });
+      return await uploadAttemptFn({
+        plaintext,
+        rawsize,
+        rawfilemd5,
+        filesize,
+        toUserId,
+        opts,
+        cdnBaseUrl,
+        mediaType,
+        timeoutMs: Math.max(1, Math.min(attemptTimeoutMs, remainingMs)),
+      });
     } catch (err) {
       lastErr = err;
-      if (attempt < CDN_UPLOAD_MAX_ATTEMPTS) {
-        await sleep(Math.min(CDN_UPLOAD_BACKOFF_BASE_MS * attempt, CDN_UPLOAD_BACKOFF_CAP_MS));
+      const remainingAfterAttemptMs = deadlineMs - now();
+      if (attempt < normalizedMaxAttempts && remainingAfterAttemptMs > 0) {
+        const backoffMs = Math.min(
+          CDN_UPLOAD_BACKOFF_BASE_MS * attempt,
+          CDN_UPLOAD_BACKOFF_CAP_MS,
+          remainingAfterAttemptMs,
+        );
+        await sleepFn(backoffMs);
       }
     }
   }
-  throw new Error(`CDN upload failed after ${CDN_UPLOAD_MAX_ATTEMPTS} attempts: ${lastErr?.message || "unknown"}`);
+  const exhaustedBudget = deadlineMs - now() <= 0;
+  const budgetSeconds = Math.round(normalizedBudgetMs / 1000);
+  const error = new Error(
+    `CDN upload ${exhaustedBudget ? "timed out" : "failed"} after ${attemptCount}/${normalizedMaxAttempts} attempts within ${budgetSeconds}s budget: ${lastErr?.message || "unknown"}`,
+  );
+  error.code = "WEIXIN_CDN_UPLOAD_FAILED";
+  error.attemptCount = attemptCount;
+  error.budgetMs = normalizedBudgetMs;
+  throw error;
 }
 
 function buildMediaRef(uploaded) {
@@ -286,4 +332,4 @@ async function sendWeixinMediaFile({ filePath, to, contextToken, baseUrl, token,
   return { kind: "file", fileName: path.basename(filePath) };
 }
 
-module.exports = { sendWeixinMediaFile };
+module.exports = { sendWeixinMediaFile, uploadMediaToWeixin };
