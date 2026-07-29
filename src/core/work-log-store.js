@@ -9,10 +9,10 @@ const {
 } = require("./json-state-file");
 
 const WORK_LOG_VERSION = 1;
-const MAX_RECORDS = 1_000;
-const MAX_EVENTS_PER_RECORD = 60;
-const SUCCESS_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const ABNORMAL_RETENTION_MS = 180 * 24 * 60 * 60 * 1_000;
+const MAX_RECORDS = 200;
+const MAX_EVENTS_PER_RECORD = 20;
+const SUCCESS_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const ABNORMAL_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const ACTIVE_EXECUTION_STATUSES = new Set(["starting", "running"]);
 
 class WorkLogStore {
@@ -109,12 +109,6 @@ class WorkLogStore {
       return null;
     }
     const type = sanitizeText(event?.type, 100);
-    if (type === "runtime.turn.started") {
-      return this.updateRecord(record.id, (current, nowIso) => {
-        current.executionStatus = "running";
-        appendEvent(current, { type, detail: "", at: nowIso });
-      });
-    }
     if (type === "runtime.tool.use") {
       return this.recordToolUse(record.id, event?.payload?.toolName);
     }
@@ -140,16 +134,32 @@ class WorkLogStore {
   }
 
   recordToolUse(id, toolName) {
+    const normalizedId = normalizeText(id);
     const normalizedTool = sanitizeToolName(toolName);
-    if (!normalizedTool) {
+    if (!normalizedId || !normalizedTool) {
       return null;
     }
-    return this.updateRecord(id, (record, nowIso) => {
+    return withFileLockSync(this.filePath, () => {
+      this.load();
+      const record = this.state.records.find((item) => item.id === normalizedId);
+      if (!record) {
+        return null;
+      }
+      const existing = record.events.find((event) =>
+        event.type === "tool.used" && event.detail === normalizedTool);
+      if (existing) {
+        return clone(record);
+      }
+      const nowIso = this.nowIso();
       appendEvent(record, {
         type: "tool.used",
         detail: normalizedTool,
         at: nowIso,
       });
+      record.updatedAt = nowIso;
+      this.prune();
+      this.save();
+      return clone(record);
     });
   }
 
@@ -558,4 +568,5 @@ function clone(value) {
 module.exports = {
   WorkLogStore,
   MAX_EVENTS_PER_RECORD,
+  MAX_RECORDS,
 };

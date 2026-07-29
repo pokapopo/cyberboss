@@ -5,7 +5,11 @@ const os = require("os");
 const path = require("path");
 
 const { ExperienceStore } = require("../src/core/experience-store");
-const { WorkLogStore, MAX_EVENTS_PER_RECORD } = require("../src/core/work-log-store");
+const {
+  WorkLogStore,
+  MAX_EVENTS_PER_RECORD,
+  MAX_RECORDS,
+} = require("../src/core/work-log-store");
 
 function createTempFile(name) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-work-memory-"));
@@ -35,7 +39,10 @@ test("work log retains a compact execution and delivery history across reloads",
     runKey: "thread-1:turn-1",
   });
   store.recordToolUse(started.id, "mcp__cyberboss_tools__cyberboss_timeline_read");
+  const afterFirstTool = store.get(started.id);
+  nowMs += 1_000;
   store.recordToolUse(started.id, "mcp__cyberboss_tools__cyberboss_timeline_read");
+  const afterDuplicateTool = store.get(started.id);
   store.recordRuntimeEvent({
     type: "runtime.turn.completed",
     payload: { threadId: "thread-1", turnId: "turn-1" },
@@ -58,8 +65,31 @@ test("work log retains a compact execution and delivery history across reloads",
   assert.equal(record.summary.includes("secret-value"), false);
   const toolEvent = record.events.find((event) => event.type === "tool.used");
   assert.equal(toolEvent.detail, "cyberboss_timeline_read");
-  assert.equal(toolEvent.count, 2);
+  assert.equal(toolEvent.count, 1);
+  assert.equal(afterDuplicateTool.updatedAt, afterFirstTool.updatedAt);
   assert.equal(reloaded.search({ query: "timeline", limit: 5 })[0].id, started.id);
+});
+
+test("work log keeps a small fixed record budget", () => {
+  const filePath = createTempFile("work-log.json");
+  let nowMs = Date.parse("2026-07-29T00:00:00.000Z");
+  const store = new WorkLogStore({
+    filePath,
+    now: () => new Date(nowMs),
+  });
+  for (let index = 0; index < MAX_RECORDS + 25; index += 1) {
+    const record = store.startExecution({
+      source: "weixin",
+      summary: `message ${index}`,
+      instanceId: "instance-1",
+    });
+    store.finishExecution(record.id, { status: "succeeded" });
+    nowMs += 1_000;
+  }
+
+  const snapshot = store.snapshot();
+  assert.equal(snapshot.records.length, MAX_RECORDS);
+  assert.equal(snapshot.records[0].summary, "message 25");
 });
 
 test("work log bounds events and marks stale active executions interrupted", () => {
