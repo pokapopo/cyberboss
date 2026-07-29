@@ -1,7 +1,6 @@
 const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol-leak-monitor");
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
-const SILENCE_FLUSH_MS = 30_000;
 const TASK_PROGRESS_INTERVAL_MS = 30_000;
 
 function stripAnsi(text) {
@@ -13,25 +12,10 @@ function looksLikeSystemActionJson(text) {
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
     return false;
   }
-  // Only block buffering when the entire reply.completed text is a single
-  // JSON object carrying an action key — this is the final turn result,
-  // not a streaming progress update.
   if (trimmed.indexOf("{", 1) !== -1) {
-    return false; // multiple JSON objects or nested — likely streaming commentary
+    return false;
   }
   return trimmed.includes('"action"') || trimmed.includes('"cyberboss_action"');
-}
-
-function isChineseProgressText(text) {
-  const normalized = String(text || "").trim();
-  if (!normalized) return false;
-  // Must contain Chinese characters — filters out English chain-of-thought
-  if (!/[一-鿿㐀-䶿]/.test(normalized)) return false;
-  // Short progress note, not a full analysis block
-  if (normalized.length > 200) return false;
-  // Must not contain code fences or tool-protocol markers
-  if (containsPlainTextSystemHazard(normalized)) return false;
-  return true;
 }
 
 class StreamDelivery {
@@ -224,15 +208,10 @@ class StreamDelivery {
           return;
         }
 
-        // System turns: buffer short Chinese progress notes the model writes
-        // between tool calls.  Skip the final JSON action (it belongs to
-        // turn.completed parsing) and skip English reasoning.
+        // System/check-in turns do not use the task outbox and must not expose
+        // intermediate assistant text as task progress. Their only user-visible
+        // text is the definitive action resolved from turn.completed.
         if (state.replyTarget?.provider === "system") {
-          const cleaned = stripAnsi(normalizeLineEndings(event.payload.text));
-          if (cleaned && !looksLikeSystemActionJson(cleaned) && isChineseProgressText(cleaned)) {
-            state.streamBuffer += (state.streamBuffer ? "\n" : "") + cleaned;
-            this._ensureBufferTimer(state);
-          }
           return;
         }
 
@@ -292,8 +271,7 @@ class StreamDelivery {
       flushPromise: null,
       sequence: this.runSequence += 1,
       threadReplyTargetAttached: false,
-      streamBuffer: "",
-      bufferTimer: null,
+      sentSystemReplyTexts: new Set(),
       turnStarted: false,
       startedAtMs: 0,
       pendingNaturalProgress: "",
@@ -405,19 +383,6 @@ class StreamDelivery {
       current.completedText = text;
     }
     current.completed = Boolean(completed);
-  }
-
-  _ensureBufferTimer(state) {
-    if (state.bufferTimer) return;
-    state.bufferTimer = setInterval(() => {
-      const text = state.streamBuffer.trim();
-      state.streamBuffer = "";
-      if (text && state.replyTarget) {
-        state.sendChain = state.sendChain
-          .then(() => this.sendSystemReply(state, text))
-          .catch(() => {});
-      }
-    }, SILENCE_FLUSH_MS);
   }
 
   isDurableWeixinRun(state) {
@@ -541,22 +506,6 @@ class StreamDelivery {
       return;
     }
 
-    // Drain progress buffer at turn completion for all providers.
-    // Synchronous reset before any async work to avoid timer races.
-    if (force) {
-      if (state.bufferTimer) {
-        clearInterval(state.bufferTimer);
-        state.bufferTimer = null;
-      }
-      const remaining = state.streamBuffer.trim();
-      state.streamBuffer = "";
-      if (remaining) {
-        state.sendChain = state.sendChain
-          .then(() => this.sendSystemReply(state, remaining))
-          .catch(() => {});
-      }
-    }
-
     if (state.replyTarget.provider === "system") {
       await this.flushSystemReply(state, { force });
       return;
@@ -665,13 +614,25 @@ class StreamDelivery {
   }
 
   async sendSystemReply(state, text) {
+    const deliveryKey = trimOuterBlankLines(normalizeLineEndings(text));
+    if (!deliveryKey || state.sentSystemReplyTexts.has(deliveryKey)) {
+      if (deliveryKey) {
+        console.log(
+          `[cyberboss] deduped system reply thread=${state.threadId} preview=${JSON.stringify(deliveryKey.slice(0, 120))}`
+        );
+      }
+      return;
+    }
     const initialTarget = state.replyTarget;
     const payload = {
       userId: initialTarget.userId,
       text,
       contextToken: initialTarget.contextToken,
     };
-    await this.sendTextWithRetry(state, payload, { kind: "system_reply" });
+    const delivered = await this.sendTextWithRetry(state, payload, { kind: "system_reply" });
+    if (delivered) {
+      state.sentSystemReplyTexts.add(deliveryKey);
+    }
   }
 
   async sendTextWithRetry(state, payload, { kind }) {
@@ -682,7 +643,7 @@ class StreamDelivery {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       try {
         await this.channelAdapter.sendText(payload);
-        return;
+        return true;
       } catch (error) {
         lastError = error;
 
@@ -726,7 +687,7 @@ class StreamDelivery {
     // All attempts exhausted — defer if possible, otherwise throw
     const deferred = await this.deferSystemReply(state, payload.text, lastError, kind);
     if (deferred) {
-      return;
+      return false;
     }
     throw lastError;
   }
@@ -788,9 +749,6 @@ class StreamDelivery {
       return;
     }
     const state = this.stateByRunKey.get(normalizedRunKey);
-    if (state?.bufferTimer) {
-      clearInterval(state.bufferTimer);
-    }
     this.clearTaskProgressTimer(state);
     this.replyTargetByTurnKey.delete(normalizedRunKey);
     this.stateByRunKey.delete(normalizedRunKey);

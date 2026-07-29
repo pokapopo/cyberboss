@@ -116,6 +116,131 @@ test("system send_message JSON sends only the message text", async () => {
   });
 });
 
+test("system final text is not misclassified as progress and sent twice", async () => {
+  const { sent, streamDelivery } = createHarness({ runtimeId: "claudecode" });
+  streamDelivery.queueReplyTargetForThread("thread-system-final", {
+    userId: "user-system-final",
+    contextToken: "ctx-system-final",
+    provider: "system",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-system-final", turnId: "turn-system-final" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-system-final",
+      turnId: "turn-system-final",
+      itemId: "item-system-final",
+      text: "日记和今晚的时间轴都补上了。你睡吧，我守着",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: {
+      threadId: "thread-system-final",
+      turnId: "turn-system-final",
+      text: "日记和今晚的时间轴都补上了。你睡吧，我守着",
+    },
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "user-system-final",
+    text: "日记和今晚的时间轴都补上了。你睡吧，我守着",
+    contextToken: "ctx-system-final",
+  }]);
+});
+
+test("system assistant text is not pushed as progress even when followed by a tool event", async () => {
+  const { sent, streamDelivery } = createHarness({ runtimeId: "claudecode" });
+  streamDelivery.queueReplyTargetForThread("thread-system-progress", {
+    userId: "user-system-progress",
+    contextToken: "ctx-system-progress",
+    provider: "system",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-system-progress", turnId: "turn-system-progress" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-system-progress",
+      turnId: "turn-system-progress",
+      itemId: "item-system-progress",
+      text: "正在补时间轴。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-system-progress",
+      turnId: "turn-system-progress",
+      toolName: "timeline.write",
+      input: {},
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: {
+      threadId: "thread-system-progress",
+      turnId: "turn-system-progress",
+      text: "正在补时间轴。",
+    },
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "user-system-progress",
+    text: "正在补时间轴。",
+    contextToken: "ctx-system-progress",
+  }]);
+});
+
+test("system turns deliver only the distinct final message after tool use", async () => {
+  const { sent, streamDelivery } = createHarness({ runtimeId: "claudecode" });
+  streamDelivery.queueReplyTargetForThread("thread-system-progress-final", {
+    userId: "user-system-progress-final",
+    contextToken: "ctx-system-progress-final",
+    provider: "system",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-system-progress-final", turnId: "turn-system-progress-final" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-system-progress-final",
+      turnId: "turn-system-progress-final",
+      itemId: "item-system-progress-final",
+      text: "正在补时间轴。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-system-progress-final",
+      turnId: "turn-system-progress-final",
+      toolName: "timeline.write",
+      input: {},
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: {
+      threadId: "thread-system-progress-final",
+      turnId: "turn-system-progress-final",
+      text: "日记和时间轴都补好了。",
+    },
+  });
+
+  assert.deepEqual(sent.map((item) => item.text), ["日记和时间轴都补好了。"]);
+});
+
 test("system send_message JSON may be wrapped in a json fence", async () => {
   const { sent, streamDelivery } = createHarness();
   streamDelivery.queueReplyTargetForThread("thread-2f", {

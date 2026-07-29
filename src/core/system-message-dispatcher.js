@@ -91,10 +91,8 @@ function buildDiaryIncrementalPrompt(timeHeader) {
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
     "No markdown fences. No text on the same line as the final JSON.",
     "",
-    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
-    "These are sent to the user as live progress updates. Be natural and brief.",
-    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
-    "Keep each line short — you're narrating your work, not explaining it.",
+    "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
+    "may produce a user-visible text message.",
   ].join("\n").trim();
 }
 
@@ -123,10 +121,8 @@ function buildCheckinPrompt(timeHeader, triggerText) {
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
     "No markdown fences. No text on the same line as the final JSON.",
     "",
-    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
-    "These are sent to the user as live progress updates. Be natural and brief.",
-    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
-    "Keep each line short — you're narrating your work, not explaining it.",
+    "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
+    "may produce a user-visible text message.",
   ];
   if (body) {
     sections.push("", "Trigger:", body);
@@ -152,10 +148,8 @@ function buildDiaryFinalizePrompt(timeHeader) {
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
     "No markdown fences. No text on the same line as the final JSON.",
     "",
-    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
-    "These are sent to the user as live progress updates. Be natural and brief.",
-    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
-    "Keep each line short — you're narrating your work, not explaining it.",
+    "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
+    "may produce a user-visible text message.",
   ].join("\n").trim();
 }
 
@@ -191,10 +185,8 @@ function buildLegacyPrompt(timeHeader, triggerText) {
     "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
     "No markdown fences. No text on the same line as the final JSON.",
     "",
-    "Between tool calls, write ONE short Chinese sentence about what you're doing.",
-    "These are sent to the user as live progress updates. Be natural and brief.",
-    "Examples: \"让我看看今天的日记…\" / \"正在补时间轴。\" / \"准备截图。\"",
-    "Keep each line short — you're narrating your work, not explaining it.",
+    "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
+    "may produce a user-visible text message.",
   );
   if (body) {
     sections.push("", "Trigger:", body);

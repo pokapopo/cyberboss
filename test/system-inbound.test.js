@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 
 const { CyberbossApp } = require("../src/core/app");
+const { SystemMessageDispatcher } = require("../src/core/system-message-dispatcher");
 
 test("system messages bypass normal inbound wrapping", async () => {
   const prepared = await CyberbossApp.prototype.prepareIncomingMessageForRuntime.call({}, {
@@ -20,6 +21,29 @@ test("system messages bypass normal inbound wrapping", async () => {
     attachments: [],
     attachmentFailures: [],
   });
+});
+
+test("system poller prompts forbid intermediate progress messages", () => {
+  const dispatcher = new SystemMessageDispatcher({
+    queueStore: {},
+    config: {
+      workspaceId: "default",
+      workspaceRoot: "/workspace",
+    },
+    accountId: "account-1",
+  });
+
+  for (const triggerKind of ["diary_incremental", "checkin", "diary_finalize", "legacy"]) {
+    const prepared = dispatcher.buildPreparedMessage({
+      id: `message-${triggerKind}`,
+      senderId: "user-1",
+      triggerKind,
+      text: "internal trigger",
+      createdAt: "2026-07-29T00:00:00.000Z",
+    });
+    assert.match(prepared.text, /Do not narrate tool use or emit intermediate progress/);
+    assert.doesNotMatch(prepared.text, /live progress updates/);
+  }
 });
 
 test("image attachments stay as inbound drafts before runtime turn assembly", async () => {
