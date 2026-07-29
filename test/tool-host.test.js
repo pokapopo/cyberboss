@@ -6,6 +6,32 @@ const { ProjectToolHost } = require("../src/tools/tool-host");
 function createHost() {
   return new ProjectToolHost({
     services: {
+      workLog: {
+        search(args) {
+          return [{
+            id: "work-1",
+            executionStatus: args.status || "failed",
+            source: args.source || "weixin",
+          }];
+        },
+        get(id) {
+          return id === "work-1"
+            ? { id, events: [{ type: "execution.failed", detail: "timeout" }] }
+            : null;
+        },
+        recordToolUseForContext() {},
+      },
+      experience: {
+        search() {
+          return [{ id: "exp-1", title: "Known timeout" }];
+        },
+        record(args) {
+          return {
+            created: true,
+            entry: { id: "exp-2", ...args },
+          };
+        },
+      },
       diary: {
         async append(args) {
           return { filePath: "/tmp/diary.md", ...args };
@@ -339,6 +365,41 @@ test("tool host descriptions include schema summary for models that only surface
   assert.match(timelineWrite.description, /Input:/);
   assert.match(timelineWrite.description, /date: string/);
   assert.match(timelineWrite.description, /events: \{/);
+});
+
+test("tool host exposes agent-visible work-log and verified experience tools", async () => {
+  const host = createHost();
+  const tools = host.listTools();
+  const workLogSearch = tools.find((tool) => tool.name === "cyberboss_worklog_search");
+  const experienceSearch = tools.find((tool) => tool.name === "cyberboss_experience_search");
+  const experienceRecord = tools.find((tool) => tool.name === "cyberboss_experience_record");
+
+  assert.match(workLogSearch.description, /why a recent Weixin or system task failed/i);
+  assert.match(experienceSearch.description, /before diagnosing a recurring problem/i);
+  assert.match(experienceRecord.description, /only after the cause, resolution, and verification/i);
+
+  const workLogs = await host.invokeTool("cyberboss_worklog_search", {
+    source: "weixin",
+    status: "failed",
+  });
+  const workLog = await host.invokeTool("cyberboss_worklog_get", {
+    workLogId: "work-1",
+  });
+  const experiences = await host.invokeTool("cyberboss_experience_search", {
+    query: "timeout",
+  });
+  const recorded = await host.invokeTool("cyberboss_experience_record", {
+    signature: "timeout",
+    title: "Known timeout",
+    problem: "A task timed out",
+    resolution: "Bound the retry budget",
+    verification: "Targeted regression passed",
+  });
+
+  assert.equal(workLogs.data.records[0].id, "work-1");
+  assert.equal(workLog.data.record.events[0].detail, "timeout");
+  assert.equal(experiences.data.entries[0].id, "exp-1");
+  assert.equal(recorded.data.entry.id, "exp-2");
 });
 
 test("tool host exposes whereabouts tools from the external dependency", async () => {

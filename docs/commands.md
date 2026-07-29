@@ -82,11 +82,17 @@ Those capabilities are exposed as project-native structured tools:
 - `cyberboss_timeline_serve`
 - `cyberboss_timeline_dev`
 - `cyberboss_timeline_screenshot`
+- `cyberboss_worklog_search`
+- `cyberboss_worklog_get`
+- `cyberboss_experience_search`
+- `cyberboss_experience_record`
 
 Notes:
 - These tools are bound to the Cyberboss project and routed through the repo's internal tool host.
 - Claude Code loads them through workspace-local `.mcp.json` injected by Cyberboss and passed to Claude at startup with `--mcp-config`.
 - Codex loads them through the runtime-side Cyberboss MCP bridge configured at spawn time.
+- Weixin and system runtime executions are logged automatically; work-log tools are read-only lookup tools.
+- Experience records require a problem, resolution, and concrete verification. Matching signatures update an existing entry.
 - The public human terminal surface stays intentionally small: lifecycle commands plus shared bridge scripts.
 
 ## Current WeChat Commands

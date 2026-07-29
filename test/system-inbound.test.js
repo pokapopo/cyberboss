@@ -41,6 +41,7 @@ test("system poller prompts forbid intermediate progress messages", () => {
       text: "internal trigger",
       createdAt: "2026-07-29T00:00:00.000Z",
     });
+    assert.equal(prepared.triggerKind, triggerKind);
     assert.match(prepared.text, /Do not narrate tool use or emit intermediate progress/);
     assert.doesNotMatch(prepared.text, /live progress updates/);
   }

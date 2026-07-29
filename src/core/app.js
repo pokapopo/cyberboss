@@ -77,6 +77,8 @@ class CyberbossApp {
       timelineIntegration: this.timelineIntegration,
     });
     this.projectServices = projectTooling.services;
+    this.workLogStore = this.projectServices.workLog;
+    this.workLogInstanceId = crypto.randomUUID();
     this.projectToolHost = projectTooling.toolHost;
     this.runtimeContextStore = projectTooling.runtimeContextStore;
     this.runtimeAdapter = createRuntimeAdapter(config);
@@ -97,6 +99,7 @@ class CyberbossApp {
     this.weixinDeliveryService = new WeixinDeliveryService({
       filePath: config.weixinDeliveryOutboxFile || path.join(config.stateDir, "weixin-delivery-outbox.json"),
       channelAdapter: this.channelAdapter,
+      onDeliveryEvent: (event) => safeWorkLogCall(this, "recordDeliveryEvent", event),
     });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
@@ -148,6 +151,14 @@ class CyberbossApp {
     const runtimeState = await this.runtimeAdapter.initialize();
     const knownContextTokens = Object.keys(this.channelAdapter.getKnownContextTokens()).length;
     const syncBuffer = this.channelAdapter.loadSyncBuffer();
+    const interruptedWorkLogs = safeWorkLogCall(
+      this,
+      "recoverInterruptedRuns",
+      this.workLogInstanceId,
+    ) || 0;
+    if (interruptedWorkLogs > 0) {
+      console.warn(`[cyberboss] work-log recovered interrupted executions count=${interruptedWorkLogs}`);
+    }
     await this.weixinDeliveryService.start();
     await this.migrateDeferredPlainRepliesToOutbox();
     await this.restoreBoundThreadSubscriptions();
@@ -529,6 +540,10 @@ class CyberbossApp {
         type: "runtime.turn.failed",
         payload: { threadId, turnId, text: `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
       });
+      safeWorkLogCall(this, "recordRuntimeEvent", {
+        type: "runtime.turn.failed",
+        payload: { threadId, turnId, text: `Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
+      });
       await this.sendFailureToThread(
         threadId,
         `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)`,
@@ -552,6 +567,16 @@ class CyberbossApp {
 
   async dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared }) {
     const pendingScopeKey = this.turnGateStore.begin(bindingKey, workspaceRoot);
+    const workLog = safeWorkLogCall(this, "startExecution", {
+      source: prepared.provider === "system" ? "system" : "weixin",
+      triggerKind: prepared.triggerKind,
+      summary: buildWorkLogSummary(prepared),
+      workspaceRoot,
+      bindingKey,
+      messageIds: collectPreparedMessageIds(prepared),
+      runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
+      instanceId: this.workLogInstanceId,
+    }) || null;
     await this.channelAdapter.sendTyping({
       userId: prepared.senderId,
       status: 1,
@@ -576,6 +601,15 @@ class CyberbossApp {
           senderId: prepared.senderId,
         },
       });
+      const runKey = buildRunKey(turn.threadId, turn.turnId);
+      if (workLog?.id) {
+        safeWorkLogCall(this, "bindRuntime", workLog.id, {
+          runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          runKey,
+        });
+      }
       this.runtimeContextStore?.setActiveContext?.({
         workspaceRoot,
         runtimeId: this.runtimeAdapter.describe().id,
@@ -583,6 +617,7 @@ class CyberbossApp {
         bindingKey,
         accountId: prepared.accountId,
         senderId: prepared.senderId,
+        workLogId: workLog?.id || "",
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
       this.pendingUserContexts.set(turn.threadId, prepared.text);
@@ -602,7 +637,7 @@ class CyberbossApp {
       }
       if (replyTarget.provider === "weixin") {
         this.weixinDeliveryService?.registerRun?.({
-          runKey: buildRunKey(turn.threadId, turn.turnId),
+          runKey,
           threadId: turn.threadId,
           turnId: turn.turnId,
           target: replyTarget,
@@ -613,6 +648,14 @@ class CyberbossApp {
     } catch (error) {
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
       const messageText = error instanceof Error ? error.message : String(error || "unknown error");
+      const dispatchRunKey = `dispatch:${prepared.messageId || workLog?.id || Date.now()}`;
+      if (workLog?.id) {
+        safeWorkLogCall(this, "setRunKey", workLog.id, dispatchRunKey);
+        safeWorkLogCall(this, "finishExecution", workLog.id, {
+          status: "failed",
+          error: messageText,
+        });
+      }
       const failurePayload = {
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
@@ -620,7 +663,7 @@ class CyberbossApp {
       };
       if (this.weixinDeliveryService?.enqueue) {
         await this.weixinDeliveryService.enqueue({
-          runKey: `dispatch:${prepared.messageId || Date.now()}`,
+          runKey: dispatchRunKey,
           target: {
             userId: prepared.senderId,
             contextToken: prepared.contextToken,
@@ -1771,6 +1814,7 @@ class CyberbossApp {
   }
 
   async handleRuntimeEvent(event) {
+    safeWorkLogCall(this, "recordRuntimeEvent", event);
     const failureReplyTarget = event?.type === "runtime.turn.failed"
       ? this.streamDelivery.resolveReplyTargetForRun({
           threadId: event?.payload?.threadId,
@@ -2609,6 +2653,44 @@ function maxRetryCount(messages) {
     }
   }
   return max;
+}
+
+function collectPreparedMessageIds(prepared) {
+  const values = [
+    ...(Array.isArray(prepared?.messageIds) ? prepared.messageIds : []),
+    prepared?.messageId,
+  ];
+  return [...new Set(values.map((value) => normalizeText(value)).filter(Boolean))];
+}
+
+function buildWorkLogSummary(prepared) {
+  if (prepared?.provider === "system") {
+    const triggerKind = normalizeText(prepared?.triggerKind);
+    return triggerKind ? `System execution: ${triggerKind}` : "System execution";
+  }
+  const text = normalizeText(prepared?.originalText || prepared?.text)
+    .replace(/\s+/g, " ");
+  if (text) {
+    return text.slice(0, 160);
+  }
+  const attachmentCount = Array.isArray(prepared?.attachments) ? prepared.attachments.length : 0;
+  return attachmentCount > 0
+    ? `Weixin execution with ${attachmentCount} attachment(s)`
+    : "Weixin execution";
+}
+
+function safeWorkLogCall(appLike, method, ...args) {
+  const fn = appLike?.workLogStore?.[method];
+  if (typeof fn !== "function") {
+    return null;
+  }
+  try {
+    return fn.apply(appLike.workLogStore, args);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "unknown error");
+    console.error(`[cyberboss] work-log ${method} failed: ${message}`);
+    return null;
+  }
 }
 
 function parseMessageIdForOrdering(value) {

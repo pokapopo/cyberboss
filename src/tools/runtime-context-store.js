@@ -38,6 +38,7 @@ class RuntimeContextStore {
     bindingKey = "",
     accountId = "",
     senderId = "",
+    workLogId = "",
   } = {}) {
     const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
@@ -50,6 +51,7 @@ class RuntimeContextStore {
       bindingKey: normalizeText(bindingKey),
       accountId: normalizeText(accountId),
       senderId: normalizeText(senderId),
+      workLogId: normalizeText(workLogId),
       updatedAt: new Date().toISOString(),
     };
     withFileLockSync(this.filePath, () => {

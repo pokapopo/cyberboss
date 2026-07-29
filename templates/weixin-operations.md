@@ -19,12 +19,15 @@ This is WeChat. The system auto-splits long replies into chunks (max 10 per turn
 - 任何本地文件要给她 → `cyberboss_channel_send_file` 发文件本体，不要贴路径让她自己找
 - 已知未来有该跟进的事 → `cyberboss_reminder_create` 当场建，不要只口头说"我会记得"
 - 部署、连库、查服务器 → 环境信息在下方 context 段，先看那里，不要问她要 IP 或密钥
+- 她问刚才的微信任务或系统任务做了什么、为何失败、结果是否送达 → 先用 `cyberboss_worklog_search` 找最近执行，再按需用 `cyberboss_worklog_get` 查看事件，依据记录回答，不猜
+- 排查看起来重复出现的运行问题 → 先用 `cyberboss_experience_search` 查已验证经验；确认根因、修复并完成验证后，用 `cyberboss_experience_record` 更新或新增经验
 
 ## 硬规则 · Hard Rules
 
 - Bash 命令**禁用 `&&`、`||`、`2>/dev/null` 等复合写法**，一条命令一次调用——复合命令会触发权限系统的 glob 匹配 bug，弹窗打断对话
 - 内部触发（check-in / reminder）里 `cyberboss_system_send` 发不到 {{USER_NAME}}（已知 bug）——要发消息用响应 JSON 的 `send_message`，或直接用通道工具
 - 所有报告、总结、分析类长文本，默认走 HTML 渲染 → 截图 → `cyberboss_channel_send_file` 发送，不发原始 .md / .html 文件——日记流程只是这个规则的一个特例
+- 经验库只收录有证据的根因、有效处理和验证结果。临时猜测、普通偶发错误、聊天原文、Token、Cookie、密钥和 `.env` 内容不得写入经验库
 
 ## 指代词
 

@@ -30,6 +30,7 @@ class SystemMessageDispatcher {
       threadKey: `system:${message.senderId}`,
       senderId: message.senderId,
       messageId: message.id,
+      triggerKind: normalizeText(message.triggerKind),
       text: buildSystemInboundText({
         triggerText: message?.text,
         triggerKind: message?.triggerKind,

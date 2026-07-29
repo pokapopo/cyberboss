@@ -344,3 +344,55 @@ test("task delivery rejects an unregistered system turn before it can notify Wei
   assert.equal(service.store.snapshot().deliveries.length, 0);
   await service.close();
 });
+
+test("delivery service reports queued, retry, and confirmed delivery events", async () => {
+  const filePath = createTempFile();
+  let nowMs = Date.parse("2026-07-29T00:00:00.000Z");
+  let shouldFail = true;
+  const events = [];
+  const service = new WeixinDeliveryService({
+    filePath,
+    now: () => new Date(nowMs),
+    onDeliveryEvent(event) {
+      events.push(event);
+    },
+    channelAdapter: {
+      prepareTextDelivery({ text }) {
+        return [text];
+      },
+      getKnownContextTokens() {
+        return { "user-1": "ctx-1" };
+      },
+      async sendTextChunk() {
+        if (shouldFail) {
+          throw new Error("sendMessage http 503");
+        }
+      },
+    },
+  });
+  service.registerRun({
+    runKey: "thread-1:turn-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    target: createTarget(),
+  });
+
+  await service.enqueue({
+    runKey: "thread-1:turn-1",
+    target: createTarget(),
+    kind: "final",
+    text: "done",
+  });
+  await service.drain();
+  shouldFail = false;
+  nowMs += 2_000;
+  await service.drain();
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "delivery.queued",
+    "delivery.retry",
+    "delivery.delivered",
+  ]);
+  assert.equal(events[1].attemptCount, 1);
+  await service.close();
+});

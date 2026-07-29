@@ -263,12 +263,14 @@ class WeixinDeliveryService {
     pollIntervalMs = 1_000,
     now = () => new Date(),
     instanceId = crypto.randomUUID(),
+    onDeliveryEvent = null,
   }) {
     this.store = new WeixinDeliveryOutboxStore({ filePath });
     this.channelAdapter = channelAdapter;
     this.pollIntervalMs = Math.max(10, Number(pollIntervalMs) || 1_000);
     this.now = now;
     this.instanceId = instanceId;
+    this.onDeliveryEvent = typeof onDeliveryEvent === "function" ? onDeliveryEvent : null;
     this.timer = null;
     this.drainPromise = null;
     this.closed = false;
@@ -367,6 +369,15 @@ class WeixinDeliveryService {
       createdAt: nowIso,
       updatedAt: nowIso,
     });
+    if (delivery) {
+      this.emitDeliveryEvent({
+        type: "delivery.queued",
+        runKey: delivery.runKey,
+        deliveryId: delivery.id,
+        kind: delivery.kind,
+        attemptCount: delivery.attemptCount,
+      });
+    }
     void this.drain();
     return delivery;
   }
@@ -421,6 +432,14 @@ class WeixinDeliveryService {
         waitingForContext: true,
         nowIso: this.nowIso(),
       });
+      this.emitDeliveryEvent({
+        type: "delivery.waiting_context",
+        runKey: delivery.runKey,
+        deliveryId: delivery.id,
+        kind: delivery.kind,
+        attemptCount: delivery.attemptCount + 1,
+        error: "Missing context_token",
+      });
       return;
     }
 
@@ -448,6 +467,15 @@ class WeixinDeliveryService {
       console.log(
         `[cyberboss] outbox chunk delivered id=${delivery.id} kind=${delivery.kind} chunk=${delivery.nextChunkIndex + 1}/${delivery.chunks.length} complete=${result.delivered}`
       );
+      if (result.delivered) {
+        this.emitDeliveryEvent({
+          type: "delivery.delivered",
+          runKey: delivery.runKey,
+          deliveryId: delivery.id,
+          kind: delivery.kind,
+          attemptCount: delivery.attemptCount,
+        });
+      }
     } catch (error) {
       const waitingForContext = isContextFailure(error);
       const delayMs = resolveRetryDelayMs(delivery.attemptCount);
@@ -461,6 +489,14 @@ class WeixinDeliveryService {
       console.error(
         `[cyberboss] outbox delivery failed id=${delivery.id} kind=${delivery.kind} attempt=${delivery.attemptCount + 1} waitingContext=${waitingForContext} retryMs=${waitingForContext ? 0 : delayMs} error=${sanitizeError(error)}`
       );
+      this.emitDeliveryEvent({
+        type: waitingForContext ? "delivery.waiting_context" : "delivery.retry",
+        runKey: delivery.runKey,
+        deliveryId: delivery.id,
+        kind: delivery.kind,
+        attemptCount: delivery.attemptCount + 1,
+        error: sanitizeError(error),
+      });
     }
   }
 
@@ -500,6 +536,19 @@ class WeixinDeliveryService {
 
   nowIso() {
     return this.now().toISOString();
+  }
+
+  emitDeliveryEvent(event) {
+    if (!this.onDeliveryEvent) {
+      return;
+    }
+    try {
+      this.onDeliveryEvent(event);
+    } catch (error) {
+      console.error(
+        `[cyberboss] delivery event observer failed type=${normalizeText(event?.type)} error=${sanitizeError(error)}`
+      );
+    }
   }
 }
 

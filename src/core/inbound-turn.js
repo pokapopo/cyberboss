@@ -31,6 +31,13 @@ function buildMergedInboundPrepared({
   }
   const attachments = queued.flatMap((message) => Array.isArray(message.attachments) ? message.attachments : []);
   const attachmentFailures = queued.flatMap((message) => Array.isArray(message.attachmentFailures) ? message.attachmentFailures : []);
+  const messageIds = queued
+    .map((message) => normalizeText(message.messageId))
+    .filter(Boolean);
+  const trailingMessageId = normalizeText(trailingPrepared?.messageId);
+  if (trailingMessageId) {
+    messageIds.push(trailingMessageId);
+  }
   const originalText = originalTexts.join("\n\n");
 
   return {
@@ -39,6 +46,7 @@ function buildMergedInboundPrepared({
     ...latest,
     originalText,
     text: originalText,
+    messageIds: [...new Set(messageIds)],
     attachments,
     attachmentFailures,
   };
@@ -158,6 +166,7 @@ function clonePreparedInboundMessage(prepared) {
     accountId: prepared.accountId,
     senderId: prepared.senderId,
     messageId: prepared.messageId,
+    messageIds: Array.isArray(prepared.messageIds) ? prepared.messageIds.slice() : [],
     contextToken: prepared.contextToken,
     provider: prepared.provider,
     originalText: prepared.originalText,

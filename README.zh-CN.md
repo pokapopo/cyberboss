@@ -465,10 +465,17 @@ ${HOME}/.cyberboss
 - `cyberboss_sticker_save_from_inbox`
 - `cyberboss_sticker_update`
 - `cyberboss_system_send`
+- `cyberboss_worklog_search`
+- `cyberboss_worklog_get`
+- `cyberboss_experience_search`
+- `cyberboss_experience_record`
 
 ### Agent 使用约定
 
 - diary、reminder、timeline、screenshot、file-send 这类 Cyberboss 能力使用项目工具
+- 微信与系统 runtime 执行会自动留下精简档案；询问近期执行情况时，agent 先查 work log
+- 重复问题排查前先搜索经验库；只有确认根因、修复并验证后才记录经验
+- 工作档案和经验默认写入 `~/.cyberboss/work-log.json` 与 `~/.cyberboss/experience-library.json`，不保存完整聊天或工具参数
 - 终端给人手动使用的仍然是 `README`、`--help` 和 [docs/commands.md](./docs/commands.md) 中的生命周期入口
 - 第一次执行失败时，先反馈报错，不要立刻读源码
 

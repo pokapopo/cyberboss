@@ -28,6 +28,15 @@ class ProjectToolHost {
     if (spec) {
       validateSchema(spec.inputSchema, normalizedArgs, toolName, "input");
       const resolvedContext = this.resolveContext(context);
+      if (resolvedContext.runtimeId === "codex") {
+        try {
+          this.services.workLog?.recordToolUseForContext?.(resolvedContext, toolName);
+        } catch (error) {
+          console.error(
+            `[cyberboss] work-log tool observation failed tool=${toolName}: ${error?.message || String(error)}`
+          );
+        }
+      }
       return await spec.handler({
         services: this.services,
         args: normalizedArgs,
@@ -56,6 +65,7 @@ class ProjectToolHost {
       bindingKey: normalizeText(context.bindingKey) || normalizeText(active.bindingKey),
       accountId: normalizeText(context.accountId) || normalizeText(active.accountId),
       senderId: normalizeText(context.senderId) || normalizeText(active.senderId),
+      workLogId: normalizeText(context.workLogId) || normalizeText(active.workLogId),
     };
   }
 }
@@ -68,6 +78,111 @@ function listProjectToolNames() {
 }
 
 const PROJECT_TOOLS = [
+  {
+    name: "cyberboss_worklog_search",
+    description: "Search recent Cyberboss execution records. When the user asks what happened, why a recent Weixin or system task failed, whether a result was delivered, or what Cyberboss did, call this before guessing. Records contain compact operational facts, not full conversations.",
+    shortHint: "Search recent execution records before explaining task behavior or failures.",
+    topics: ["operations", "worklog"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Optional words such as diary, delivery, failed, a tool name, or an error fragment." },
+        source: { type: "string", description: "Optional source filter: weixin or system." },
+        status: { type: "string", description: "Optional execution or delivery status filter." },
+        limit: { type: "integer", description: "Maximum records, from 1 to 20." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const records = services.workLog.search(args);
+      return {
+        text: `Cyberboss work logs found: ${records.length}. Inspect a record with cyberboss_worklog_get when event detail is needed.`,
+        data: { records },
+      };
+    },
+  },
+  {
+    name: "cyberboss_worklog_get",
+    description: "Load one Cyberboss execution record with its bounded event history. Use after cyberboss_worklog_search when diagnosing a specific recent execution. Do not claim a cause that the record does not support.",
+    shortHint: "Inspect one execution record and its event history.",
+    topics: ["operations", "worklog"],
+    inputSchema: {
+      type: "object",
+      required: ["workLogId"],
+      properties: {
+        workLogId: { type: "string", description: "Work-log id returned by cyberboss_worklog_search." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const record = services.workLog.get(args.workLogId);
+      return {
+        text: record ? `Cyberboss work log loaded: ${record.id}.` : "Cyberboss work log not found.",
+        data: { record },
+      };
+    },
+  },
+  {
+    name: "cyberboss_experience_search",
+    description: "Search Cyberboss's verified operational experience before diagnosing a recurring problem or repeating a repair. Experience entries contain previously verified symptoms, resolutions, and checks; treat them as relevant evidence, not guaranteed current truth.",
+    shortHint: "Search verified prior experience before diagnosing recurring operational problems.",
+    topics: ["operations", "experience"],
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", description: "Problem symptoms, component, error signature, or repair topic." },
+        tags: {
+          type: "array",
+          description: "Optional tags that all matching entries must contain.",
+          items: { type: "string" },
+        },
+        limit: { type: "integer", description: "Maximum entries, from 1 to 10." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const entries = services.experience.search(args);
+      return {
+        text: `Verified Cyberboss experiences found: ${entries.length}.`,
+        data: { entries },
+      };
+    },
+  },
+  {
+    name: "cyberboss_experience_record",
+    description: "Create or update a reusable Cyberboss operational experience only after the cause, resolution, and verification are supported by evidence. Never record guesses, transient noise, secrets, raw conversation text, tokens, cookies, or environment values. Reuse a stable signature to update the same experience instead of duplicating it.",
+    shortHint: "Record a deduplicated operational experience only after the repair is verified.",
+    topics: ["operations", "experience"],
+    inputSchema: {
+      type: "object",
+      required: ["title", "problem", "resolution", "verification"],
+      properties: {
+        signature: { type: "string", description: "Stable optional key such as weixin-delivery-context-expired." },
+        title: { type: "string", description: "Short reusable experience title." },
+        problem: { type: "string", description: "Sanitized symptoms and confirmed cause." },
+        resolution: { type: "string", description: "The action that resolved the problem." },
+        verification: { type: "string", description: "Concrete evidence that the resolution worked." },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+        },
+        relatedWorkLogIds: {
+          type: "array",
+          description: "Optional work-log ids that support this experience.",
+          items: { type: "string" },
+        },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = services.experience.record(args);
+      return {
+        text: `${result.created ? "Recorded" : "Updated"} verified Cyberboss experience: ${result.entry.id}.`,
+        data: result,
+      };
+    },
+  },
   {
     name: "cyberboss_diary_append",
     description: "Append a diary entry into Cyberboss local diary storage.",

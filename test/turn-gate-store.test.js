@@ -220,8 +220,25 @@ test("handlePreparedMessage queues while the scope is in a turn-boundary handoff
 test("dispatchPreparedTurn binds reply target to the explicit turn id when runtime returns one", async () => {
   const turnBindings = [];
   const queuedBindings = [];
+  const workLogCalls = [];
+  const runtimeContexts = [];
   const order = [];
   const appLike = {
+    workLogInstanceId: "instance-1",
+    workLogStore: {
+      startExecution(payload) {
+        workLogCalls.push(["start", payload]);
+        return { id: "work-1" };
+      },
+      bindRuntime(id, payload) {
+        workLogCalls.push(["bind", id, payload]);
+      },
+    },
+    runtimeContextStore: {
+      setActiveContext(payload) {
+        runtimeContexts.push(payload);
+      },
+    },
     channelAdapter: {
       async sendTyping() {
         order.push("typing");
@@ -237,6 +254,9 @@ test("dispatchPreparedTurn binds reply target to the explicit turn id when runti
       releaseScope() {},
     },
     runtimeAdapter: {
+      describe() {
+        return { id: "claudecode" };
+      },
       async sendTextTurn() {
         return { threadId: "thread-1", turnId: "turn-1" };
       },
@@ -291,6 +311,11 @@ test("dispatchPreparedTurn binds reply target to the explicit turn id when runti
   }]);
   assert.deepEqual(queuedBindings, []);
   assert.deepEqual(order, ["begin", "typing"]);
+  assert.equal(workLogCalls[0][0], "start");
+  assert.equal(workLogCalls[0][1].source, "system");
+  assert.equal(workLogCalls[1][0], "bind");
+  assert.equal(workLogCalls[1][2].runKey, "thread-1:turn-1");
+  assert.equal(runtimeContexts[0].workLogId, "work-1");
 });
 
 test("completed turns flush queued inbound work before system messages", async () => {

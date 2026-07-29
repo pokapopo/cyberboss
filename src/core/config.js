@@ -29,6 +29,8 @@ function readConfig() {
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
     deferredSystemReplyQueueFile: path.join(stateDir, "deferred-system-replies.json"),
     weixinDeliveryOutboxFile: path.join(stateDir, "weixin-delivery-outbox.json"),
+    workLogFile: path.join(stateDir, "work-log.json"),
+    experienceFile: path.join(stateDir, "experience-library.json"),
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     timelineScreenshotQueueFile: path.join(stateDir, "timeline-screenshot-queue.json"),
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
