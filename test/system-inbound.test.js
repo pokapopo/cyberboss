@@ -47,6 +47,41 @@ test("system poller prompts forbid intermediate progress messages", () => {
   }
 });
 
+test("nightly diary prompt requires complete specifications and CC reflection validation", () => {
+  const memoryDir = "/state/memory";
+  const dispatcher = new SystemMessageDispatcher({
+    queueStore: {},
+    config: {
+      workspaceId: "default",
+      workspaceRoot: "/workspace",
+      memoryDir,
+    },
+    accountId: "account-1",
+  });
+
+  const prepared = dispatcher.buildPreparedMessage({
+    id: "message-diary-finalize",
+    senderId: "user-1",
+    triggerKind: "diary_finalize",
+    createdAt: "2026-07-29T23:00:00.000Z",
+  });
+
+  for (const file of [
+    "reference-diary-format.md",
+    "feedback-diary-send-screenshot.md",
+    "feedback-diary-detail-precision.md",
+    "feedback-verify-before-writing.md",
+    "feedback-diary-less-schedule.md",
+    "feedback-diary-no-templates.md",
+  ]) {
+    assert.match(prepared.text, new RegExp(`${memoryDir}/${file.replaceAll(".", "\\.")}`));
+  }
+  assert.match(prepared.text, /load the COMPLETE contents/);
+  assert.match(prepared.text, /exact standalone heading `## CC 的想法`/);
+  assert.match(prepared.text, /must not be empty/);
+  assert.match(prepared.text, /Do not render, send, or return silent until/);
+});
+
 test("image attachments stay as inbound drafts before runtime turn assembly", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-inbound-test-"));
   const originalFetch = global.fetch;

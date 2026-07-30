@@ -35,6 +35,7 @@ class SystemMessageDispatcher {
         triggerText: message?.text,
         triggerKind: message?.triggerKind,
         createdAt: message?.createdAt,
+        config: this.config,
       }),
       attachments: [],
       command: "message",
@@ -45,7 +46,7 @@ class SystemMessageDispatcher {
   }
 }
 
-function buildSystemInboundText({ triggerText, triggerKind, createdAt }) {
+function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = {} }) {
   const localTime = formatSystemLocalTime(createdAt);
   const timeHeader = localTime ? [`[${localTime}]`, ""] : [];
 
@@ -55,7 +56,7 @@ function buildSystemInboundText({ triggerText, triggerKind, createdAt }) {
     case "checkin":
       return buildCheckinPrompt(timeHeader, triggerText);
     case "diary_finalize":
-      return buildDiaryFinalizePrompt(timeHeader);
+      return buildDiaryFinalizePrompt(timeHeader, config);
     default:
       // Fallback for legacy messages without triggerKind (reminders, location, etc.)
       return buildLegacyPrompt(timeHeader, triggerText);
@@ -131,18 +132,39 @@ function buildCheckinPrompt(timeHeader, triggerText) {
   return sections.join("\n").trim();
 }
 
-function buildDiaryFinalizePrompt(timeHeader) {
+function buildDiaryFinalizePrompt(timeHeader, config = {}) {
+  const memoryDir = normalizeText(config.memoryDir) || "~/.cyberboss/memory";
+  const requiredDiarySpecifications = [
+    "reference-diary-format.md",
+    "feedback-diary-send-screenshot.md",
+    "feedback-diary-detail-precision.md",
+    "feedback-verify-before-writing.md",
+    "feedback-diary-less-schedule.md",
+    "feedback-diary-no-templates.md",
+  ];
   return [...timeHeader,
     "DIARY FINALIZE — end-of-day wrap-up.",
     "",
     "Your task. Do these in order:",
     "",
-    "1. Read ALL diary entries and notes written today. Gather everything together.",
-    "2. Merge and polish them into a single cohesive diary entry for today. Write it",
+    "1. Before writing, use Read to load the COMPLETE contents of every diary",
+    "   specification below. Do not rely on summaries, memory search snippets, or",
+    "   instructions retained from an earlier turn:",
+    ...requiredDiarySpecifications.map((file) => `   - ${memoryDir}/${file}`),
+    "2. Read ALL diary entries and notes written today. Gather everything together.",
+    "3. Merge and polish them into a single cohesive diary entry for today. Write it",
     "   in the standard diary voice — warm, lyrical, writing to her not about her.",
-    "3. Capture a timeline screenshot (day view, Chinese locale) and send it to the user.",
-    "4. Render the finalized diary as HTML and screenshot it. Send to the user.",
-    "5. After sending both, return silent. The day's diary work is complete.",
+    "4. The final Markdown MUST contain the exact standalone heading `## CC 的想法`,",
+    "   followed by a substantive first-person reflection from CC. It must not be empty,",
+    "   folded into another section, or replaced by an event summary.",
+    "5. Re-read the final Markdown and verify `## CC 的想法` exists and has substantive",
+    "   content. If it is absent or empty, revise the diary before doing anything else.",
+    "6. Capture a timeline screenshot (day view, Chinese locale) and send it to the user.",
+    "7. Render the finalized diary as HTML and screenshot it. Send to the user.",
+    "8. After sending both, return silent. The day's diary work is complete.",
+    "",
+    "Do not render, send, or return silent until the specification reads and final",
+    "`## CC 的想法` self-check have passed.",
     "",
     "Return exactly one JSON object after any tool calls:",
     "{\"action\":\"silent\"}",
