@@ -180,10 +180,11 @@ test("topic-aware coordinator skips short continuations and retrieves after a cl
   assert.equal(first.recalled.length, 1);
   assert.equal(shortReply.recalled.length, 0);
   assert.equal(changed.reason, "explicit_topic_change");
+  assert.equal(changed.recalled.length, 1);
   assert.equal(searches.length, 2);
 });
 
-test("coordinator periodically recalls on the fifth same-topic user turn", async () => {
+test("coordinator searches on the fifth same-topic turn without reinjecting unchanged memory", async () => {
   const searches = [];
   const memoryService = {
     isRecallConfigured() {
@@ -194,7 +195,7 @@ test("coordinator periodically recalls on the fifth same-topic user turn", async
     },
     async search(query) {
       searches.push(query);
-      return [];
+      return [{ file: "memory.md", description: "命中", body: "相同正文", score: 0.8 }];
     },
   };
   const coordinator = new ConversationMemoryCoordinator({
@@ -207,6 +208,7 @@ test("coordinator periodically recalls on the fifth same-topic user turn", async
     text: "继续讨论微信消息投递稳定性的修复方案",
   });
   assert.equal(initial.reason, "initial_topic");
+  assert.equal(initial.recalled.length, 1);
 
   for (let index = 1; index <= 4; index += 1) {
     const result = await coordinator.prepareTurn({
@@ -222,7 +224,107 @@ test("coordinator periodically recalls on the fifth same-topic user turn", async
   });
 
   assert.equal(fifth.reason, "periodic_refresh");
+  assert.equal(fifth.recalled.length, 0);
   assert.equal(searches.length, 2);
+});
+
+test("coordinator reinjects a changed memory body during the dedup cooldown", async () => {
+  let body = "初始正文";
+  const memoryService = {
+    isRecallConfigured() {
+      return true;
+    },
+    isExtractionConfigured() {
+      return false;
+    },
+    async search() {
+      return [{ file: "memory.md", description: "命中", body, score: 0.8 }];
+    },
+  };
+  const coordinator = new ConversationMemoryCoordinator({
+    memoryService,
+    recallEveryTurns: 5,
+  });
+
+  await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案",
+  });
+  for (let index = 1; index <= 4; index += 1) {
+    await coordinator.prepareTurn({
+      scopeKey: "binding::workspace",
+      text: `继续讨论微信消息投递稳定性的修复方案第${index}部分`,
+    });
+  }
+  body = "已经更新的正文";
+  const fifth = await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案第五部分",
+  });
+
+  assert.equal(fifth.recalled.length, 1);
+  assert.equal(fifth.recalled[0].body, "已经更新的正文");
+});
+
+test("coordinator allows unchanged periodic memory after the dedup cooldown", async () => {
+  const memoryService = {
+    isRecallConfigured() {
+      return true;
+    },
+    isExtractionConfigured() {
+      return false;
+    },
+    async search() {
+      return [{ file: "memory.md", description: "命中", body: "相同正文", score: 0.8 }];
+    },
+  };
+  const coordinator = new ConversationMemoryCoordinator({
+    memoryService,
+    recallEveryTurns: 5,
+  });
+
+  await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案",
+  });
+  let latest;
+  for (let index = 1; index <= 20; index += 1) {
+    latest = await coordinator.prepareTurn({
+      scopeKey: "binding::workspace",
+      text: `继续讨论微信消息投递稳定性的修复方案第${index}部分`,
+    });
+  }
+
+  assert.equal(latest.reason, "periodic_refresh");
+  assert.equal(latest.recalled.length, 1);
+});
+
+test("coordinator bounds total injected memory body characters", async () => {
+  const memoryService = {
+    isRecallConfigured() {
+      return true;
+    },
+    isExtractionConfigured() {
+      return false;
+    },
+    async search() {
+      return [1, 2, 3].map((index) => ({
+        file: `memory-${index}.md`,
+        description: `记忆 ${index}`,
+        body: String(index).repeat(2_400),
+        score: 0.9 - index / 100,
+      }));
+    },
+  };
+  const coordinator = new ConversationMemoryCoordinator({ memoryService });
+
+  const result = await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案",
+  });
+
+  assert.equal(result.recalled.length, 2);
+  assert.equal(result.recalled.reduce((total, item) => total + item.body.length, 0), 3_600);
 });
 
 test("coordinator queues one background extraction after ten completed turns", async () => {
