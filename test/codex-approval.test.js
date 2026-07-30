@@ -68,8 +68,11 @@ test("codex MCP elicitation approvals map to runtime approval events", () => {
   assert.equal(event.payload.threadId, "thread-1");
   assert.deepEqual(event.payload.commandTokens, ["mcp_tool", "cyberboss_tools", "cyberboss_reminder_create"]);
   assert.equal(event.payload.command, "cyberboss_reminder_create\ndelayMinutes: 5\ntext: hello");
-  assert.deepEqual(event.payload.responseTemplate.supportedCommands, ["yes", "no"]);
+  assert.deepEqual(event.payload.responseTemplate.supportedCommands, ["yes", "always", "no"]);
   assert.deepEqual(event.payload.responseTemplate.responseByCommand.yes, {
+    action: "accept",
+  });
+  assert.deepEqual(event.payload.responseTemplate.responseByCommand.always, {
     action: "accept",
   });
   assert.equal(event.payload.elicitation.approvalKind, "mcp_tool_call");
@@ -217,9 +220,10 @@ test("handleApprovalCommand sends MCP elicitation responses back through the run
   assert.deepEqual(sent, ["✅ This request has been approved."]);
 });
 
-test("handleApprovalCommand does not pretend to support persistent Codex MCP tool approval from WeChat", async () => {
+test("handleApprovalCommand enables persistent Codex MCP tool approval from WeChat", async () => {
   const responses = [];
   const sent = [];
+  const remembered = [];
   const approval = {
     kind: "mcp_tool_call",
     requestId: "req-ext-mcp",
@@ -254,6 +258,9 @@ test("handleApprovalCommand does not pretend to support persistent Codex MCP too
             return "thread-1";
           },
           clearApprovalPrompt() {},
+          rememberApprovalPrefixForWorkspace(workspaceRoot, commandTokens) {
+            remembered.push({ workspaceRoot, commandTokens });
+          },
         };
       },
     },
@@ -276,6 +283,15 @@ test("handleApprovalCommand does not pretend to support persistent Codex MCP too
     { name: "always" },
   );
 
-  assert.deepEqual(responses, []);
-  assert.deepEqual(sent, ["⚠️ Persistent approval for this Codex MCP tool request is not available from WeChat."]);
+  assert.deepEqual(responses, [{
+    requestId: "req-ext-mcp",
+    result: {
+      action: "accept",
+    },
+  }]);
+  assert.deepEqual(remembered, [{
+    workspaceRoot: "/workspace",
+    commandTokens: ["mcp_tool", "notes_server", "note_create"],
+  }]);
+  assert.deepEqual(sent, ["💡 Auto-approve enabled for this MCP tool in the current workspace."]);
 });

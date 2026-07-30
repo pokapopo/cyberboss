@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const path = require("node:path");
-const { buildTimelineFailureMessage } = require("../src/integrations/timeline");
+const { buildTimelineFailureMessage, buildTimelineSpawnSpec } = require("../src/integrations/timeline");
 
 test("timeline integration does not write child output to process stdio", async () => {
   const integrationPath = path.resolve(__dirname, "../src/integrations/timeline/index.js");
@@ -52,6 +52,67 @@ test("timeline integration does not write child output to process stdio", async 
       require.cache[integrationPath] = originalModule;
     }
   }
+});
+
+test("timeline write sends JSON through stdin instead of argv", async () => {
+  const integrationPath = path.resolve(__dirname, "../src/integrations/timeline/index.js");
+  const childProcess = require("node:child_process");
+  const originalSpawn = childProcess.spawn;
+  const originalModule = require.cache[integrationPath];
+  const payload = JSON.stringify({ events: [{ title: "ship it" }] });
+  const calls = [];
+  const stdinWrites = [];
+
+  childProcess.spawn = (command, args, options) => {
+    calls.push({ command, args, options });
+    const child = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.end = (value) => {
+      stdinWrites.push(value);
+    };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit("data", Buffer.from([
+        "timeline written: 2026-04-11",
+        "mode: merge",
+        "events: 1",
+        "status: draft",
+      ].join("\n"), "utf8"));
+      child.emit("exit", 0, null);
+    });
+    return child;
+  };
+
+  delete require.cache[integrationPath];
+
+  try {
+    const { createTimelineIntegration } = require(integrationPath);
+    const integration = createTimelineIntegration({ stateDir: "/tmp/cyberboss-state" });
+    await integration.runSubcommand("write", [
+      "--date", "2026-04-11",
+      "--events-json", payload,
+    ]);
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, process.execPath);
+    assert.deepEqual(calls[0].args.slice(1), ["write", "--date", "2026-04-11", "--stdin"]);
+    assert.deepEqual(calls[0].options.stdio, ["pipe", "pipe", "pipe"]);
+    assert.equal(calls[0].args.includes(payload), false);
+    assert.deepEqual(stdinWrites, [payload]);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[integrationPath];
+    if (originalModule) {
+      require.cache[integrationPath] = originalModule;
+    }
+  }
+});
+
+test("timeline spawn spec invokes node directly", () => {
+  const spec = buildTimelineSpawnSpec("/tmp/timeline-for-agent.js", ["write", "--stdin"]);
+  assert.equal(spec.command, process.execPath);
+  assert.deepEqual(spec.args, ["/tmp/timeline-for-agent.js", "write", "--stdin"]);
 });
 
 test("timeline failure message prefers the root error over stack tail", () => {

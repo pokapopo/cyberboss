@@ -289,6 +289,52 @@ test("native image-capable runtimes receive attachments without caption fallback
   assert.equal(runtimeTurn.visionContext.route, "native");
 });
 
+test("tool image-capable runtimes keep local image paths without caption fallback", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    throw new Error("caption provider should not be called");
+  };
+
+  try {
+    const runtimeTurn = await CyberbossApp.prototype.buildRuntimeTurn.call({
+      config: {
+        visionMode: "auto",
+        visionProvider: "openai-compatible",
+        visionApiBaseUrl: "https://dashscope.example.com/compatible-mode/v1",
+        visionModel: "qwen-vl-demo",
+      },
+      runtimeAdapter: {
+        getTurnCapabilities() {
+          return { nativeImageInput: false, toolImageRead: true };
+        },
+      },
+    }, {
+      prepared: {
+        provider: "weixin",
+        originalText: "看看这个",
+        text: "看看这个",
+        attachments: [{
+          kind: "image",
+          contentType: "image/jpeg",
+          isImage: true,
+          absolutePath: "/tmp/tool-readable.jpg",
+        }],
+        attachmentFailures: [],
+        receivedAt: "2026-04-17T10:00:00.000Z",
+      },
+      model: "claude-sonnet",
+    });
+
+    assert.match(runtimeTurn.text, /Saved attachments:/i);
+    assert.match(runtimeTurn.text, /\/tmp\/tool-readable\.jpg/);
+    assert.doesNotMatch(runtimeTurn.text, /Visual context from attachments:/i);
+    assert.deepEqual(runtimeTurn.attachments, []);
+    assert.equal(runtimeTurn.visionContext.route, "tool");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("image-only inbound turns enter the dedicated debounce queue", async () => {
   const queued = [];
   let routed = 0;

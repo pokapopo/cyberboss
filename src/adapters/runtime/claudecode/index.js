@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { ClaudeCodeProcessClient } = require("./process-client");
@@ -12,6 +13,7 @@ function createClaudeCodeRuntimeAdapter(config) {
   const sessionStore = new SessionStore({ filePath: config.sessionsFile, runtimeId: "claudecode" });
   const clientsByWorkspace = new Map();
   const pendingApprovals = new Map();
+  const pendingModelByWorkspaceRoot = new Map();
   const configuredModel = normalizeText(config.claudeModel);
   let globalListener = null;
   const IS_WINDOWS = os.platform() === "win32";
@@ -22,6 +24,8 @@ function createClaudeCodeRuntimeAdapter(config) {
         "claudecode-runtime.sock",
       );
   const ipcServer = new ClaudeCodeIpcServer({ socketPath: ipcSocketPath, stateDir: config.stateDir });
+
+  hydrateRuntimeModelsFromClaudeProjects();
 
   ipcServer.on("clientMessage", (msg) => {
     if (msg?.type === "sendUserMessage" && msg?.workspaceRoot) {
@@ -71,6 +75,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       workspaceRoot,
     });
     client.onMessage((event, raw) => {
+      rememberObservedModelForWorkspace(workspaceRoot, extractClaudeMessageModel(raw));
       if (event.type === "session.id") {
         for (const binding of sessionStore.listBindings()) {
           if (binding.activeWorkspaceRoot === workspaceRoot) {
@@ -183,13 +188,15 @@ function createClaudeCodeRuntimeAdapter(config) {
     getSessionStore() {
       return sessionStore;
     },
-    getTurnCapabilities() {
+    getTurnCapabilities({ model = "" } = {}) {
+      const effectiveModel = resolveModel(model);
       return {
         nativeImageInput: false,
-        toolImageRead: false,
+        toolImageRead: hasClaudeImageFileRead(effectiveModel),
       };
     },
     async initialize() {
+      hydrateRuntimeModelsFromClaudeProjects();
       ipcServer.start();
       return {
         command: config.claudeCommand || "claude",
@@ -314,12 +321,64 @@ function createClaudeCodeRuntimeAdapter(config) {
         returnedThreadId,
         metadata,
       );
+      rememberModelForBinding(bindingKey, workspaceRoot, pendingModelByWorkspaceRoot.get(normalizeText(workspaceRoot)));
       return {
         threadId: returnedThreadId,
         turnId: client.pendingTurnId,
       };
     },
   };
+
+  function hydrateRuntimeModelsFromClaudeProjects() {
+    for (const binding of sessionStore.listBindings()) {
+      const workspaceRoots = new Set([
+        normalizeText(binding.activeWorkspaceRoot),
+        ...sessionStore.listWorkspaceRoots(binding.bindingKey),
+      ].filter(Boolean));
+      for (const workspaceRoot of workspaceRoots) {
+        const threadId = sessionStore.getThreadIdForWorkspace(binding.bindingKey, workspaceRoot);
+        const model = readLatestClaudeProjectModel({
+          claudeConfigDir: config.claudeConfigDir,
+          workspaceRoot,
+          threadId,
+        });
+        rememberModelForBinding(binding.bindingKey, workspaceRoot, model);
+      }
+    }
+  }
+
+  function rememberObservedModelForWorkspace(workspaceRoot, model) {
+    const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+    const normalizedModel = normalizeClaudeRuntimeModel(model);
+    if (!normalizedWorkspaceRoot || !normalizedModel) {
+      return;
+    }
+    let remembered = false;
+    for (const binding of sessionStore.listBindings()) {
+      if (normalizeText(binding.activeWorkspaceRoot) === normalizedWorkspaceRoot) {
+        rememberModelForBinding(binding.bindingKey, normalizedWorkspaceRoot, normalizedModel);
+        remembered = true;
+      }
+    }
+    if (!remembered) {
+      pendingModelByWorkspaceRoot.set(normalizedWorkspaceRoot, normalizedModel);
+    }
+  }
+
+  function rememberModelForBinding(bindingKey, workspaceRoot, model) {
+    const normalizedModel = normalizeClaudeRuntimeModel(model);
+    if (!bindingKey || !normalizeText(workspaceRoot) || !normalizedModel) {
+      return;
+    }
+    const current = sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot);
+    if (normalizeText(current.model) === normalizedModel) {
+      return;
+    }
+    sessionStore.setRuntimeParamsForWorkspace(bindingKey, workspaceRoot, {
+      model: normalizedModel,
+      modelProvider: "",
+    });
+  }
 }
 
 function filterClaudeCodeEnv(env) {
@@ -340,6 +399,74 @@ function normalizeThreadId(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function extractClaudeMessageModel(raw) {
+  return normalizeClaudeRuntimeModel(raw?.message?.model);
+}
+
+function normalizeClaudeRuntimeModel(model) {
+  const normalized = normalizeText(model);
+  if (!normalized || normalized === "<synthetic>") {
+    return "";
+  }
+  return normalized;
+}
+
+function readLatestClaudeProjectModel({ claudeConfigDir = "", workspaceRoot = "", threadId = "" } = {}) {
+  const transcriptPath = resolveClaudeProjectTranscriptPath({ claudeConfigDir, workspaceRoot, threadId });
+  if (!transcriptPath) {
+    return "";
+  }
+  let raw = "";
+  try {
+    raw = fs.readFileSync(transcriptPath, "utf8");
+  } catch {
+    return "";
+  }
+  const lines = raw.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      const model = normalizeClaudeRuntimeModel(parsed?.message?.model);
+      if (model) {
+        return model;
+      }
+    } catch {
+      // ignore malformed transcript lines
+    }
+  }
+  return "";
+}
+
+function resolveClaudeProjectTranscriptPath({ claudeConfigDir = "", workspaceRoot = "", threadId = "" } = {}) {
+  const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+  const normalizedThreadId = normalizeThreadId(threadId);
+  if (!normalizedWorkspaceRoot || !normalizedThreadId) {
+    return "";
+  }
+  const baseDir = normalizeText(claudeConfigDir) || path.join(os.homedir(), ".claude");
+  return path.join(baseDir, "projects", encodeClaudeProjectPath(normalizedWorkspaceRoot), `${normalizedThreadId}.jsonl`);
+}
+
+function encodeClaudeProjectPath(workspaceRoot) {
+  return normalizeText(workspaceRoot).replace(/[\\/:\s]+/g, "-");
+}
+
+function hasClaudeImageFileRead(model) {
+  const normalized = normalizeText(model).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return normalized === "sonnet"
+    || normalized === "opus"
+    || normalized === "haiku"
+    || /\b(?:sonnet|opus|haiku)\b/.test(normalized)
+    || /^claude-(?:3|4)(?:\b|-)/.test(normalized);
 }
 
 function clientMatchesThread(client, threadId) {

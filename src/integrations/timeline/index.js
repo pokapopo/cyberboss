@@ -1,9 +1,6 @@
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
-const os = require("os");
-
-const IS_WINDOWS = os.platform() === "win32";
 
 function createTimelineIntegration(config) {
   const binPath = resolveTimelineBinPath();
@@ -29,7 +26,7 @@ function createTimelineIntegration(config) {
         ...prepared.extraEnv,
       }, {
         subcommand: normalizedSubcommand,
-        stdinContent: prepared.stdinContent,
+        stdinBody: prepared.stdinBody,
       });
     },
   };
@@ -43,21 +40,15 @@ function resolveTimelineBinPath() {
 function runTimelineCommand(binPath, args, extraEnv = {}, options = {}) {
   return new Promise((resolve, reject) => {
     const spawnSpec = buildTimelineSpawnSpec(binPath, args);
-    const stdinContent = options.stdinContent || "";
+    const stdinBody = normalizeOptionalText(options.stdinBody);
     const child = spawn(spawnSpec.command, spawnSpec.args, {
-      stdio: [stdinContent ? "pipe" : "inherit", "pipe", "pipe"],
+      stdio: [stdinBody ? "pipe" : "inherit", "pipe", "pipe"],
       env: {
         ...process.env,
         ...extraEnv,
       },
       shell: false,
     });
-
-    if (stdinContent) {
-      child.stdin.setEncoding("utf8");
-      child.stdin.write(stdinContent);
-      child.stdin.end();
-    }
 
     let stdout = "";
     let stderr = "";
@@ -102,6 +93,10 @@ function runTimelineCommand(binPath, args, extraEnv = {}, options = {}) {
     child.once("error", (error) => {
       finishReject(error);
     });
+    if (stdinBody) {
+      child.stdin.once("error", finishReject);
+      child.stdin.end(stdinBody);
+    }
     child.once("exit", (code, signal) => {
       if (signal) {
         finishReject(new Error(`timeline process was interrupted by signal: ${signal}`));
@@ -154,9 +149,15 @@ function prepareTimelineInvocation(subcommand, args = []) {
   const normalizedArgs = normalizeArgs(args);
   const preparedArgs = [];
   const extraEnv = {};
-  let sawJsonArgument = false;
-  let sawEventsSource = false;
-  let stdinContent = "";
+  let sawWriteSource = false;
+  let stdinBody = "";
+
+  const claimWriteSource = () => {
+    if (sawWriteSource) {
+      throw new Error("Use only one of --json, --stdin, --events-json, or --events-file");
+    }
+    sawWriteSource = true;
+  };
 
   for (let index = 0; index < normalizedArgs.length; index += 1) {
     const token = normalizedArgs[index];
@@ -175,16 +176,9 @@ function prepareTimelineInvocation(subcommand, args = []) {
       if (!next || next.startsWith("--")) {
         throw new Error("Missing value for argument: --events-json");
       }
-      if (sawJsonArgument || sawEventsSource) {
-        throw new Error("Use only one of --json, --events-json, or --events-file");
-      }
-      if (IS_WINDOWS) {
-        preparedArgs.push("--stdin");
-        stdinContent = next;
-      } else {
-        preparedArgs.push("--json", next);
-      }
-      sawEventsSource = true;
+      claimWriteSource();
+      preparedArgs.push("--stdin");
+      stdinBody = next;
       index += 1;
       continue;
     }
@@ -193,36 +187,40 @@ function prepareTimelineInvocation(subcommand, args = []) {
       if (!next || next.startsWith("--")) {
         throw new Error("Missing value for argument: --events-file");
       }
-      if (sawJsonArgument || sawEventsSource) {
-        throw new Error("Use only one of --json, --events-json, or --events-file");
-      }
-      const fileContent = fs.readFileSync(path.resolve(next), "utf8");
-      if (IS_WINDOWS) {
-        preparedArgs.push("--stdin");
-        stdinContent = fileContent;
-      } else {
-        preparedArgs.push("--json", fileContent);
-      }
-      sawEventsSource = true;
+      claimWriteSource();
+      preparedArgs.push("--stdin");
+      stdinBody = fs.readFileSync(path.resolve(next), "utf8");
       index += 1;
       continue;
     }
 
     if (normalizedSubcommand === "write" && token === "--json") {
-      if (sawEventsSource) {
-        throw new Error("Use only one of --json, --events-json, or --events-file");
+      if (!next || next.startsWith("--")) {
+        throw new Error("Missing value for argument: --json");
       }
-      sawJsonArgument = true;
+      claimWriteSource();
+      preparedArgs.push("--stdin");
+      stdinBody = next;
+      index += 1;
+      continue;
+    }
+
+    if (normalizedSubcommand === "write" && token === "--stdin") {
+      claimWriteSource();
     }
 
     preparedArgs.push(token);
   }
 
-  return { args: preparedArgs, extraEnv, stdinContent };
+  return { args: preparedArgs, extraEnv, stdinBody };
 }
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeOptionalText(value) {
+  return typeof value === "string" && value.length > 0 ? value : "";
 }
 
 function resolveTimelineChromePath() {
@@ -342,6 +340,7 @@ function matchTimelineText(text, pattern) {
 module.exports = {
   createTimelineIntegration,
   buildTimelineFailureMessage,
+  buildTimelineSpawnSpec,
   detectTimelineServerStartup,
   prepareTimelineInvocation,
 };

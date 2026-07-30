@@ -130,6 +130,109 @@ test("claudecode approval events capture Write file paths for state-dir auto app
   assert.deepEqual(event.payload.filePaths, ["/Users/tingyiwen/.cyberboss/notes/today.md"]);
 });
 
+test("claudecode adapter exposes image file read capability only for known image-capable models", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-vision-"));
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir: tempDir,
+    sessionsFile: path.join(tempDir, "sessions.json"),
+  });
+  const configured = createClaudeCodeRuntimeAdapter({
+    stateDir: tempDir,
+    sessionsFile: path.join(tempDir, "configured-sessions.json"),
+    claudeModel: "sonnet",
+  });
+
+  assert.deepEqual(adapter.getTurnCapabilities({ model: "" }), {
+    nativeImageInput: false,
+    toolImageRead: false,
+  });
+  assert.deepEqual(adapter.getTurnCapabilities({ model: "claude-sonnet" }), {
+    nativeImageInput: false,
+    toolImageRead: true,
+  });
+  assert.deepEqual(adapter.getTurnCapabilities({ model: "deepseek-chat" }), {
+    nativeImageInput: false,
+    toolImageRead: false,
+  });
+  assert.deepEqual(configured.getTurnCapabilities({ model: "deepseek-chat" }), {
+    nativeImageInput: false,
+    toolImageRead: true,
+  });
+});
+
+test("claudecode adapter hydrates model from Claude project transcript", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-project-model-"));
+  const stateDir = path.join(tempDir, "state");
+  const claudeConfigDir = path.join(tempDir, "claude");
+  const workspaceRoot = path.join(tempDir, "workspace root");
+  const sessionId = "77777777-7777-4777-8777-777777777777";
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  const projectDir = path.join(claudeConfigDir, "projects", workspaceRoot.replace(/[\\/:\s]+/g, "-"));
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, `${sessionId}.jsonl`), [
+    JSON.stringify({ type: "assistant", message: { model: "deepseek-v4-flash" } }),
+    JSON.stringify({ type: "assistant", message: { model: "claude-sonnet-4-6" } }),
+  ].join("\n"));
+  const sessionsFile = path.join(tempDir, "sessions.json");
+  new SessionStore({ filePath: sessionsFile, runtimeId: "claudecode" })
+    .setThreadIdForWorkspace("binding-1", workspaceRoot, sessionId);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile,
+    claudeConfigDir,
+  });
+
+  assert.deepEqual(adapter.getSessionStore().getRuntimeParamsForWorkspace("binding-1", workspaceRoot), {
+    model: "claude-sonnet-4-6",
+    modelProvider: "",
+  });
+});
+
+test("claudecode adapter remembers model observed in stream messages", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-stream-model-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  const sessionId = "88888888-8888-4888-8888-888888888888";
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    "process.stdin.on(\"data\", () => {",
+    `  console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
+    "  console.log(JSON.stringify({ type: \"assistant\", message: { model: \"claude-sonnet-4-6\", content: [{ type: \"text\", text: \"done\" }] } }));",
+    `  console.log(JSON.stringify({ type: "result", session_id: ${JSON.stringify(sessionId)}, result: "done" }));`,
+    "  process.exit(0);",
+    "});",
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile: path.join(tempDir, "sessions.json"),
+    claudeCommand: commandFile,
+    claudeDisableVerbose: true,
+  });
+
+  try {
+    await adapter.sendTurn({
+      bindingKey: "binding-1",
+      workspaceRoot,
+      text: "hello",
+    });
+    const sessionsText = await waitForFileText(path.join(tempDir, "sessions.json"), /claude-sonnet-4-6/);
+    assert.match(sessionsText, /claude-sonnet-4-6/);
+    assert.deepEqual(adapter.getSessionStore().getRuntimeParamsForWorkspace("binding-1", workspaceRoot), {
+      model: "claude-sonnet-4-6",
+      modelProvider: "",
+    });
+  } finally {
+    await adapter.close();
+  }
+});
+
 test("claudecode assistant events map usage into context snapshots", () => {
   const event = mapClaudeCodeMessageToRuntimeEvent(
     {

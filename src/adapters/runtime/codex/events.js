@@ -248,9 +248,10 @@ function extractToolNameFromMcpPrompt(promptMessage) {
 function buildMcpToolCallResponseTemplate() {
   return {
     kind: "mcp_tool_call",
-    supportedCommands: ["yes", "no"],
+    supportedCommands: ["yes", "always", "no"],
     responseByCommand: {
       yes: { action: "accept" },
+      always: { action: "accept" },
       no: { action: "cancel" },
     },
   };

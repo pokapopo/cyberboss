@@ -15,13 +15,24 @@ async function resolveVisionContext({ prepared, config = {}, runtimeAdapter = nu
     return emptyVisionContext("none");
   }
 
-  if (mode !== "caption" && supportsNativeImageInput({ runtimeAdapter, model })) {
-    return {
-      route: "native",
-      items: [],
-      errors: [],
-      runtimeAttachments: attachments,
-    };
+  if (mode !== "caption") {
+    const runtimeImageAccess = resolveRuntimeImageAccess({ runtimeAdapter, model });
+    if (runtimeImageAccess.nativeImageInput) {
+      return {
+        route: "native",
+        items: [],
+        errors: [],
+        runtimeAttachments: attachments,
+      };
+    }
+    if (runtimeImageAccess.toolImageRead) {
+      return {
+        route: "tool",
+        items: [],
+        errors: [],
+        runtimeAttachments: [],
+      };
+    }
   }
 
   if (mode === "native") {
@@ -163,11 +174,14 @@ function extractOpenAiCompatibleText(response) {
   return "";
 }
 
-function supportsNativeImageInput({ runtimeAdapter, model }) {
+function resolveRuntimeImageAccess({ runtimeAdapter, model }) {
   const capabilitySource = typeof runtimeAdapter?.getTurnCapabilities === "function"
     ? runtimeAdapter.getTurnCapabilities({ model })
     : runtimeAdapter?.describe?.()?.capabilities;
-  return Boolean(capabilitySource?.nativeImageInput);
+  return {
+    nativeImageInput: Boolean(capabilitySource?.nativeImageInput),
+    toolImageRead: Boolean(capabilitySource?.toolImageRead),
+  };
 }
 
 function isCaptionProviderConfigured(config) {

@@ -26,8 +26,9 @@ test("diary body can be loaded from --text-file", async () => {
   assert.equal(body, "line one\nline two");
 });
 
-test("timeline invocation translates --locale and --events-file", () => {
-  const filePath = createTempFile("events.json", "[{\"title\":\"ship it\"}]");
+test("timeline invocation translates write JSON sources to stdin", () => {
+  const payload = JSON.stringify({ events: [{ title: "ship it" }] });
+  const filePath = createTempFile("events.json", payload);
   const prepared = prepareTimelineInvocation("write", [
     "--date", "2026-04-11",
     "--locale", "en",
@@ -37,14 +38,15 @@ test("timeline invocation translates --locale and --events-file", () => {
   assert.deepEqual(prepared.extraEnv, { TIMELINE_FOR_AGENT_LOCALE: "en" });
   assert.deepEqual(prepared.args, [
     "--date", "2026-04-11",
-    "--json", "[{\"title\":\"ship it\"}]",
+    "--stdin",
   ]);
+  assert.equal(prepared.stdinBody, payload);
 });
 
 test("timeline invocation rejects mixed json sources", () => {
   assert.throws(() => {
     prepareTimelineInvocation("write", ["--json", "[]", "--events-json", "[]"]);
-  }, /Use only one of --json, --events-json, or --events-file/);
+  }, /Use only one of --json, --stdin, --events-json, or --events-file/);
 });
 
 test("timeline failure message explains port conflicts", () => {
