@@ -36,6 +36,7 @@ const { TimelineScreenshotQueueStore } = require("./timeline-screenshot-queue-st
 const { TurnGateStore } = require("./turn-gate-store");
 const { createMessageDebouncer } = require("./message-debounce");
 const { WeixinDeliveryService } = require("./weixin-delivery-outbox");
+const { ConversationMemoryCoordinator } = require("./conversation-memory-coordinator");
 const { ReminderQueueStore } = require("../adapters/channel/weixin/reminder-queue-store");
 const {
   matchesCommandPrefix,
@@ -96,6 +97,11 @@ class CyberbossApp {
     this.messageDebouncer = null;
     this.systemMessageDispatcher = null;
     this.pendingUserContexts = new Map();
+    this.pendingMemoryTurns = new Map();
+    this.memoryCoordinator = new ConversationMemoryCoordinator({
+      memoryService: this.projectServices.memory,
+      extractionEveryTurns: config.memoryExtractionEveryTurns,
+    });
     this.weixinDeliveryService = new WeixinDeliveryService({
       filePath: config.weixinDeliveryOutboxFile || path.join(config.stateDir, "weixin-delivery-outbox.json"),
       channelAdapter: this.channelAdapter,
@@ -149,6 +155,15 @@ class CyberbossApp {
       accountId: account.accountId,
     });
     const runtimeState = await this.runtimeAdapter.initialize();
+    this.projectServices.memory?.refreshIndex?.()
+      .then((result) => {
+        if (result && (result.changed || result.removed)) {
+          console.log(`[cyberboss] memory index refreshed changed=${result.changed} removed=${result.removed} total=${result.total}`);
+        }
+      })
+      .catch((error) => {
+        console.error(`[cyberboss] memory index refresh failed: ${error?.message || String(error)}`);
+      });
     const knownContextTokens = Object.keys(this.channelAdapter.getKnownContextTokens()).length;
     const syncBuffer = this.channelAdapter.loadSyncBuffer();
     const interruptedWorkLogs = safeWorkLogCall(
@@ -175,6 +190,7 @@ class CyberbossApp {
     console.log(`[cyberboss] runtimeEndpoint=${runtimeState.endpoint || runtimeState.command || "(spawn)"}`);
     console.log(`[cyberboss] runtimeModels=${runtimeState.models?.length || 0}`);
     console.log(`[cyberboss] vision: mode=${this.config.visionMode} provider=${this.config.visionProvider} baseUrl=${this.config.visionApiBaseUrl || "(empty)"} model=${this.config.visionModel || "(empty)"}`);
+    console.log(`[cyberboss] memory: recall=${this.projectServices.memory?.isRecallConfigured?.() ? "ready" : "disabled"} extraction=${this.projectServices.memory?.isExtractionConfigured?.() ? `every-${this.config.memoryExtractionEveryTurns}-turns` : "disabled"}`);
     if (this.config.startWithLocationServer) {
       await this.ensureLocationServerStarted();
     }
@@ -585,7 +601,13 @@ class CyberbossApp {
 
     try {
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
-      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
+      const memoryContext = prepared.provider === "weixin"
+        ? await this.memoryCoordinator?.prepareTurn?.({
+            scopeKey: pendingScopeKey,
+            text: prepared.originalText || prepared.text,
+          })
+        : null;
+      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext });
       const sendTurn = typeof this.runtimeAdapter.sendTurn === "function"
         ? this.runtimeAdapter.sendTurn.bind(this.runtimeAdapter)
         : this.runtimeAdapter.sendTextTurn.bind(this.runtimeAdapter);
@@ -621,6 +643,12 @@ class CyberbossApp {
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
       this.pendingUserContexts.set(turn.threadId, prepared.text);
+      if (prepared.provider === "weixin") {
+        this.pendingMemoryTurns?.set?.(turn.threadId, {
+          scopeKey: pendingScopeKey,
+          userText: prepared.originalText || prepared.text,
+        });
+      }
       const replyTarget = {
         userId: prepared.senderId,
         contextToken: prepared.contextToken,
@@ -681,7 +709,7 @@ class CyberbossApp {
     }
   }
 
-  async buildRuntimeTurn({ prepared, model = "" }) {
+  async buildRuntimeTurn({ prepared, model = "", memoryContext = null }) {
     if (prepared?.provider === "system") {
       return {
         text: String(prepared.text || "").trim(),
@@ -710,6 +738,7 @@ class CyberbossApp {
         prepared,
         config: this.config,
         visionContext,
+        memoryContext: memoryContext || {},
       }),
       attachments: Array.isArray(visionContext.runtimeAttachments) ? visionContext.runtimeAttachments : [],
       visionContext,
@@ -1822,11 +1851,23 @@ class CyberbossApp {
       if (event.payload?.text) {
         saveAssistantContext(event.payload.text);
       }
+      const memoryTurn = this.pendingMemoryTurns?.get?.(event.payload.threadId);
+      if (memoryTurn) {
+        this.pendingMemoryTurns.delete(event.payload.threadId);
+        this.memoryCoordinator?.completeTurn?.({
+          scopeKey: memoryTurn.scopeKey,
+          userText: memoryTurn.userText,
+          assistantText: event.payload?.text || "",
+        });
+      }
     }
     if (!event) {
       return;
     }
     if (event.type === "runtime.turn.completed" || event.type === "runtime.turn.failed") {
+      if (event.type === "runtime.turn.failed") {
+        this.pendingMemoryTurns?.delete?.(event.payload.threadId);
+      }
       this.clearTurnTimeout(event.payload.threadId);
       const completedRunKey = buildRunKey(event.payload.threadId, event.payload.turnId);
       const pendingOperations = this.pendingOperationByRunKey;

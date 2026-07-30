@@ -79,6 +79,77 @@ function listProjectToolNames() {
 
 const PROJECT_TOOLS = [
   {
+    name: "cyberboss_memory_search",
+    description: "Semantically search Cyberboss long-term Markdown memory. Use when the user asks what is remembered, requests a past preference/project fact, or automatic recalled context is insufficient. Treat results as historical context that may need current confirmation.",
+    shortHint: "Search long-term memory by meaning when current context is insufficient.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", description: "Natural-language memory query." },
+        limit: { type: "integer", description: "Maximum results, from 1 to 10." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const entries = await services.memory.search(args.query, {
+        topK: args.limit,
+        scoreThreshold: 0.4,
+        includeBody: true,
+      });
+      return {
+        text: `Long-term memories found: ${entries.length}.`,
+        data: { entries },
+      };
+    },
+  },
+  {
+    name: "cyberboss_memory_candidates",
+    description: "List pending long-term memory candidates extracted in the background. Sensitive candidates are hidden unless the user explicitly asks to review sensitive memory.",
+    shortHint: "Review pending memory candidates before approving or rejecting them.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Maximum candidates, from 1 to 30." },
+        includeSensitive: { type: "boolean", description: "Set true only when the user explicitly asks to review sensitive candidates." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const candidates = services.memory.listCandidates(args);
+      return {
+        text: `Pending memory candidates found: ${candidates.length}. No changes were made.`,
+        data: { candidates },
+      };
+    },
+  },
+  {
+    name: "cyberboss_memory_candidate_review",
+    description: "Approve or reject one pending memory candidate only after the user explicitly confirms that exact candidate. Approval writes a Markdown memory and indexes it; rejection does not delete any existing memory.",
+    shortHint: "Approve or reject an exact pending memory candidate after explicit user confirmation.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      required: ["candidateId", "action"],
+      properties: {
+        candidateId: { type: "string", description: "Exact candidate id returned by cyberboss_memory_candidates." },
+        action: { type: "string", enum: ["approve", "reject"] },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.memory.reviewCandidate(args.candidateId, args.action);
+      return {
+        text: result.found
+          ? `Memory candidate ${result.action === "approve" ? "approved and indexed" : "rejected"}.`
+          : "Pending memory candidate not found.",
+        data: result,
+      };
+    },
+  },
+  {
     name: "cyberboss_worklog_search",
     description: "Search recent Cyberboss execution records. When the user asks what happened, why a recent Weixin or system task failed, whether a result was delivered, or what Cyberboss did, call this before guessing. Records contain compact operational facts, not full conversations.",
     shortHint: "Search recent execution records before explaining task behavior or failures.",

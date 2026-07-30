@@ -86,6 +86,9 @@ Those capabilities are exposed as project-native structured tools:
 - `cyberboss_worklog_get`
 - `cyberboss_experience_search`
 - `cyberboss_experience_record`
+- `cyberboss_memory_search`
+- `cyberboss_memory_candidates`
+- `cyberboss_memory_candidate_review`
 
 Notes:
 - These tools are bound to the Cyberboss project and routed through the repo's internal tool host.
@@ -93,6 +96,9 @@ Notes:
 - Codex loads them through the runtime-side Cyberboss MCP bridge configured at spawn time.
 - Weixin and system runtime executions are logged automatically; work-log tools are read-only lookup tools.
 - Experience records require a problem, resolution, and concrete verification. Matching signatures update an existing entry.
+- Long-term memory recall is topic-gated; background extraction runs in bounded batches and leaves uncertain or sensitive results as reviewable candidates.
+- Memory automation is opt-in with `CYBERBOSS_MEMORY_ENABLED=true`. Enabling it sends topic-change queries and changed memory text to the configured embedding endpoint, and sends each extraction batch (about ten completed turns) to the configured extraction model.
+- Memory provider refusals, timeouts, and malformed responses degrade silently to no recall/extraction result; they are logged for operators and never become a Weixin error reply.
 - The public human terminal surface stays intentionally small: lifecycle commands plus shared bridge scripts.
 
 ## Current WeChat Commands

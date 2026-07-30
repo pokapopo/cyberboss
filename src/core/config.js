@@ -5,6 +5,9 @@ function readConfig() {
   const argv = process.argv.slice(2);
   const mode = argv[0] || "";
   const stateDir = process.env.CYBERBOSS_STATE_DIR || path.join(os.homedir(), ".cyberboss");
+  const visionApiBaseUrl = readTextEnv("CYBERBOSS_VISION_API_BASE_URL");
+  const visionApiKey = readTextEnv("CYBERBOSS_VISION_API_KEY");
+  const visionModel = readTextEnv("CYBERBOSS_VISION_MODEL");
 
   return {
     mode,
@@ -31,6 +34,19 @@ function readConfig() {
     weixinDeliveryOutboxFile: path.join(stateDir, "weixin-delivery-outbox.json"),
     workLogFile: path.join(stateDir, "work-log.json"),
     experienceFile: path.join(stateDir, "experience-library.json"),
+    memoryEnabled: readOptionalBoolEnv("CYBERBOSS_MEMORY_ENABLED") === true,
+    memoryDir: readTextEnv("CYBERBOSS_MEMORY_DIR") || path.join(stateDir, "memory"),
+    memoryIndexFile: readTextEnv("CYBERBOSS_MEMORY_INDEX_FILE")
+      || path.join(stateDir, "memory-search", "embeddings.json"),
+    memoryCandidatesFile: readTextEnv("CYBERBOSS_MEMORY_CANDIDATES_FILE")
+      || path.join(stateDir, "memory-candidates.json"),
+    memoryApiBaseUrl: readTextEnv("CYBERBOSS_MEMORY_API_BASE_URL") || visionApiBaseUrl,
+    memoryApiKey: readTextEnv("CYBERBOSS_MEMORY_API_KEY") || visionApiKey,
+    memoryEmbeddingModel: readTextEnv("CYBERBOSS_MEMORY_EMBEDDING_MODEL") || "text-embedding-v4",
+    memoryEmbeddingDimensions: readIntEnv("CYBERBOSS_MEMORY_EMBEDDING_DIMENSIONS") || 1024,
+    memoryExtractionModel: readTextEnv("CYBERBOSS_MEMORY_EXTRACTION_MODEL") || visionModel,
+    memoryExtractionEveryTurns: readIntEnv("CYBERBOSS_MEMORY_EXTRACTION_EVERY_TURNS") || 10,
+    memoryTimeoutMs: readIntEnv("CYBERBOSS_MEMORY_TIMEOUT_MS") || 15_000,
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     timelineScreenshotQueueFile: path.join(stateDir, "timeline-screenshot-queue.json"),
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
@@ -71,9 +87,9 @@ function readConfig() {
     codexNativeImageInput: readOptionalBoolEnv("CYBERBOSS_CODEX_NATIVE_IMAGE_INPUT"),
     visionMode: readTextEnv("CYBERBOSS_VISION_MODE") || "auto",
     visionProvider: readTextEnv("CYBERBOSS_VISION_PROVIDER") || "openai-compatible",
-    visionApiBaseUrl: readTextEnv("CYBERBOSS_VISION_API_BASE_URL"),
-    visionApiKey: readTextEnv("CYBERBOSS_VISION_API_KEY"),
-    visionModel: readTextEnv("CYBERBOSS_VISION_MODEL"),
+    visionApiBaseUrl,
+    visionApiKey,
+    visionModel,
     visionPrompt: readTextEnv("CYBERBOSS_VISION_PROMPT"),
     visionTimeoutMs: readIntEnv("CYBERBOSS_VISION_TIMEOUT_MS") || 30_000,
     claudeCommand: readTextEnv("CYBERBOSS_CLAUDE_COMMAND") || "claude",

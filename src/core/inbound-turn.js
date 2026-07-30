@@ -52,7 +52,12 @@ function buildMergedInboundPrepared({
   };
 }
 
-function assembleRuntimeTurnText({ prepared, config = {}, visionContext = {} }) {
+function assembleRuntimeTurnText({
+  prepared,
+  config = {},
+  visionContext = {},
+  memoryContext = {},
+}) {
   const lines = [];
   const localTime = formatWechatLocalTime(prepared?.receivedAt);
   const originalText = normalizeText(prepared?.originalText ?? prepared?.text);
@@ -70,6 +75,29 @@ function assembleRuntimeTurnText({ prepared, config = {}, visionContext = {} }) 
       lines.push("");
     }
     lines.push(originalText);
+  }
+
+  const recalledMemories = Array.isArray(memoryContext.recalled)
+    ? memoryContext.recalled.filter((item) => normalizeText(item?.body))
+    : [];
+  const memoryNotices = Array.isArray(memoryContext.notices)
+    ? memoryContext.notices.map(normalizeText).filter(Boolean)
+    : [];
+  if (recalledMemories.length) {
+    pushSectionBreak(lines);
+    lines.push("Relevant long-term memory (internal context; use only when it helps, and do not mention retrieval mechanics):");
+    for (const item of recalledMemories) {
+      const label = normalizeText(item.description) || normalizeText(item.file) || "memory";
+      lines.push(`- ${label}`);
+      lines.push(`  ${normalizeText(item.body)}`);
+    }
+  }
+  if (memoryNotices.length) {
+    pushSectionBreak(lines);
+    lines.push("Memory maintenance notices (briefly tell the user naturally when relevant):");
+    for (const notice of memoryNotices) {
+      lines.push(`- ${notice}`);
+    }
   }
 
   if (attachments.length) {

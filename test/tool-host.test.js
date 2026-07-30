@@ -32,6 +32,30 @@ function createHost() {
           };
         },
       },
+      memory: {
+        async search() {
+          return [{
+            file: "preference-tone.md",
+            description: "用户喜欢直接回答",
+            body: "先给结论。",
+            score: 0.8,
+          }];
+        },
+        listCandidates() {
+          return [{
+            id: "memory-candidate-1",
+            name: "reply-style",
+            sensitive: false,
+          }];
+        },
+        async reviewCandidate(candidateId, action) {
+          return {
+            found: candidateId === "memory-candidate-1",
+            action,
+            saved: action === "approve" ? { file: "preference-reply-style.md" } : null,
+          };
+        },
+      },
       diary: {
         async append(args) {
           return { filePath: "/tmp/diary.md", ...args };
@@ -400,6 +424,34 @@ test("tool host exposes agent-visible work-log and verified experience tools", a
   assert.equal(workLog.data.record.events[0].detail, "timeout");
   assert.equal(experiences.data.entries[0].id, "exp-1");
   assert.equal(recorded.data.entry.id, "exp-2");
+});
+
+test("tool host exposes semantic memory search and explicit candidate review", async () => {
+  const host = createHost();
+  const tools = host.listTools();
+  const memorySearch = tools.find((tool) => tool.name === "cyberboss_memory_search");
+  const memoryCandidates = tools.find((tool) => tool.name === "cyberboss_memory_candidates");
+  const memoryReview = tools.find((tool) => tool.name === "cyberboss_memory_candidate_review");
+
+  assert.match(memorySearch.description, /Semantically search/i);
+  assert.match(memoryCandidates.description, /No changes were made|pending long-term memory/i);
+  assert.match(memoryReview.description, /only after the user explicitly confirms/i);
+
+  const search = await host.invokeTool("cyberboss_memory_search", {
+    query: "怎么回复技术问题",
+    limit: 3,
+  });
+  const candidates = await host.invokeTool("cyberboss_memory_candidates", {
+    limit: 5,
+  });
+  const reviewed = await host.invokeTool("cyberboss_memory_candidate_review", {
+    candidateId: "memory-candidate-1",
+    action: "approve",
+  });
+
+  assert.equal(search.data.entries[0].file, "preference-tone.md");
+  assert.equal(candidates.data.candidates[0].id, "memory-candidate-1");
+  assert.equal(reviewed.data.saved.file, "preference-reply-style.md");
 });
 
 test("tool host exposes whereabouts tools from the external dependency", async () => {
