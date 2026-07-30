@@ -1,7 +1,10 @@
 const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol-leak-monitor");
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
-const TASK_PROGRESS_INTERVAL_MS = 30_000;
+const TASK_PROGRESS_MIN_INTERVAL_MS = 45_000;
+const TASK_PROGRESS_INITIAL_PHASE_DELAY_MS = 60_000;
+const TASK_PROGRESS_FIRST_HEARTBEAT_MS = 90_000;
+const TASK_PROGRESS_HEARTBEAT_BACKOFF_MS = [120_000, 180_000];
 
 function stripAnsi(text) {
   return String(text || "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
@@ -25,10 +28,13 @@ class StreamDelivery {
     runtimeId = "",
     onDeferredSystemReply,
     onTaskDelivery,
-    progressIntervalMs = TASK_PROGRESS_INTERVAL_MS,
+    progressMinIntervalMs = TASK_PROGRESS_MIN_INTERVAL_MS,
+    progressInitialPhaseDelayMs = TASK_PROGRESS_INITIAL_PHASE_DELAY_MS,
+    progressFirstHeartbeatMs = TASK_PROGRESS_FIRST_HEARTBEAT_MS,
+    progressHeartbeatBackoffMs = TASK_PROGRESS_HEARTBEAT_BACKOFF_MS,
     now = () => Date.now(),
-    setIntervalFn = setInterval,
-    clearIntervalFn = clearInterval,
+    setTimeoutFn = setTimeout,
+    clearTimeoutFn = clearTimeout,
     systemReplyRetryScheduleMs,
     sameTokenRetryDelayMs,
   }) {
@@ -38,10 +44,22 @@ class StreamDelivery {
     this.systemReplyPolicy = createSystemReplyPolicy(this.runtimeId);
     this.onDeferredSystemReply = typeof onDeferredSystemReply === "function" ? onDeferredSystemReply : null;
     this.onTaskDelivery = typeof onTaskDelivery === "function" ? onTaskDelivery : null;
-    this.progressIntervalMs = Math.max(10, Number(progressIntervalMs) || TASK_PROGRESS_INTERVAL_MS);
+    this.progressMinIntervalMs = positiveDelay(progressMinIntervalMs, TASK_PROGRESS_MIN_INTERVAL_MS);
+    this.progressInitialPhaseDelayMs = positiveDelay(
+      progressInitialPhaseDelayMs,
+      TASK_PROGRESS_INITIAL_PHASE_DELAY_MS,
+    );
+    this.progressFirstHeartbeatMs = positiveDelay(
+      progressFirstHeartbeatMs,
+      TASK_PROGRESS_FIRST_HEARTBEAT_MS,
+    );
+    this.progressHeartbeatBackoffMs = normalizeDelaySchedule(
+      progressHeartbeatBackoffMs,
+      TASK_PROGRESS_HEARTBEAT_BACKOFF_MS,
+    );
     this.now = now;
-    this.setIntervalFn = setIntervalFn;
-    this.clearIntervalFn = clearIntervalFn;
+    this.setTimeoutFn = setTimeoutFn;
+    this.clearTimeoutFn = clearTimeoutFn;
     this.systemReplyRetryScheduleMs = Array.isArray(systemReplyRetryScheduleMs) && systemReplyRetryScheduleMs.length
       ? systemReplyRetryScheduleMs.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
       : [1_500, 2_500, 4_000, 6_000];
@@ -178,8 +196,13 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         if (this.isDurableWeixinRun(state)) {
-          await this.confirmNaturalProgressBeforeTool(state);
-          this.addTaskToolSignal(state, event.payload.toolName, event.payload.input);
+          const hasNaturalProgress = await this.confirmNaturalProgressBeforeTool(state);
+          this.addTaskToolSignal(
+            state,
+            event.payload.toolName,
+            event.payload.input,
+            { suppressPhaseUpdate: hasNaturalProgress },
+          );
           this.ensureTaskProgressTimer(state);
         }
         return;
@@ -187,10 +210,9 @@ class StreamDelivery {
       case "runtime.approval.requested": {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
-        if (this.isDurableWeixinRun(state)) {
-          state.toolProgressKinds.push("approval");
-          this.ensureTaskProgressTimer(state);
-        }
+        // App-level approval delivery is immediate and actionable. Avoid
+        // following it with a second generic progress message.
+        this.clearTaskProgressTimer(state);
         return;
       }
       case "runtime.reply.completed": {
@@ -276,10 +298,16 @@ class StreamDelivery {
       startedAtMs: 0,
       pendingNaturalProgress: "",
       confirmedNaturalProgress: [],
-      toolProgressKinds: [],
+      pendingProgressPhase: "",
+      highestProgressPhaseRank: 0,
+      lastProgressPhase: "",
+      lastProgressText: "",
+      lastProgressSentAtMs: null,
       kickoffSent: false,
       progressTimer: null,
+      progressTimerDueAtMs: 0,
       progressTick: 0,
+      heartbeatCount: 0,
     };
     this.stateByRunKey.set(runKey, created);
     this.attachReplyTarget(created);
@@ -391,11 +419,19 @@ class StreamDelivery {
   }
 
   ensureTaskProgressTimer(state) {
-    if (!state?.turnStarted || !this.isDurableWeixinRun(state) || state.progressTimer) {
+    if (!state?.turnStarted || !this.isDurableWeixinRun(state)) {
       return;
     }
     state.startedAtMs ||= this.now();
-    state.progressTimer = this.setIntervalFn(() => {
+    const dueAtMs = this.resolveNextTaskProgressDueAt(state);
+    if (state.progressTimer && state.progressTimerDueAtMs === dueAtMs) {
+      return;
+    }
+    this.clearTaskProgressTimer(state);
+    state.progressTimerDueAtMs = dueAtMs;
+    state.progressTimer = this.setTimeoutFn(() => {
+      state.progressTimer = null;
+      state.progressTimerDueAtMs = 0;
       state.sendChain = state.sendChain
         .catch(() => {})
         .then(() => this.emitTaskProgress(state))
@@ -403,8 +439,9 @@ class StreamDelivery {
           console.error(
             `[cyberboss] failed to persist task progress thread=${state.threadId}: ${error.message}`
           );
-        });
-    }, this.progressIntervalMs);
+        })
+        .finally(() => this.ensureTaskProgressTimer(state));
+    }, Math.max(0, dueAtMs - this.now()));
     state.progressTimer.unref?.();
   }
 
@@ -412,15 +449,43 @@ class StreamDelivery {
     if (!state?.progressTimer) {
       return;
     }
-    this.clearIntervalFn(state.progressTimer);
+    this.clearTimeoutFn(state.progressTimer);
     state.progressTimer = null;
+    state.progressTimerDueAtMs = 0;
+  }
+
+  resolveNextTaskProgressDueAt(state) {
+    const nowMs = this.now();
+    const hasLastProgress = Number.isFinite(state.lastProgressSentAtMs);
+    if (state.confirmedNaturalProgress.length || state.pendingProgressPhase) {
+      const earliestAtMs = hasLastProgress
+        ? state.lastProgressSentAtMs + this.progressMinIntervalMs
+        : state.startedAtMs + this.progressInitialPhaseDelayMs;
+      return Math.max(nowMs, earliestAtMs);
+    }
+    const anchorMs = hasLastProgress ? state.lastProgressSentAtMs : state.startedAtMs;
+    return Math.max(nowMs, anchorMs + this.resolveHeartbeatDelayMs(state.heartbeatCount));
+  }
+
+  resolveHeartbeatDelayMs(heartbeatCount) {
+    if (heartbeatCount <= 0) {
+      return this.progressFirstHeartbeatMs;
+    }
+    const index = Math.min(
+      heartbeatCount - 1,
+      this.progressHeartbeatBackoffMs.length - 1,
+    );
+    return this.progressHeartbeatBackoffMs[index];
   }
 
   async confirmNaturalProgressBeforeTool(state) {
     const natural = state.pendingNaturalProgress;
     state.pendingNaturalProgress = "";
     if (!natural) {
-      return;
+      return false;
+    }
+    if (sameProgressText(natural, state.lastProgressText)) {
+      return true;
     }
     if (!state.kickoffSent) {
       state.kickoffSent = true;
@@ -429,24 +494,32 @@ class StreamDelivery {
         text: natural,
         idempotencyKey: `kickoff:${state.runKey}`,
       });
-      return;
+      this.rememberTaskProgress(state, {
+        text: natural,
+        meaningful: true,
+      });
+      this.ensureTaskProgressTimer(state);
+      return true;
     }
     const previous = state.confirmedNaturalProgress[state.confirmedNaturalProgress.length - 1];
-    if (previous !== natural) {
+    if (!sameProgressText(previous, natural)) {
       state.confirmedNaturalProgress.push(natural);
       if (state.confirmedNaturalProgress.length > 6) {
         state.confirmedNaturalProgress.splice(0, state.confirmedNaturalProgress.length - 6);
       }
     }
+    return true;
   }
 
-  addTaskToolSignal(state, toolName, input = null) {
+  addTaskToolSignal(state, toolName, input = null, { suppressPhaseUpdate = false } = {}) {
     const kind = classifyTaskToolProgress(toolName, input);
-    if (kind && kind !== "internal") {
-      state.toolProgressKinds.push(kind);
-      if (state.toolProgressKinds.length > 20) {
-        state.toolProgressKinds.splice(0, state.toolProgressKinds.length - 20);
-      }
+    const rank = progressPhaseRank(kind);
+    if (!rank || rank <= state.highestProgressPhaseRank) {
+      return;
+    }
+    state.highestProgressPhaseRank = rank;
+    if (!suppressPhaseUpdate && kind !== state.lastProgressPhase) {
+      state.pendingProgressPhase = kind;
     }
   }
 
@@ -454,21 +527,42 @@ class StreamDelivery {
     if (!this.isDurableWeixinRun(state)) {
       return;
     }
-    state.progressTick += 1;
     const natural = state.confirmedNaturalProgress.at(-1) || "";
-    const toolKinds = [...state.toolProgressKinds];
-    const text = natural || buildTaskProgressText(
-      toolKinds,
-      Math.max(0, this.now() - state.startedAtMs),
-      state.progressTick,
-    );
+    const phase = state.pendingProgressPhase;
+    const meaningful = Boolean(natural || phase);
+    const text = natural
+      || buildTaskPhaseProgressText(phase)
+      || buildTaskHeartbeatText(
+        Math.max(0, this.now() - state.startedAtMs),
+        state.heartbeatCount,
+      );
+    state.confirmedNaturalProgress = [];
+    state.pendingProgressPhase = "";
+    if (sameProgressText(text, state.lastProgressText)) {
+      return;
+    }
+    state.progressTick += 1;
     await this.enqueueTaskDelivery(state, {
       kind: "progress",
       text,
       idempotencyKey: `progress:${state.runKey}:${state.progressTick}`,
     });
-    state.confirmedNaturalProgress = [];
-    state.toolProgressKinds = [];
+    this.rememberTaskProgress(state, {
+      text,
+      phase: meaningful ? phase : "",
+      meaningful,
+    });
+  }
+
+  rememberTaskProgress(state, { text, phase = "", meaningful = false }) {
+    state.lastProgressText = normalizeProgressFingerprint(text);
+    state.lastProgressSentAtMs = this.now();
+    if (phase) {
+      state.lastProgressPhase = phase;
+    }
+    state.heartbeatCount = meaningful
+      ? 0
+      : state.heartbeatCount + 1;
   }
 
   async enqueueTaskDelivery(state, { kind, text, idempotencyKey = "" }) {
@@ -749,6 +843,9 @@ class StreamDelivery {
       return;
     }
     const state = this.stateByRunKey.get(normalizedRunKey);
+    if (state) {
+      state.turnStarted = false;
+    }
     this.clearTaskProgressTimer(state);
     this.replyTargetByTurnKey.delete(normalizedRunKey);
     this.stateByRunKey.delete(normalizedRunKey);
@@ -905,33 +1002,74 @@ function classifyTaskToolProgress(toolName, input = null) {
   return "work";
 }
 
-function buildTaskProgressText(toolKinds, elapsedMs, progressTick = 1) {
-  const kinds = new Set(toolKinds);
-  if (kinds.has("approval")) {
-    return "我这边正在等你确认授权，确认后我就继续。";
+function progressPhaseRank(kind) {
+  if (kind === "inspect") {
+    return 1;
   }
-  if (kinds.has("modify")) {
-    return "问题已经有些眉目了，我正在调整实现并继续确认。";
+  if (kind === "modify") {
+    return 2;
   }
-  if (kinds.has("verify")) {
-    return "我正在核对结果，确认清楚后就一起告诉你。";
+  if (kind === "verify") {
+    return 3;
   }
-  if (kinds.has("inspect")) {
-    return "我还在看相关内容，正在把整个链路理清楚。";
+  return 0;
+}
+
+function buildTaskPhaseProgressText(phase) {
+  if (phase === "inspect") {
+    return "我已经开始检查相关内容，正在定位具体问题。";
   }
-  if (kinds.has("work")) {
-    return "我还在继续处理，正在确认目前的结果。";
+  if (phase === "modify") {
+    return "我已经进入修改阶段，接下来会继续核对改动。";
   }
-  const seconds = Math.max(30, Math.round(elapsedMs / 1_000));
+  if (phase === "verify") {
+    return "修改已经进入验证阶段，我正在核对结果。";
+  }
+  return "";
+}
+
+function buildTaskHeartbeatText(elapsedMs, heartbeatCount = 0) {
+  const seconds = Math.max(90, Math.round(elapsedMs / 1_000));
   const elapsed = seconds < 60
     ? `约 ${seconds} 秒`
     : `约 ${Math.max(1, Math.round(seconds / 60))} 分钟`;
   const heartbeats = [
-    `我还在处理，已经进行了${elapsed}，暂时没有新的结论，再等我一下。`,
-    `还在继续，任务已经进行了${elapsed}，我正在把剩下的部分确认完。`,
-    `我还在这边处理，已经进行了${elapsed}，完成后马上把结果告诉你。`,
+    "我还在处理这件事，暂时没有新的确定结论。有结果后我直接告诉你。",
+    `任务还在继续，已经进行了${elapsed}。我正在等下一条确定结果。`,
+    `我还在处理，任务已进行了${elapsed}。有明确变化我马上告诉你。`,
   ];
-  return heartbeats[(Math.max(1, progressTick) - 1) % heartbeats.length];
+  return heartbeats[Math.min(Math.max(0, heartbeatCount), heartbeats.length - 1)];
+}
+
+function normalizeProgressFingerprint(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/[，。！？、；：,.!?;:]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function sameProgressText(left, right) {
+  const normalizedLeft = normalizeProgressFingerprint(left);
+  const normalizedRight = normalizeProgressFingerprint(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+}
+
+function positiveDelay(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 10
+    ? numeric
+    : fallback;
+}
+
+function normalizeDelaySchedule(value, fallback) {
+  const normalized = Array.isArray(value)
+    ? value
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item) && item >= 10)
+    : [];
+  return normalized.length ? normalized : [...fallback];
 }
 
 function collectPendingReplyDeliveries(state, { force }) {

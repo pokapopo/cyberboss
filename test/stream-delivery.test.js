@@ -49,6 +49,59 @@ function createHarness({
   return { sent, streamDelivery, bindingByThreadId };
 }
 
+function createProgressClock(startMs = 0) {
+  let nowMs = startMs;
+  const timers = [];
+
+  function setTimeoutFn(callback, delayMs) {
+    const timer = {
+      callback,
+      delayMs,
+      dueAtMs: nowMs + delayMs,
+      cleared: false,
+      unref() {},
+    };
+    timers.push(timer);
+    return timer;
+  }
+
+  function clearTimeoutFn(timer) {
+    if (timer) {
+      timer.cleared = true;
+    }
+  }
+
+  function activeTimers() {
+    return timers
+      .filter((timer) => !timer.cleared)
+      .sort((left, right) => left.dueAtMs - right.dueAtMs);
+  }
+
+  async function fireNext(streamDelivery, runKey) {
+    const timer = activeTimers()[0];
+    assert.ok(timer, "expected an active progress timer");
+    timer.cleared = true;
+    nowMs = timer.dueAtMs;
+    timer.callback();
+    const state = streamDelivery.stateByRunKey.get(runKey);
+    if (state) {
+      await state.sendChain;
+    }
+    return timer;
+  }
+
+  return {
+    now: () => nowMs,
+    setNow(value) {
+      nowMs = value;
+    },
+    setTimeoutFn,
+    clearTimeoutFn,
+    activeTimers,
+    fireNext,
+  };
+}
+
 async function runCompletedTurn(streamDelivery, { threadId, turnId, itemId, text }) {
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.turn.started",
@@ -710,28 +763,25 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
   });
 });
 
-test("durable Weixin turns send confirmed Claude progress naturally and hide tool names", async () => {
+test("durable Weixin progress uses adaptive phase changes and suppresses repeated phases", async () => {
   const deliveries = [];
-  let nowMs = 0;
-  let intervalCallback = null;
+  const clock = createProgressClock();
   let cleared = false;
-  const fakeTimer = { unref() {} };
   const { streamDelivery } = createHarness({
     runtimeId: "claudecode",
     async onTaskDelivery(payload) {
       deliveries.push(payload);
     },
     streamOptions: {
-      progressIntervalMs: 30_000,
-      now: () => nowMs,
-      setIntervalFn(callback, intervalMs) {
-        assert.equal(intervalMs, 30_000);
-        intervalCallback = callback;
-        return fakeTimer;
-      },
-      clearIntervalFn(timer) {
-        assert.equal(timer, fakeTimer);
+      progressMinIntervalMs: 45_000,
+      progressInitialPhaseDelayMs: 60_000,
+      progressFirstHeartbeatMs: 90_000,
+      progressHeartbeatBackoffMs: [120_000, 180_000],
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn(timer) {
         cleared = true;
+        clock.clearTimeoutFn(timer);
       },
     },
   });
@@ -745,16 +795,19 @@ test("durable Weixin turns send confirmed Claude progress naturally and hide too
     payload: { threadId: "thread-progress", turnId: "turn-progress" },
   });
   await streamDelivery.handleRuntimeEvent({
-    type: "runtime.reply.completed",
+    type: "runtime.tool.use",
     payload: {
       threadId: "thread-progress",
       turnId: "turn-progress",
-      itemId: "item-progress",
-      text: "我先检查消息投递链路。",
+      toolName: "Read",
     },
   });
-  assert.equal(deliveries.length, 0);
+  assert.equal(clock.activeTimers()[0].dueAtMs, 60_000);
+  await clock.fireNext(streamDelivery, "thread-progress:turn-progress");
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].text, "我已经开始检查相关内容，正在定位具体问题。");
 
+  clock.setNow(70_000);
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.tool.use",
     payload: {
@@ -764,40 +817,33 @@ test("durable Weixin turns send confirmed Claude progress naturally and hide too
     },
   });
   assert.equal(deliveries.length, 1);
-  assert.equal(deliveries[0].kind, "progress");
-  assert.equal(deliveries[0].text, "我先检查消息投递链路。");
+  assert.equal(clock.activeTimers()[0].dueAtMs, 150_000);
 
-  nowMs = 30_000;
-  intervalCallback();
-  await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
-  assert.equal(deliveries.length, 2);
-  assert.equal(deliveries[1].text, "我还在看相关内容，正在把整个链路理清楚。");
-  assert.doesNotMatch(deliveries[1].text, /Read|读取|TaskUpdate|命令行/);
-
-  await streamDelivery.handleRuntimeEvent({
-    type: "runtime.reply.completed",
-    payload: {
-      threadId: "thread-progress",
-      turnId: "turn-progress",
-      itemId: "item-progress",
-      text: "我找到一个可疑的状态清理分支，再确认一下。",
-    },
-  });
+  clock.setNow(100_000);
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.tool.use",
     payload: {
       threadId: "thread-progress",
       turnId: "turn-progress",
-      toolName: "TaskUpdate",
+      toolName: "Edit",
     },
   });
+  assert.equal(clock.activeTimers()[0].dueAtMs, 105_000);
+  await clock.fireNext(streamDelivery, "thread-progress:turn-progress");
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[1].text, "我已经进入修改阶段，接下来会继续核对改动。");
 
-  nowMs = 60_000;
-  intervalCallback();
-  await streamDelivery.stateByRunKey.get("thread-progress:turn-progress").sendChain;
-  assert.equal(deliveries.length, 3);
-  assert.equal(deliveries[2].text, "我找到一个可疑的状态清理分支，再确认一下。");
-  assert.doesNotMatch(deliveries[2].text, /TaskUpdate/);
+  clock.setNow(110_000);
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      toolName: "Edit",
+    },
+  });
+  assert.equal(deliveries.length, 2);
+  assert.equal(clock.activeTimers()[0].dueAtMs, 195_000);
 
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.turn.completed",
@@ -808,10 +854,156 @@ test("durable Weixin turns send confirmed Claude progress naturally and hide too
     },
   });
   assert.equal(cleared, true);
-  assert.equal(deliveries.length, 4);
-  assert.equal(deliveries[3].kind, "final");
-  assert.equal(deliveries[3].text, "已经修复消息投递。");
+  assert.equal(deliveries.length, 3);
+  assert.equal(deliveries[2].kind, "final");
+  assert.equal(deliveries[2].text, "已经修复消息投递。");
   assert.equal(streamDelivery.stateByRunKey.has("thread-progress:turn-progress"), false);
+  assert.equal(clock.activeTimers().length, 0);
+});
+
+test("durable Weixin liveness heartbeats start at 90 seconds and back off", async () => {
+  const deliveries = [];
+  const clock = createProgressClock();
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      progressFirstHeartbeatMs: 90_000,
+      progressHeartbeatBackoffMs: [120_000, 180_000],
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-heartbeat", {
+    userId: "user-heartbeat",
+    contextToken: "ctx-heartbeat",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-heartbeat", turnId: "turn-heartbeat" },
+  });
+
+  assert.equal(clock.activeTimers()[0].dueAtMs, 90_000);
+  await clock.fireNext(streamDelivery, "thread-heartbeat:turn-heartbeat");
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0].text, /暂时没有新的确定结论/);
+
+  assert.equal(clock.activeTimers()[0].dueAtMs, 210_000);
+  await clock.fireNext(streamDelivery, "thread-heartbeat:turn-heartbeat");
+  assert.equal(deliveries.length, 2);
+  assert.notEqual(deliveries[1].text, deliveries[0].text);
+  assert.equal(clock.activeTimers()[0].dueAtMs, 390_000);
+});
+
+test("durable Weixin progress pauses for an actionable approval prompt and resumes on work", async () => {
+  const clock = createProgressClock();
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery() {},
+    streamOptions: {
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-approval", {
+    userId: "user-approval",
+    contextToken: "ctx-approval",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-approval", turnId: "turn-approval" },
+  });
+  assert.equal(clock.activeTimers().length, 1);
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.approval.requested",
+    payload: { threadId: "thread-approval", turnId: "turn-approval" },
+  });
+  assert.equal(clock.activeTimers().length, 0);
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-approval",
+      turnId: "turn-approval",
+      toolName: "Read",
+    },
+  });
+  assert.equal(clock.activeTimers()[0].dueAtMs, 60_000);
+});
+
+test("durable Weixin natural progress is rate-limited and deduped across cycles", async () => {
+  const deliveries = [];
+  const clock = createProgressClock();
+  const { streamDelivery } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    streamOptions: {
+      progressMinIntervalMs: 45_000,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-natural", {
+    userId: "user-natural",
+    contextToken: "ctx-natural",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-natural", turnId: "turn-natural" },
+  });
+
+  async function emitNaturalProgress(text, toolName) {
+    await streamDelivery.handleRuntimeEvent({
+      type: "runtime.reply.completed",
+      payload: {
+        threadId: "thread-natural",
+        turnId: "turn-natural",
+        itemId: "item-natural",
+        text,
+      },
+    });
+    await streamDelivery.handleRuntimeEvent({
+      type: "runtime.tool.use",
+      payload: {
+        threadId: "thread-natural",
+        turnId: "turn-natural",
+        toolName,
+      },
+    });
+  }
+
+  await emitNaturalProgress("我先检查消息投递链路。", "Read");
+  assert.deepEqual(deliveries.map((item) => item.text), ["我先检查消息投递链路。"]);
+
+  clock.setNow(10_000);
+  await emitNaturalProgress("我先检查消息投递链路。", "Read");
+  assert.equal(deliveries.length, 1);
+  assert.equal(clock.activeTimers()[0].dueAtMs, 90_000);
+
+  clock.setNow(20_000);
+  await emitNaturalProgress("我找到一个可疑的状态清理分支，再确认一下。", "TaskUpdate");
+  assert.equal(clock.activeTimers()[0].dueAtMs, 45_000);
+  await clock.fireNext(streamDelivery, "thread-natural:turn-natural");
+  assert.deepEqual(deliveries.map((item) => item.text), [
+    "我先检查消息投递链路。",
+    "我找到一个可疑的状态清理分支，再确认一下。",
+  ]);
+
+  clock.setNow(50_000);
+  await emitNaturalProgress("我找到一个可疑的状态清理分支，再确认一下。", "TaskUpdate");
+  assert.equal(deliveries.length, 2);
+  assert.equal(clock.activeTimers()[0].dueAtMs, 135_000);
 });
 
 test("a Claude reply without a following tool is sent once as the final answer", async () => {
@@ -822,10 +1014,10 @@ test("a Claude reply without a following tool is sent once as the final answer",
       deliveries.push(payload);
     },
     streamOptions: {
-      setIntervalFn() {
+      setTimeoutFn() {
         return { unref() {} };
       },
-      clearIntervalFn() {},
+      clearTimeoutFn() {},
     },
   });
   streamDelivery.queueReplyTargetForThread("thread-direct", {
@@ -869,10 +1061,10 @@ test("durable Weixin completion persists an explicit error when Claude returns n
       deliveries.push(payload);
     },
     streamOptions: {
-      setIntervalFn() {
+      setTimeoutFn() {
         return { unref() {} };
       },
-      clearIntervalFn() {},
+      clearTimeoutFn() {},
     },
   });
   streamDelivery.queueReplyTargetForThread("thread-empty", {
@@ -896,18 +1088,20 @@ test("durable Weixin completion persists an explicit error when Claude returns n
 
 test("binding a new Claude Code turn starts progress even when the early start event had no session id", async () => {
   const deliveries = [];
-  let intervalCallback = null;
+  let timeoutCallback = null;
+  const timeoutDelays = [];
   const { streamDelivery } = createHarness({
     runtimeId: "claudecode",
     async onTaskDelivery(payload) {
       deliveries.push(payload);
     },
     streamOptions: {
-      setIntervalFn(callback) {
-        intervalCallback = callback;
+      setTimeoutFn(callback, delayMs) {
+        timeoutDelays.push(delayMs);
+        timeoutCallback = callback;
         return { unref() {} };
       },
-      clearIntervalFn() {},
+      clearTimeoutFn() {},
     },
   });
 
@@ -925,8 +1119,9 @@ test("binding a new Claude Code turn starts progress even when the early start e
     },
   });
 
-  assert.equal(typeof intervalCallback, "function");
-  intervalCallback();
+  assert.equal(typeof timeoutCallback, "function");
+  assert.equal(timeoutDelays[0], 90_000);
+  timeoutCallback();
   await streamDelivery.stateByRunKey
     .get("thread-new-session:turn-new-session")
     .sendChain;
