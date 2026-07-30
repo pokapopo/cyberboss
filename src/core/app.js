@@ -101,6 +101,7 @@ class CyberbossApp {
     this.pendingMemoryTurns = new Map();
     this.memoryCoordinator = new ConversationMemoryCoordinator({
       memoryService: this.projectServices.memory,
+      recallEveryTurns: config.memoryRecallEveryTurns,
       extractionEveryTurns: config.memoryExtractionEveryTurns,
     });
     this.weixinDeliveryService = new WeixinDeliveryService({
@@ -191,7 +192,7 @@ class CyberbossApp {
     console.log(`[cyberboss] runtimeEndpoint=${runtimeState.endpoint || runtimeState.command || "(spawn)"}`);
     console.log(`[cyberboss] runtimeModels=${runtimeState.models?.length || 0}`);
     console.log(`[cyberboss] vision: mode=${this.config.visionMode} provider=${this.config.visionProvider} baseUrl=${this.config.visionApiBaseUrl || "(empty)"} model=${this.config.visionModel || "(empty)"}`);
-    console.log(`[cyberboss] memory: recall=${this.projectServices.memory?.isRecallConfigured?.() ? "ready" : "disabled"} extraction=${this.projectServices.memory?.isExtractionConfigured?.() ? `every-${this.config.memoryExtractionEveryTurns}-turns` : "disabled"}`);
+    console.log(`[cyberboss] memory: recall=${this.projectServices.memory?.isRecallConfigured?.() ? `topic-aware/every-${this.config.memoryRecallEveryTurns}-turns` : "disabled"} extraction=${this.projectServices.memory?.isExtractionConfigured?.() ? `every-${this.config.memoryExtractionEveryTurns}-turns` : "disabled"}`);
     if (this.config.startWithLocationServer) {
       await this.ensureLocationServerStarted();
     }

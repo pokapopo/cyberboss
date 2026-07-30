@@ -183,6 +183,48 @@ test("topic-aware coordinator skips short continuations and retrieves after a cl
   assert.equal(searches.length, 2);
 });
 
+test("coordinator periodically recalls on the fifth same-topic user turn", async () => {
+  const searches = [];
+  const memoryService = {
+    isRecallConfigured() {
+      return true;
+    },
+    isExtractionConfigured() {
+      return false;
+    },
+    async search(query) {
+      searches.push(query);
+      return [];
+    },
+  };
+  const coordinator = new ConversationMemoryCoordinator({
+    memoryService,
+    recallEveryTurns: 5,
+  });
+
+  const initial = await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案",
+  });
+  assert.equal(initial.reason, "initial_topic");
+
+  for (let index = 1; index <= 4; index += 1) {
+    const result = await coordinator.prepareTurn({
+      scopeKey: "binding::workspace",
+      text: `继续讨论微信消息投递稳定性的修复方案第${index}部分`,
+    });
+    assert.equal(result.reason, "");
+  }
+
+  const fifth = await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "继续讨论微信消息投递稳定性的修复方案第五部分",
+  });
+
+  assert.equal(fifth.reason, "periodic_refresh");
+  assert.equal(searches.length, 2);
+});
+
 test("coordinator queues one background extraction after ten completed turns", async () => {
   const batches = [];
   const memoryService = {

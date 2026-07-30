@@ -1,6 +1,6 @@
 const DEFAULT_EXTRACTION_EVERY_TURNS = 10;
+const DEFAULT_RECALL_EVERY_TURNS = 5;
 const MAX_BUFFERED_TURNS = 12;
-const MAX_RECALL_GAP = 12;
 const MIN_RECALL_GAP = 2;
 const TOPIC_SIMILARITY_THRESHOLD = 0.18;
 const SHORT_CONTINUATION_MAX_CHARS = 10;
@@ -9,10 +9,22 @@ class ConversationMemoryCoordinator {
   constructor({
     memoryService,
     extractionEveryTurns = DEFAULT_EXTRACTION_EVERY_TURNS,
+    recallEveryTurns = DEFAULT_RECALL_EVERY_TURNS,
     logger = console,
   } = {}) {
     this.memoryService = memoryService;
-    this.extractionEveryTurns = clampInteger(extractionEveryTurns, 5, 30);
+    this.extractionEveryTurns = clampInteger(
+      extractionEveryTurns,
+      5,
+      30,
+      DEFAULT_EXTRACTION_EVERY_TURNS,
+    );
+    this.recallEveryTurns = clampInteger(
+      recallEveryTurns,
+      1,
+      30,
+      DEFAULT_RECALL_EVERY_TURNS,
+    );
     this.logger = logger;
     this.scopes = new Map();
     this.extractionChain = Promise.resolve();
@@ -25,7 +37,9 @@ class ConversationMemoryCoordinator {
       return emptyMemoryContext();
     }
     const state = this.getScope(normalizedScope);
-    const decision = decideTopicRecall(state, normalizedText);
+    const decision = decideTopicRecall(state, normalizedText, {
+      recallEveryTurns: this.recallEveryTurns,
+    });
     state.userTurnsSinceRecall += 1;
     state.topicFingerprint = decision.nextFingerprint;
     state.lastUserText = normalizedText;
@@ -99,7 +113,7 @@ class ConversationMemoryCoordinator {
       state = {
         topicFingerprint: new Set(),
         lastUserText: "",
-        userTurnsSinceRecall: MAX_RECALL_GAP,
+        userTurnsSinceRecall: this.recallEveryTurns,
         completedTurnsSinceExtraction: 0,
         turns: [],
         notices: [],
@@ -115,7 +129,11 @@ class ConversationMemoryCoordinator {
   }
 }
 
-function decideTopicRecall(state, text) {
+function decideTopicRecall(
+  state,
+  text,
+  { recallEveryTurns = DEFAULT_RECALL_EVERY_TURNS } = {},
+) {
   const nextFingerprint = buildTopicFingerprint(text);
   const explicitTransition = /(?:换个话题|换一件事|说点别的|另外一件事|另外问|还有个问题|对了[，,：:]|说到这里)/.test(text);
   if (!state.topicFingerprint.size) {
@@ -139,7 +157,7 @@ function decideTopicRecall(state, text) {
       nextFingerprint,
     };
   }
-  if (state.userTurnsSinceRecall >= MAX_RECALL_GAP) {
+  if (state.userTurnsSinceRecall >= recallEveryTurns - 1) {
     return {
       shouldRecall: true,
       reason: "periodic_refresh",
@@ -211,9 +229,9 @@ function emptyMemoryContext() {
   return { recalled: [], notices: [], reason: "" };
 }
 
-function clampInteger(value, min, max) {
+function clampInteger(value, min, max, fallback) {
   const parsed = Number.parseInt(value, 10);
-  return Math.max(min, Math.min(max, Number.isFinite(parsed) ? parsed : DEFAULT_EXTRACTION_EVERY_TURNS));
+  return Math.max(min, Math.min(max, Number.isFinite(parsed) ? parsed : fallback));
 }
 
 function normalizeText(value) {

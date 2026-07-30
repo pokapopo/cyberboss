@@ -98,7 +98,7 @@ Notes:
 - Weixin and system runtime executions are logged automatically; work-log tools are read-only lookup tools.
 - Experience records require a problem, resolution, and concrete verification. Matching signatures update an existing entry.
 - Long-term memory recall is topic-gated; background extraction runs in bounded batches and leaves uncertain or sensitive results as reviewable candidates.
-- Memory automation is opt-in with `CYBERBOSS_MEMORY_ENABLED=true`. Enabling it sends topic-change queries and changed memory text to the configured embedding endpoint, and sends each extraction batch (about ten completed turns) to the configured extraction model.
+- Memory automation is opt-in with `CYBERBOSS_MEMORY_ENABLED=true`. Enabling it sends topic-change or every-five-turn periodic queries and changed memory text to the configured embedding endpoint, and sends each extraction batch (about ten completed turns) to the configured extraction model. Set `CYBERBOSS_MEMORY_RECALL_EVERY_TURNS` to adjust the periodic interval.
 - Memory provider refusals, timeouts, and malformed responses degrade silently to no recall/extraction result; they are logged for operators and never become a Weixin error reply.
 - The public human terminal surface stays intentionally small: lifecycle commands plus shared bridge scripts.
 
