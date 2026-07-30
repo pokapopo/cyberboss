@@ -43,6 +43,7 @@ const {
   canonicalizeCommandTokens,
   extractApprovalFilePaths,
   isPathWithinRoot,
+  isPathWithinRootResolved,
   normalizeCommandTokens,
   splitCommandLine,
 } = require("../adapters/runtime/shared/approval-command");
@@ -1950,6 +1951,11 @@ class CyberbossApp {
     }
     const allowlist = sessionStore.getApprovalCommandAllowlistForWorkspace(linked.workspaceRoot);
     const shouldAutoApprove = isAutoApprovedStateDirOperation(event.payload, this.config)
+      || isAutoApprovedPromptMemoryOperation(
+        event.payload,
+        this.config,
+        linked.workspaceRoot,
+      )
       || matchesBuiltInCommandPrefix(event.payload.commandTokens)
       || matchesCommandPrefix(event.payload.commandTokens, allowlist);
     if (!shouldAutoApprove) {
@@ -2638,6 +2644,39 @@ function isAutoApprovedStateDirOperation(approval, config = {}) {
   }
 
   return filePaths.every((filePath) => isPathWithinRoot(filePath, stateDir));
+}
+
+function isAutoApprovedPromptMemoryOperation(
+  approval,
+  config = {},
+  workspaceRoot = "",
+) {
+  const filePaths = extractApprovalFilePaths(approval);
+  if (!filePaths.length) {
+    return false;
+  }
+
+  const trustedDirectories = [
+    config?.memoryDir,
+  ].map(normalizeText).filter(Boolean);
+  const trustedFiles = [
+    config?.weixinInstructionsFile,
+    config?.weixinContextFile,
+    config?.weixinOperationsFile,
+    config?.stateDir ? path.join(config.stateDir, "claude-local.md") : "",
+    workspaceRoot ? path.join(workspaceRoot, "CLAUDE.md") : "",
+  ].map(normalizeText).filter(Boolean);
+
+  return filePaths.every((filePath) =>
+    trustedDirectories.some((rootPath) =>
+      isPathWithinRootResolved(filePath, rootPath))
+    || trustedFiles.some((trustedFile) =>
+      isSameResolvedPath(filePath, trustedFile)));
+}
+
+function isSameResolvedPath(left, right) {
+  return isPathWithinRootResolved(left, right)
+    && isPathWithinRootResolved(right, left);
 }
 
 function sortInboundUpdateMessages(messages) {

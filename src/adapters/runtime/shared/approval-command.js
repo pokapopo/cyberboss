@@ -1,3 +1,4 @@
+const fs = require("node:fs");
 const path = require("node:path");
 
 function extractApprovalCommandTokens(value, options = {}) {
@@ -259,6 +260,45 @@ function isPathWithinRoot(filePath, rootPath) {
   return resolvedFilePath === resolvedRootPath || resolvedFilePath.startsWith(`${resolvedRootPath}/`);
 }
 
+function isPathWithinRootResolved(filePath, rootPath) {
+  const resolvedFilePath = resolvePathForApproval(filePath);
+  const resolvedRootPath = resolvePathForApproval(rootPath);
+  if (!resolvedFilePath || !resolvedRootPath) {
+    return false;
+  }
+  return resolvedFilePath === resolvedRootPath
+    || resolvedFilePath.startsWith(`${resolvedRootPath}/`);
+}
+
+function resolvePathForApproval(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return "";
+  }
+  let current = path.resolve(normalized);
+  const missingSegments = [];
+  while (current && current !== path.dirname(current)) {
+    try {
+      const realPath = typeof fs.realpathSync.native === "function"
+        ? fs.realpathSync.native(current)
+        : fs.realpathSync(current);
+      return path.resolve(realPath, ...missingSegments).replace(/\\/g, "/");
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+        return "";
+      }
+      missingSegments.unshift(path.basename(current));
+      current = path.dirname(current);
+    }
+  }
+  try {
+    const realRoot = fs.realpathSync(current || path.parse(path.resolve(normalized)).root);
+    return path.resolve(realRoot, ...missingSegments).replace(/\\/g, "/");
+  } catch {
+    return "";
+  }
+}
+
 function isShellWrapper(command, flag) {
   const executable = baseName(command);
   return (executable === "sh" || executable === "bash" || executable === "zsh") && normalizeString(flag) === "-lc";
@@ -335,6 +375,7 @@ module.exports = {
   canonicalizeCommandTokens,
   isImageFilePath,
   isPathWithinRoot,
+  isPathWithinRootResolved,
   matchesCommandPrefix,
   normalizeCommandTokens,
   splitCommandLine,

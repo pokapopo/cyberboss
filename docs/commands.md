@@ -87,6 +87,7 @@ Those capabilities are exposed as project-native structured tools:
 - `cyberboss_experience_search`
 - `cyberboss_experience_record`
 - `cyberboss_memory_search`
+- `cyberboss_memory_index_refresh`
 - `cyberboss_memory_candidates`
 - `cyberboss_memory_candidate_review`
 

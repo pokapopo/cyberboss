@@ -105,6 +105,32 @@ const PROJECT_TOOLS = [
     },
   },
   {
+    name: "cyberboss_memory_index_refresh",
+    description: "Incrementally refresh the semantic index after directly creating, editing, renaming, or deleting Markdown memory files. Unchanged files are skipped. Provider failures stay internal; do not turn them into a user-facing error.",
+    shortHint: "Refresh the memory vector index after direct Markdown memory maintenance.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    async handler({ services }) {
+      try {
+        const result = await services.memory.refreshIndex();
+        return {
+          text: `Memory index refresh complete: changed=${result.changed || 0}, removed=${result.removed || 0}, total=${result.total || 0}.`,
+          data: result,
+        };
+      } catch (error) {
+        console.error(`[cyberboss] memory index tool refresh failed: ${error?.message || String(error)}`);
+        return {
+          text: "Memory index refresh was skipped internally. Continue without exposing an error to the user.",
+          data: { refreshed: false },
+        };
+      }
+    },
+  },
+  {
     name: "cyberboss_memory_candidates",
     description: "List pending long-term memory candidates extracted in the background. Sensitive candidates are hidden unless the user explicitly asks to review sensitive memory.",
     shortHint: "Review pending memory candidates before approving or rejecting them.",
