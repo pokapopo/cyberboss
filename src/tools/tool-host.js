@@ -634,8 +634,107 @@ const PROJECT_TOOLS = [
     },
   },
   {
+    name: "cyberboss_timeline_capture",
+    description: "Immediately preserve one or more timeline activity observations before exact event ranges are known. Use this in the same conversational turn whenever the user reports an activity, transition, duration, or ongoing state. It is safe to capture unknown or approximate time and does not write a guessed final timeline event. Source message ids are attached automatically when available. Observations expire after 48 hours unless reconciled.",
+    shortHint: "Capture activity evidence immediately without inventing a complete time range.",
+    topics: ["timeline"],
+    inputSchema: {
+      type: "object",
+      required: ["observations"],
+      properties: {
+        observations: {
+          type: "array",
+          description: "Activity observations from the current conversation, in visible order.",
+          items: {
+            type: "object",
+            required: ["text"],
+            properties: {
+              text: { type: "string", description: "Concise factual observation grounded in the user's message; do not embellish." },
+              date: { type: "string", description: "Asia/Shanghai calendar date when explicitly known; otherwise omit." },
+              observedAt: { type: "string", description: "Message/report time as an ISO datetime; defaults to capture time." },
+              startAt: { type: "string", description: "Known activity start as an ISO datetime; omit when unknown." },
+              endAt: { type: "string", description: "Known activity end as an ISO datetime; omit for ongoing or unknown end." },
+              timePrecision: { type: "string", enum: ["exact", "approximate", "unknown"], description: "How strongly the conversation supports the supplied time." },
+              status: { type: "string", enum: ["ongoing", "completed"], description: "Whether the activity is still ongoing." },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args, context }) {
+      let workLog = null;
+      try {
+        workLog = context.workLogId ? services.workLog?.get?.(context.workLogId) : null;
+      } catch {
+        workLog = null;
+      }
+      const result = services.timeline.capture({
+        observations: args.observations,
+        sourceMessageIds: workLog?.source === "weixin" && Array.isArray(workLog.messageIds)
+          ? workLog.messageIds
+          : [],
+        threadId: context.threadId,
+      });
+      return {
+        text: `Timeline observations captured: ${result.capturedCount}. Reconcile only when the time range is evidence-backed; leave unknown or ongoing observations pending.`,
+        data: result,
+      };
+    },
+  },
+  {
+    name: "cyberboss_timeline_reconcile",
+    description: "Inspect pending timeline observations together with the current day and taxonomy, then optionally apply evidence-backed upserts/drops through one safe complete-day replacement and verify by readback. First call with date only to inspect; request proposals only when considering new taxonomy. Every new or corrected event must cite pending observationIds and declare exact or approximate timePrecision. Unknown-time and ongoing observations should remain pending. Use resolvedObservationIds only for observations represented by the applied events or intentionally dismissed as irrelevant. This is the authoritative conversational timeline maintenance path; it avoids merge widening and duplicate correction errors.",
+    shortHint: "Inspect and safely reconcile pending evidence into a verified timeline day.",
+    topics: ["timeline"],
+    inputSchema: {
+      type: "object",
+      required: ["date"],
+      properties: {
+        date: { type: "string", description: "Target Asia/Shanghai date in YYYY-MM-DD." },
+        events: {
+          type: "array",
+          description: "Evidence-backed new or corrected events. Omit on the inspection call.",
+          items: {
+            type: "object",
+            required: ["observationIds", "startAt", "endAt", "timePrecision"],
+            properties: {
+              id: { type: "string", description: "Existing event id when correcting; omit for a stable id derived from observations." },
+              observationIds: { type: "array", items: { type: "string" }, description: "Pending observation ids supporting this event." },
+              startAt: { type: "string", description: "Evidence-backed ISO start datetime." },
+              endAt: { type: "string", description: "Evidence-backed ISO end datetime." },
+              timePrecision: { type: "string", enum: ["exact", "approximate"] },
+              title: { type: "string" },
+              note: { type: "string" },
+              categoryId: { type: "string" },
+              subcategoryId: { type: "string" },
+              eventNodeId: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+            },
+            additionalProperties: false,
+          },
+        },
+        dropEventIds: { type: "array", items: { type: "string" }, description: "Existing event ids to remove during this complete-day reconciliation." },
+        resolvedObservationIds: { type: "array", items: { type: "string" }, description: "Pending observations represented by this write or intentionally dismissed." },
+        finalize: { type: "boolean", description: "Finalize the timeline day after reconciliation." },
+        includeProposals: { type: "boolean", description: "Include taxonomy proposals only when deciding whether a new node is needed." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.timeline.reconcile(args);
+      return {
+        text: result.applied
+          ? `Timeline reconciled and verified: ${result.writtenEventCount} written, ${result.droppedEventCount} dropped, ${result.pendingObservations.length} pending.`
+          : `Timeline reconciliation state loaded: ${result.pendingObservations.length} pending observations.`,
+        data: result,
+      };
+    },
+  },
+  {
     name: "cyberboss_timeline_write",
-    description: "Write timeline events through timeline-for-agent. Inspect the current day and taxonomy first when category ids, event nodes, or existing events are uncertain.",
+    description: "Low-level timeline write through timeline-for-agent. For conversational activity maintenance, prefer cyberboss_timeline_capture followed by cyberboss_timeline_reconcile so incomplete evidence stays pending and corrections are verified without merge widening.",
     shortHint: "Write timeline events after checking the current day and taxonomy when needed.",
     topics: ["timeline"],
     inputSchema: {

@@ -20,7 +20,7 @@ test("timeline integration does not write child output to process stdio", async 
     process.nextTick(() => {
       child.stdout.emit("data", Buffer.from("timeline build ok\n", "utf8"));
       child.stderr.emit("data", Buffer.from("warning line\n", "utf8"));
-      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
     });
     return child;
   };
@@ -54,6 +54,39 @@ test("timeline integration does not write child output to process stdio", async 
   }
 });
 
+test("timeline integration waits for piped output to drain after process exit", async () => {
+  const integrationPath = path.resolve(__dirname, "../src/integrations/timeline/index.js");
+  const childProcess = require("node:child_process");
+  const originalSpawn = childProcess.spawn;
+  const originalModule = require.cache[integrationPath];
+
+  childProcess.spawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.emit("exit", 0, null);
+      child.stdout.emit("data", Buffer.from('{"exists":false,"events":[]}\n', "utf8"));
+      child.emit("close", 0, null);
+    });
+    return child;
+  };
+
+  delete require.cache[integrationPath];
+  try {
+    const { createTimelineIntegration } = require(integrationPath);
+    const integration = createTimelineIntegration({ stateDir: "/tmp/cyberboss-state" });
+    const result = await integration.runSubcommand("read", ["--date", "2026-08-05"]);
+    assert.match(result.stdout, /"exists":false/);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[integrationPath];
+    if (originalModule) {
+      require.cache[integrationPath] = originalModule;
+    }
+  }
+});
+
 test("timeline write sends JSON through stdin instead of argv", async () => {
   const integrationPath = path.resolve(__dirname, "../src/integrations/timeline/index.js");
   const childProcess = require("node:child_process");
@@ -79,7 +112,7 @@ test("timeline write sends JSON through stdin instead of argv", async () => {
         "events: 1",
         "status: draft",
       ].join("\n"), "utf8"));
-      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
     });
     return child;
   };

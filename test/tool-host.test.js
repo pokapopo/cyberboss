@@ -163,6 +163,21 @@ function createHost() {
         },
       },
       timeline: {
+        capture(args) {
+          return {
+            capturedCount: args.observations.length,
+            observations: args.observations.map((item, index) => ({ id: `obs-${index + 1}`, ...item })),
+          };
+        },
+        async reconcile(args) {
+          return {
+            date: args.date,
+            applied: Array.isArray(args.events) && args.events.length > 0,
+            writtenEventCount: args.events?.length || 0,
+            droppedEventCount: args.dropEventIds?.length || 0,
+            pendingObservations: [{ id: "obs-1" }],
+          };
+        },
         async read(args) {
           return {
             data: {
@@ -285,6 +300,24 @@ test("tool host exposes structured timeline read tools", async () => {
   assert.equal(proposalsResult.text, "Timeline proposals loaded: 1.");
 });
 
+test("tool host captures incomplete observations and reconciles through the authoritative path", async () => {
+  const host = createHost();
+  const captured = await host.invokeTool("cyberboss_timeline_capture", {
+    observations: [{
+      text: "刚开始写代码",
+      timePrecision: "unknown",
+      status: "ongoing",
+    }],
+  }, {});
+  const inspected = await host.invokeTool("cyberboss_timeline_reconcile", {
+    date: "2026-08-05",
+  }, {});
+
+  assert.match(captured.text, /captured: 1/i);
+  assert.equal(captured.data.observations[0].id, "obs-1");
+  assert.match(inspected.text, /1 pending observations/);
+});
+
 test("tool host validates structured reminder input types", async () => {
   const host = createHost();
   await assert.rejects(async () => {
@@ -399,10 +432,16 @@ test("timeline screenshot delivery failure returns a model-facing friendly resul
 test("tool host descriptions include schema summary for models that only surface descriptions", () => {
   const host = createHost();
   const timelineWrite = host.listTools().find((tool) => tool.name === "cyberboss_timeline_write");
+  const timelineCapture = host.listTools().find((tool) => tool.name === "cyberboss_timeline_capture");
+  const timelineReconcile = host.listTools().find((tool) => tool.name === "cyberboss_timeline_reconcile");
   const diaryAppend = host.listTools().find((tool) => tool.name === "cyberboss_diary_append");
   assert.match(timelineWrite.description, /Input:/);
   assert.match(timelineWrite.description, /date: string/);
   assert.match(timelineWrite.description, /events: \{/);
+  assert.match(timelineWrite.description, /prefer cyberboss_timeline_capture/);
+  assert.match(timelineCapture.description, /does not write a guessed final timeline event/);
+  assert.match(timelineReconcile.description, /authoritative conversational timeline maintenance path/);
+  assert.match(timelineReconcile.description, /observationIds/);
   assert.match(diaryAppend.description, /raw timestamped fragment/i);
   assert.match(diaryAppend.description, /at most four natural time-period sections/i);
   assert.match(diaryAppend.description, /exact standalone `## CC 的想法` section/);

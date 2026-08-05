@@ -44,6 +44,9 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /tool description and this system prompt are authoritative/);
   assert.match(prepared.text, /preference-diary-writing\.md/);
   assert.match(prepared.text, /missing memory must never block diary finalization/);
+  assert.match(prepared.text, /cyberboss_timeline_reconcile/);
+  assert.match(prepared.text, /leave unknown\/ongoing observations pending/);
+  assert.match(prepared.text, /finalize=true/);
 });
 
 test("incremental diary prompt explicitly treats append entries as draft fragments", () => {
@@ -62,4 +65,7 @@ test("incremental diary prompt explicitly treats append entries as draft fragmen
   assert.match(prepared.text, /cyberboss_diary_append/);
   assert.match(prepared.text, /timestamped draft fragments/);
   assert.match(prepared.text, /do not try to\s+turn each fragment into a complete formatted diary/);
+  assert.match(prepared.text, /cyberboss_timeline_capture first/);
+  assert.match(prepared.text, /cyberboss_timeline_reconcile/);
+  assert.match(prepared.text, /Leave unknown-time or ongoing observations pending/);
 });

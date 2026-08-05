@@ -3,14 +3,14 @@ const assert = require("node:assert/strict");
 
 const { TimelineService } = require("../src/services/timeline-service");
 
-function createService() {
+function createService(options = {}) {
   const calls = [];
   const service = new TimelineService({
     config: {
       stateDir: "/tmp/cyberboss-state",
       timelineScreenshotQueueFile: "/tmp/cyberboss-timeline-service-test.json",
     },
-    timelineIntegration: {
+    timelineIntegration: options.timelineIntegration || {
       async runSubcommand(subcommand, args) {
         calls.push({ subcommand, args });
         if (subcommand === "read") {
@@ -51,6 +51,7 @@ function createService() {
         return {};
       },
     },
+    observationStore: options.observationStore,
     sessionStore: {
       listBindings() {
         return [];
@@ -147,6 +148,148 @@ test("timeline service rejects mixed structured and raw event sources", async ()
       eventsJson: "{\"events\":[]}",
     });
   }, /Use only one of events, eventsJson, or eventsFile/);
+});
+
+test("timeline capture preserves evidence without writing the timeline", () => {
+  const capturedCalls = [];
+  const { service, calls } = createService({
+    observationStore: {
+      capture(observations, context) {
+        capturedCalls.push({ observations, context });
+        return [{ id: "obs-1", ...observations[0], sourceMessageIds: context.sourceMessageIds }];
+      },
+    },
+  });
+  const result = service.capture({
+    observations: [{ text: "刚开始写代码", status: "ongoing", timePrecision: "unknown" }],
+    sourceMessageIds: ["msg-1"],
+    threadId: "thread-1",
+  });
+
+  assert.equal(result.capturedCount, 1);
+  assert.deepEqual(capturedCalls[0].context, {
+    sourceMessageIds: ["msg-1"],
+    threadId: "thread-1",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("timeline reconcile inspects evidence then safely replaces and verifies the complete day", async () => {
+  const calls = [];
+  let dayEvents = [{
+    id: "existing-1",
+    startAt: "2026-08-05T01:00:00.000Z",
+    endAt: "2026-08-05T02:00:00.000Z",
+    title: "已有事件",
+    categoryId: "work",
+    subcategoryId: "work.coding",
+    eventNodeId: "",
+    note: "",
+    tags: [],
+  }];
+  let pending = [{
+    id: "obs-1",
+    date: "2026-08-05",
+    text: "两点开始整理代码，三点结束",
+    startAt: "2026-08-05T06:00:00.000Z",
+    endAt: "2026-08-05T07:00:00.000Z",
+    timePrecision: "exact",
+    status: "completed",
+    sourceMessageIds: ["msg-1"],
+  }];
+  const observationStore = {
+    capture() { return []; },
+    listPending() { return pending; },
+    resolve(ids) {
+      const resolved = pending.filter((item) => ids.includes(item.id));
+      pending = pending.filter((item) => !ids.includes(item.id));
+      return resolved;
+    },
+  };
+  const integration = {
+    async runSubcommand(subcommand, args) {
+      calls.push({ subcommand, args });
+      if (subcommand === "read") {
+        return { stdout: JSON.stringify({
+          date: "2026-08-05",
+          exists: true,
+          status: "draft",
+          eventCount: dayEvents.length,
+          events: dayEvents,
+        }) };
+      }
+      if (subcommand === "categories") {
+        return { stdout: JSON.stringify({ categoryCount: 1, categories: [{ id: "work" }] }) };
+      }
+      if (subcommand === "proposals") {
+        return { stdout: JSON.stringify({ date: "2026-08-05", proposalCount: 0, proposals: [] }) };
+      }
+      if (subcommand === "write") {
+        const payload = JSON.parse(args[args.indexOf("--events-json") + 1]);
+        dayEvents = payload.events;
+        return { stdout: "timeline written" };
+      }
+      throw new Error(`unexpected subcommand ${subcommand}`);
+    },
+  };
+  const { service } = createService({ timelineIntegration: integration, observationStore });
+
+  const inspected = await service.reconcile({ date: "2026-08-05" });
+  assert.equal(inspected.applied, false);
+  assert.equal(inspected.pendingObservations.length, 1);
+
+  const applied = await service.reconcile({
+    date: "2026-08-05",
+    events: [{
+      observationIds: ["obs-1"],
+      startAt: "2026-08-05T06:00:00.000Z",
+      endAt: "2026-08-05T07:00:00.000Z",
+      timePrecision: "exact",
+      title: "整理代码",
+      categoryId: "work",
+      subcategoryId: "work.coding",
+    }],
+    resolvedObservationIds: ["obs-1"],
+  });
+
+  assert.equal(applied.applied, true);
+  assert.equal(applied.day.eventCount, 2);
+  assert.equal(applied.pendingObservations.length, 0);
+  const writeCall = calls.find((call) => call.subcommand === "write");
+  assert.deepEqual(writeCall.args.slice(0, 4), ["--date", "2026-08-05", "--mode", "replace"]);
+  const writtenPayload = JSON.parse(writeCall.args[writeCall.args.indexOf("--events-json") + 1]);
+  assert.equal(writtenPayload.events[0].id, "existing-1");
+  assert.equal(writtenPayload.events[1].confidence, 0.95);
+  assert.deepEqual(writtenPayload.events[1].sourceMessageIds, ["msg-1"]);
+});
+
+test("timeline reconcile refuses observations without defensible time evidence", async () => {
+  const observationStore = {
+    listPending() {
+      return [{
+        id: "obs-unknown",
+        date: "2026-08-05",
+        text: "做了点事情",
+        timePrecision: "unknown",
+        status: "completed",
+        sourceMessageIds: [],
+      }];
+    },
+    resolve() { return []; },
+  };
+  const { service } = createService({ observationStore });
+  await assert.rejects(() => service.reconcile({
+    date: "2026-08-05",
+    events: [{
+      observationIds: ["obs-unknown"],
+      startAt: "2026-08-05T06:00:00.000Z",
+      endAt: "2026-08-05T07:00:00.000Z",
+      timePrecision: "approximate",
+      title: "猜测事件",
+      categoryId: "work",
+      subcategoryId: "work.coding",
+    }],
+  }), /must remain pending/);
 });
 
 test("timeline service serializes structured screenshot options", async () => {

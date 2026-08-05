@@ -49,6 +49,7 @@ function readConfig() {
     memoryExtractionEveryTurns: readIntEnv("CYBERBOSS_MEMORY_EXTRACTION_EVERY_TURNS") || 10,
     memoryTimeoutMs: readIntEnv("CYBERBOSS_MEMORY_TIMEOUT_MS") || 15_000,
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
+    timelineObservationFile: path.join(stateDir, "timeline-observations.json"),
     timelineScreenshotQueueFile: path.join(stateDir, "timeline-screenshot-queue.json"),
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
     weixinInstructionsFile: path.join(stateDir, "weixin-instructions.md"),

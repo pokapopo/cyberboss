@@ -97,7 +97,9 @@ function runTimelineCommand(binPath, args, extraEnv = {}, options = {}) {
       child.stdin.once("error", finishReject);
       child.stdin.end(stdinBody);
     }
-    child.once("exit", (code, signal) => {
+    // `exit` can fire before piped stdout/stderr are fully drained. Waiting for
+    // `close` keeps fast JSON commands (especially an empty-day read) reliable.
+    child.once("close", (code, signal) => {
       if (signal) {
         finishReject(new Error(`timeline process was interrupted by signal: ${signal}`));
         return;

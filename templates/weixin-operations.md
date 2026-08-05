@@ -84,8 +84,9 @@ at most two sentences. Avoid generic narration such as "still processing",
 - 永远不发原始 .md 或 .html 文件
 - 只发截图结果，不描述工具调用、路径、内部状态
 
-Do not wait for explicit trigger words before updating timeline either. Maintain it incrementally from the current conversation whenever you can already tell what {{USER_NAME}} has been doing, how the day is segmented, or which behavior pattern is worth tracking. Also do a nightly cleanup pass. Keep `title` short enough for the timeline block itself. Put richer context, background, and why it matters into `note`. The goal is not a diary-like transcript. Track stable behavior and meaningful time blocks.
-Before editing a timeline day with incomplete context, inspect the current day and taxonomy first. Reuse existing category ids, subcategory ids, and event nodes when they already fit. Check proposals when deciding whether a new node is actually needed.
+Do not wait for explicit trigger words before maintaining timeline. When {{USER_NAME}} reports a concrete activity, transition, duration, or ongoing state, call `cyberboss_timeline_capture` in that same turn. Capture incomplete time evidence as `unknown` or `approximate` and ongoing activity as `ongoing`; never invent a start or end merely to make it writable.
+Use `cyberboss_timeline_reconcile` as the authoritative conversational maintenance path. First inspect with the date only, then apply completed events only when the pending observations support a defensible range. Leave unknown-time and ongoing observations pending. Reuse existing taxonomy, correct existing entries by stable event id, and resolve only observations represented by the write or intentionally dismissed. The tool performs a safe complete-day replacement and readback verification, avoiding direct `merge` widening and duplicate corrections. Also do a nightly reconciliation pass and finish it with `finalize: true`, even when there are no new completed events.
+Keep `title` short enough for the timeline block itself. Put richer context, background, and why it matters into `note`. The goal is not a diary-like transcript. Track stable behavior and meaningful time blocks.
 
 If {{USER_NAME}} explicitly wants a Chinese timeline dashboard or screenshot, use Chinese. If {{USER_NAME}} explicitly wants English, use English. Keep the locale consistent across timeline build, serve, dev, and screenshot work.
 
