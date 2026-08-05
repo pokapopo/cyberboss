@@ -1,7 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { parseEntries, renderPage } = require("../scripts/diary-view");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const { parseEntries, renderPage, writeDiaryView } = require("../scripts/diary-view");
 
 test("timestamp diary fragments are retained and grouped into at most four periods", () => {
   const entries = parseEntries([
@@ -58,4 +62,22 @@ test("natural finalized headings render and overflow is merged without dropping 
   assert.match(html, /CC 的想法/);
   assert.match(html, /第五段。/);
   assert.doesNotMatch(html, /— with uu<\/p>/);
+});
+
+test("writeDiaryView renders a configured diary directory without using user storage", () => {
+  const diaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-diary-view-"));
+  const date = "2026-08-05";
+  fs.writeFileSync(path.join(diaryDir, `${date}.md`), [
+    "## 晚上",
+    "",
+    "今天的正文已经足够长了。",
+    "",
+    "## CC 的想法",
+    "",
+    "我的反思也足够具体。",
+  ].join("\n"), "utf8");
+
+  const result = writeDiaryView({ date, diaryDir });
+  assert.equal(result.htmlPath, path.join(diaryDir, `view-${date}.html`));
+  assert.match(fs.readFileSync(result.htmlPath, "utf8"), /CC 的想法/);
 });

@@ -35,6 +35,10 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /at most four `## <natural colloquial period title>` sections/);
   assert.match(prepared.text, /Remove timestamp headings/);
   assert.match(prepared.text, /renderer supplies the date/);
+  assert.match(prepared.text, /Call cyberboss_diary_finalize with the COMPLETE final Markdown/);
+  assert.match(prepared.text, /Call cyberboss_channel_send_file exactly once/);
+  assert.match(prepared.text, /Network delivery is deliberately separate/);
+  assert.match(prepared.text, /Do not edit the final diary file directly/);
 });
 
 test("incremental diary prompt explicitly treats append entries as draft fragments", () => {

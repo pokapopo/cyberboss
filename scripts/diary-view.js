@@ -14,19 +14,16 @@ function main() {
   const date = dateArg || today();
   const target = resolveDate(date);
 
-  const entries = readDiaryEntries(target);
-  const html = renderPage(target, entries);
-  const outPath = path.join(DIARY_DIR, `view-${target}.html`);
-  fs.writeFileSync(outPath, html, "utf8");
-  console.log(outPath);
+  const { htmlPath } = writeDiaryView({ date: target });
+  console.log(htmlPath);
 
   if (openFlag) {
     const { exec } = require("child_process");
     const cmd = process.platform === "win32"
-      ? `start "" "${outPath}"`
+      ? `start "" "${htmlPath}"`
       : process.platform === "darwin"
-        ? `open "${outPath}"`
-        : `xdg-open "${outPath}"`;
+        ? `open "${htmlPath}"`
+        : `xdg-open "${htmlPath}"`;
     exec(cmd);
   }
 }
@@ -47,13 +44,22 @@ function resolveDate(input) {
   return today();
 }
 
-function readDiaryEntries(date) {
-  const filePath = path.join(DIARY_DIR, `${date}.md`);
+function readDiaryEntries(date, diaryDir = DIARY_DIR) {
+  const filePath = path.join(diaryDir, `${date}.md`);
   if (!fs.existsSync(filePath)) {
     return [];
   }
   const raw = fs.readFileSync(filePath, "utf8");
   return parseEntries(raw);
+}
+
+function writeDiaryView({ date, diaryDir = DIARY_DIR }) {
+  const entries = readDiaryEntries(date, diaryDir);
+  const html = renderPage(date, entries);
+  const htmlPath = path.join(diaryDir, `view-${date}.html`);
+  fs.mkdirSync(diaryDir, { recursive: true });
+  fs.writeFileSync(htmlPath, html, "utf8");
+  return { date, htmlPath, entries };
 }
 
 function parseEntries(raw) {
@@ -331,4 +337,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { parseEntries, renderPage };
+module.exports = { parseEntries, readDiaryEntries, renderPage, writeDiaryView };

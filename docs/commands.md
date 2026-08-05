@@ -75,6 +75,7 @@ Those capabilities are exposed as project-native structured tools:
 
 - `cyberboss_channel_send_file`
 - `cyberboss_diary_append`
+- `cyberboss_diary_finalize`
 - `cyberboss_reminder_create`
 - `cyberboss_system_send`
 - `cyberboss_timeline_write`

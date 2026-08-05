@@ -10,17 +10,22 @@ const DIARY_DIR = path.join(os.homedir(), ".cyberboss", "diary");
 
 async function main() {
   const date = process.argv[2] || today();
-  const htmlPath = path.join(DIARY_DIR, `view-${date}.html`);
+  const outputPath = await captureDiaryScreenshot({ date });
+  console.log(outputPath);
+}
+
+async function captureDiaryScreenshot({ date, diaryDir = DIARY_DIR, chromiumApi = chromium }) {
+  const htmlPath = path.join(diaryDir, `view-${date}.html`);
 
   if (!fs.existsSync(htmlPath)) {
     console.error("HTML not found:", htmlPath);
-    process.exit(1);
+    throw new Error(`Diary HTML not found: ${htmlPath}`);
   }
 
-  const outputPath = path.join(DIARY_DIR, `shot-${date}.png`);
+  const outputPath = path.join(diaryDir, `shot-${date}.png`);
   const url = `file:///${htmlPath.replace(/\\/g, "/")}`;
 
-  const browser = await chromium.launch({
+  const browser = await chromiumApi.launch({
     headless: true,
     channel: "chromium",
   });
@@ -44,19 +49,23 @@ async function main() {
     await browser.close().catch(() => {});
   }
 
-  console.log(outputPath);
+  return outputPath;
 }
 
 function today() {
-  const d = new Date();
-  return [
-    d.getFullYear(),
-    String(d.getMonth() + 1).padStart(2, "0"),
-    String(d.getDate()).padStart(2, "0"),
-  ].join("-");
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = { captureDiaryScreenshot };

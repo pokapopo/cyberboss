@@ -447,6 +447,7 @@ ${HOME}/.cyberboss
 
 - `cyberboss_reminder_create`
 - `cyberboss_diary_append`
+- `cyberboss_diary_finalize`
 - `cyberboss_timeline_write`
 - `cyberboss_timeline_build`
 - `cyberboss_timeline_serve`

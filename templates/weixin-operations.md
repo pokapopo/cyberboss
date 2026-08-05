@@ -84,7 +84,8 @@ at most two sentences. Avoid generic narration such as "still processing",
 - 她纠正过的错误不再犯。
 
 ### 发送方式
-- 永远走完整流程：`diary-view.js <日期>` 生成 HTML → `diary-screenshot.js <日期>` 截图 PNG → channel_send_file 发给她
+- 完整日记只走 `cyberboss_diary_finalize`：工具校验结构、原子保存、生成 HTML 和本地 PNG，不手动改最终文件，不手动跑渲染脚本
+- 拿到 `screenshotPath` 后再单独调 `cyberboss_channel_send_file` 发给她。本地收尾与微信网络投递是两个独立状态；发送失败不重做收尾、不重新渲染
 - 永远不发原始 .md 或 .html 文件
 - 只发截图结果，不描述工具调用、路径、内部状态
 

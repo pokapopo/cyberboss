@@ -305,6 +305,28 @@ const PROJECT_TOOLS = [
     },
   },
   {
+    name: "cyberboss_diary_finalize",
+    description: "Validate and finalize one complete diary locally. Supply the entire final Markdown body with one to four natural `## <period title>` sections followed by exactly one substantive final `## CC 的想法` section. Timestamp headings, date headers, signatures, empty sections, extra headings, and the `不是…而是…` template pattern are rejected before any write. On success this tool atomically replaces the diary Markdown, renders HTML, and captures a local PNG. It does not send any network request or WeChat file. After success, call `cyberboss_channel_send_file` once with the returned `screenshotPath`; if delivery fails, do not rerun finalization automatically.",
+    shortHint: "Validate, atomically save, render, and locally screenshot the final diary without sending it.",
+    topics: ["diary"],
+    inputSchema: {
+      type: "object",
+      required: ["markdown"],
+      properties: {
+        markdown: { type: "string", description: "Complete final Markdown body only. Omit date header and signature because the renderer supplies both." },
+        date: { type: "string", description: "Optional diary date in YYYY-MM-DD; defaults to today in Asia/Shanghai." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.diary.finalize(args);
+      return {
+        text: `Diary finalized locally: ${result.screenshotPath}. This tool did not send it. Next call cyberboss_channel_send_file once with that screenshotPath.`,
+        data: result,
+      };
+    },
+  },
+  {
     name: "cyberboss_reminder_create",
     description: "Create a reminder in Cyberboss.",
     shortHint: "Create a reminder with direct text plus delayMinutes or dueAt.",

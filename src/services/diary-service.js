@@ -2,10 +2,14 @@ const fs = require("fs");
 const path = require("path");
 
 const { resolveBodyInput } = require("./text-input");
+const { writeDiaryView } = require("../../scripts/diary-view");
+const { captureDiaryScreenshot } = require("../../scripts/diary-screenshot");
 
 class DiaryService {
-  constructor({ config }) {
+  constructor({ config, renderDiary = writeDiaryView, screenshotDiary = captureDiaryScreenshot }) {
     this.config = config;
+    this.renderDiary = renderDiary;
+    this.screenshotDiary = screenshotDiary;
   }
 
   async append({ text = "", textFile = "", title = "", date = "", time = "" } = {}) {
@@ -33,6 +37,126 @@ class DiaryService {
       time: timeString,
       body,
     };
+  }
+
+  async finalize({ markdown = "", date = "" } = {}) {
+    const finalMarkdown = validateFinalDiaryMarkdown(markdown);
+    const dateString = normalizeDiaryDate(date) || formatDate(new Date());
+    const filePath = path.join(this.config.diaryDir, `${dateString}.md`);
+
+    writeTextFileAtomicSync(filePath, finalMarkdown);
+    const rendered = await this.renderDiary({
+      date: dateString,
+      diaryDir: this.config.diaryDir,
+    });
+    const screenshotPath = await this.screenshotDiary({
+      date: dateString,
+      diaryDir: this.config.diaryDir,
+    });
+    return {
+      date: dateString,
+      filePath,
+      htmlPath: rendered.htmlPath,
+      screenshotPath,
+      delivery: null,
+    };
+  }
+}
+
+function validateFinalDiaryMarkdown(value) {
+  const markdown = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (!markdown) {
+    throw new Error("Diary finalization rejected: final Markdown cannot be empty.");
+  }
+  if (/^[—-]\s*with uu\s*$/im.test(markdown)) {
+    throw new Error("Diary finalization rejected: omit the signature; the renderer supplies it.");
+  }
+  if (/^#(?:\s|$)/m.test(markdown)) {
+    throw new Error("Diary finalization rejected: omit the date header; the renderer supplies it.");
+  }
+  if (/^#{3,6}\s+/m.test(markdown)) {
+    throw new Error("Diary finalization rejected: only H2 period headings and `## CC 的想法` are allowed.");
+  }
+  if (/不是[^\n]{0,100}(?:而是|，是|,是)/.test(markdown)) {
+    throw new Error("Diary finalization rejected: remove the forbidden `不是…而是…` template pattern.");
+  }
+
+  const lines = markdown.split("\n");
+  const sections = [];
+  let current = null;
+  for (const line of lines) {
+    const heading = line.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      if (current) sections.push(current);
+      current = { title: heading[1].trim(), body: [] };
+      continue;
+    }
+    if (!current && line.trim()) {
+      throw new Error("Diary finalization rejected: content must begin with an H2 natural period heading.");
+    }
+    if (current) current.body.push(line);
+  }
+  if (current) sections.push(current);
+
+  const reflections = sections.filter((section) => section.title === "CC 的想法");
+  if (reflections.length !== 1) {
+    throw new Error("Diary finalization rejected: include exactly one `## CC 的想法` section.");
+  }
+  if (sections.at(-1)?.title !== "CC 的想法") {
+    throw new Error("Diary finalization rejected: `## CC 的想法` must be the final section.");
+  }
+
+  const periods = sections.filter((section) => section.title !== "CC 的想法");
+  if (periods.length < 1 || periods.length > 4) {
+    throw new Error("Diary finalization rejected: use one to four natural time-period sections.");
+  }
+  for (const section of periods) {
+    if (/^\d{1,2}:\d{2}(?:\s|$)/.test(section.title)) {
+      throw new Error("Diary finalization rejected: remove timestamp headings and use natural period titles.");
+    }
+  }
+  for (const section of sections) {
+    const plainBody = section.body.join("\n").replace(/[*_`>#\s-]/g, "");
+    if (plainBody.length < 8) {
+      throw new Error(`Diary finalization rejected: section \`${section.title}\` needs substantive content.`);
+    }
+  }
+  return `${markdown}\n`;
+}
+
+function normalizeDiaryDate(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw new Error("Diary date must use YYYY-MM-DD.");
+  }
+  const parsed = new Date(`${normalized}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== normalized) {
+    throw new Error("Diary date is invalid.");
+  }
+  return normalized;
+}
+
+function writeTextFileAtomicSync(filePath, body, { mode = 0o600 } = {}) {
+  const parentDir = path.dirname(filePath);
+  fs.mkdirSync(parentDir, { recursive: true });
+  const tempPath = path.join(
+    parentDir,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  let fd;
+  try {
+    fd = fs.openSync(tempPath, "wx", mode);
+    fs.writeFileSync(fd, body, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    try { fs.unlinkSync(tempPath); } catch {}
   }
 }
 
@@ -64,4 +188,5 @@ module.exports = {
   buildDiaryEntry,
   formatDate,
   formatTime,
+  validateFinalDiaryMarkdown,
 };

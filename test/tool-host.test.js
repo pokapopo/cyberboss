@@ -63,6 +63,15 @@ function createHost() {
         async append(args) {
           return { filePath: "/tmp/diary.md", ...args };
         },
+        async finalize(args) {
+          return {
+            date: args.date,
+            filePath: "/tmp/diary.md",
+            htmlPath: "/tmp/diary.html",
+            screenshotPath: "/tmp/diary.png",
+            delivery: null,
+          };
+        },
       },
       reminder: {
         async create(args) {
@@ -397,6 +406,28 @@ test("tool host descriptions include schema summary for models that only surface
   assert.match(diaryAppend.description, /at most four natural time-period sections/i);
   assert.match(diaryAppend.description, /exact standalone `## CC 的想法` section/);
   assert.match(diaryAppend.description, /Do not depend on recalled memory/);
+  const diaryFinalize = host.listTools().find((tool) => tool.name === "cyberboss_diary_finalize");
+  assert.match(diaryFinalize.description, /validate/i);
+  assert.match(diaryFinalize.description, /does not send/i);
+  assert.match(diaryFinalize.description, /cyberboss_channel_send_file/);
+});
+
+test("diary finalize returns a local screenshot and never invokes channel delivery", async () => {
+  const host = createHost();
+  let sends = 0;
+  host.services.channelFile.sendToCurrentChat = async () => {
+    sends += 1;
+  };
+
+  const result = await host.invokeTool("cyberboss_diary_finalize", {
+    date: "2026-08-05",
+    markdown: "## 晚上\n\n今天的正文。\n\n## CC 的想法\n\n今天的反思已经足够具体。",
+  });
+
+  assert.equal(result.data.screenshotPath, "/tmp/diary.png");
+  assert.equal(result.data.delivery, null);
+  assert.equal(sends, 0);
+  assert.match(result.text, /cyberboss_channel_send_file/);
 });
 
 test("tool host exposes agent-visible work-log and verified experience tools", async () => {
