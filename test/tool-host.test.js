@@ -389,9 +389,14 @@ test("timeline screenshot delivery failure returns a model-facing friendly resul
 test("tool host descriptions include schema summary for models that only surface descriptions", () => {
   const host = createHost();
   const timelineWrite = host.listTools().find((tool) => tool.name === "cyberboss_timeline_write");
+  const diaryAppend = host.listTools().find((tool) => tool.name === "cyberboss_diary_append");
   assert.match(timelineWrite.description, /Input:/);
   assert.match(timelineWrite.description, /date: string/);
   assert.match(timelineWrite.description, /events: \{/);
+  assert.match(diaryAppend.description, /raw timestamped fragment/i);
+  assert.match(diaryAppend.description, /at most four natural time-period sections/i);
+  assert.match(diaryAppend.description, /exact standalone `## CC 的想法` section/);
+  assert.match(diaryAppend.description, /Do not depend on recalled memory/);
 });
 
 test("tool host exposes agent-visible work-log and verified experience tools", async () => {

@@ -32,12 +32,12 @@ function main() {
 }
 
 function today() {
-  const d = new Date();
-  return [
-    d.getFullYear(),
-    String(d.getMonth() + 1).padStart(2, "0"),
-    String(d.getDate()).padStart(2, "0"),
-  ].join("-");
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 function resolveDate(input) {
@@ -57,27 +57,94 @@ function readDiaryEntries(date) {
 }
 
 function parseEntries(raw) {
-  const entries = [];
+  const rawEntries = [];
   const lines = raw.split("\n");
   let current = null;
 
   for (const line of lines) {
-    const h2 = line.match(/^##\s+(\d{1,2}:\d{2})(?:\s+(.+))?/);
+    const h2 = line.match(/^##\s+(.+?)\s*$/);
     if (h2) {
       if (current) {
-        entries.push(current);
+        rawEntries.push(current);
       }
-      current = { time: h2[1], title: h2[2] || "", body: [] };
+      const heading = h2[1].trim();
+      const timed = heading.match(/^(\d{1,2}:\d{2})(?:\s+(.+))?$/);
+      const title = timed ? String(timed[2] || "").trim() : heading;
+      current = {
+        time: timed ? timed[1] : "",
+        title,
+        body: [],
+        isReflection: title === "CC 的想法",
+      };
       continue;
     }
-    if (current && line.trim()) {
-      current.body.push(line.trim());
+    const bodyLine = line.trim();
+    if (current && bodyLine && !/^[—-]\s*with uu$/i.test(bodyLine)) {
+      current.body.push(bodyLine);
     }
   }
   if (current) {
-    entries.push(current);
+    rawEntries.push(current);
   }
-  return entries;
+  return consolidateEntries(rawEntries);
+}
+
+function consolidateEntries(rawEntries) {
+  const reflections = rawEntries.filter((entry) => entry.isReflection);
+  const content = rawEntries.filter((entry) => !entry.isReflection);
+  const periods = content.length > 0 && content.every((entry) => entry.time)
+    ? groupTimestampFragments(content)
+    : limitNaturalPeriods(content);
+
+  if (reflections.length === 0) {
+    return periods;
+  }
+  return [...periods, {
+    time: "",
+    title: "CC 的想法",
+    body: reflections.flatMap((entry) => entry.body),
+    isReflection: true,
+  }];
+}
+
+function groupTimestampFragments(entries) {
+  const definitions = [
+    { title: "凌晨", from: 0, to: 6 },
+    { title: "上午", from: 6, to: 12 },
+    { title: "下午", from: 12, to: 18 },
+    { title: "晚上", from: 18, to: 24 },
+  ];
+  return definitions.flatMap((definition) => {
+    const fragments = entries.filter((entry) => {
+      const hour = Number.parseInt(entry.time.split(":")[0], 10);
+      return hour >= definition.from && hour < definition.to;
+    });
+    if (fragments.length === 0) {
+      return [];
+    }
+    const firstTime = fragments[0].time;
+    const lastTime = fragments[fragments.length - 1].time;
+    return [{
+      time: firstTime === lastTime ? firstTime : `${firstTime}–${lastTime}`,
+      title: fragments.length === 1 && fragments[0].title
+        ? fragments[0].title
+        : definition.title,
+      body: fragments.flatMap((entry) => entry.body),
+      isReflection: false,
+    }];
+  });
+}
+
+function limitNaturalPeriods(entries) {
+  if (entries.length <= 4) {
+    return entries;
+  }
+  const firstThree = entries.slice(0, 3);
+  const remainder = entries.slice(3);
+  return [...firstThree, {
+    ...remainder[0],
+    body: remainder.flatMap((entry) => entry.body),
+  }];
 }
 
 function renderPage(date, entries) {
@@ -227,10 +294,10 @@ ${entries.length ? items : '<div class="empty">这天还没有日记 · No entri
 
 function renderEntry(entry) {
   const body = entry.body.map((p) => `    <p>${esc(p)}</p>`).join("\n");
+  const time = entry.time ? `      <span class="entry-time">${esc(entry.time)}</span>\n` : "";
   return `  <div class="entry">
     <div class="entry-header">
-      <span class="entry-time">${esc(entry.time)}</span>
-      <span class="entry-title">${esc(entry.title)}</span>
+${time}      <span class="entry-title">${esc(entry.title)}</span>
     </div>
     <div class="entry-body">
 ${body}
@@ -260,4 +327,8 @@ function esc(text) {
     .replace(/"/g, "&quot;");
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { parseEntries, renderPage };

@@ -58,6 +58,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
 const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
 const MAX_RETRY_COUNT = 3;
+const SHANGHAI_UTC_OFFSET_MS = 8 * 60 * 60_000;
+const SHANGHAI_DIARY_FINALIZE_UTC_HOUR = 15;
 // Safety net: if a turn gate has been locked for >5 min, force-release it.
 // Normal turn timeout is 120s; 5 min gives ample margin for close() retries.
 const STUCK_GATE_MAX_AGE_MS = 300_000;
@@ -1221,12 +1223,7 @@ class CyberbossApp {
   _startDiarySummaryScheduler() {
     const schedule = () => {
       const now = new Date();
-      const target = new Date(now);
-      // 23:00 Asia/Shanghai
-      target.setHours(23, 0, 0, 0);
-      if (target <= now) {
-        target.setDate(target.getDate() + 1);
-      }
+      const target = resolveNextDiaryFinalizeAt(now);
       const delayMs = target.getTime() - now.getTime();
       console.log(`[cyberboss] diary summary scheduled at ${target.toISOString()} (in ${Math.round(delayMs / 60000)}m)`);
       setTimeout(async () => {
@@ -2141,6 +2138,30 @@ class CyberbossApp {
   }
 }
 
+function resolveNextDiaryFinalizeAt(now = new Date()) {
+  const current = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  if (Number.isNaN(current.getTime())) {
+    throw new Error("Cannot schedule diary finalize from an invalid date.");
+  }
+
+  // Asia/Shanghai is permanently UTC+8. Shift only to obtain its calendar day,
+  // then build 23:00 Shanghai as 15:00 UTC so the VPS timezone is irrelevant.
+  const shanghaiCalendar = new Date(current.getTime() + SHANGHAI_UTC_OFFSET_MS);
+  let targetMs = Date.UTC(
+    shanghaiCalendar.getUTCFullYear(),
+    shanghaiCalendar.getUTCMonth(),
+    shanghaiCalendar.getUTCDate(),
+    SHANGHAI_DIARY_FINALIZE_UTC_HOUR,
+    0,
+    0,
+    0,
+  );
+  if (targetMs <= current.getTime()) {
+    targetMs += 24 * 60 * 60_000;
+  }
+  return new Date(targetMs);
+}
+
 function buildRunKey(threadId, turnId) {
   return `${normalizeCommandArgument(threadId)}:${normalizeCommandArgument(turnId)}`;
 }
@@ -2317,7 +2338,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { CyberbossApp };
+module.exports = { CyberbossApp, resolveNextDiaryFinalizeAt };
 
 function parseChannelCommand(text) {
   const normalized = typeof text === "string" ? text.trim() : "";

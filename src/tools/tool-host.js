@@ -282,15 +282,15 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_diary_append",
-    description: "Append a diary entry into Cyberboss local diary storage.",
-    shortHint: "Append a diary entry with direct text content.",
+    description: "Append one raw timestamped fragment to today's Cyberboss diary. Use this during the day to accumulate factual material; the timestamp is draft metadata and multiple fragments are expected. At end-of-day, consolidate the complete file into at most four natural time-period sections using `## <colloquial period title>` headings, with continuous prose and no timestamp subheadings. Then add an exact standalone `## CC 的想法` section containing substantive first-person reflection. Write from CC to her, emphasize observations and feelings over schedule recap, include direct address, avoid reusable template language and the `不是…而是…` pattern, and verify uncertain facts before writing. The renderer supplies the bilingual date header and `— with uu` signature. Do not depend on recalled memory for this contract, and do not append a final reflection or signature as another raw fragment.",
+    shortHint: "Append a raw diary fragment; consolidate later into four natural periods plus CC's reflection.",
     topics: ["diary"],
     inputSchema: {
       type: "object",
       required: ["text"],
       properties: {
-        text: { type: "string", description: "Diary body to append." },
-        title: { type: "string", description: "Optional short entry title." },
+        text: { type: "string", description: "Factual raw diary fragment written from CC's perspective. Do not include a Markdown heading, final signature, or standalone final reflection." },
+        title: { type: "string", description: "Optional short draft label. The service still stores the fragment under its HH:mm timestamp; this label is not a final diary section title." },
         date: { type: "string", description: "Optional date in YYYY-MM-DD." },
         time: { type: "string", description: "Optional time in HH:mm." },
       },
