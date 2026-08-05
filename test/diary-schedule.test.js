@@ -41,6 +41,9 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /Do not edit the final diary file directly/);
   assert.match(prepared.text, /If finalize succeeds with warnings, treat them as reminders only/);
   assert.match(prepared.text, /Do not revise the\s+saved diary or call finalize again for warnings/);
+  assert.match(prepared.text, /tool description and this system prompt are authoritative/);
+  assert.match(prepared.text, /preference-diary-writing\.md/);
+  assert.match(prepared.text, /missing memory must never block diary finalization/);
 });
 
 test("incremental diary prompt explicitly treats append entries as draft fragments", () => {

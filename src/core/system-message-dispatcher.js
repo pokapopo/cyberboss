@@ -136,23 +136,18 @@ function buildCheckinPrompt(timeHeader, triggerText) {
 
 function buildDiaryFinalizePrompt(timeHeader, config = {}) {
   const memoryDir = normalizeText(config.memoryDir) || "~/.cyberboss/memory";
-  const requiredDiarySpecifications = [
-    "reference-diary-format.md",
-    "feedback-diary-send-screenshot.md",
-    "feedback-diary-detail-precision.md",
-    "feedback-verify-before-writing.md",
-    "feedback-diary-less-schedule.md",
-    "feedback-diary-no-templates.md",
-  ];
+  const diaryWritingPreference = `${memoryDir}/preference-diary-writing.md`;
   return [...timeHeader,
     "DIARY FINALIZE — end-of-day wrap-up.",
     "",
     "Your task. Do these in order:",
     "",
-    "1. Before writing, use Read to load the COMPLETE contents of every diary",
-    "   specification below. Do not rely on summaries, memory search snippets, or",
-    "   instructions retained from an earlier turn:",
-    ...requiredDiarySpecifications.map((file) => `   - ${memoryDir}/${file}`),
+    "1. The tool description and this system prompt are authoritative for current",
+    "   diary structure and operations. If available, use Read to load the COMPLETE",
+    "   supplemental writing preference below for uu's voice/content preferences:",
+    `   - ${diaryWritingPreference}`,
+    "   If that supplemental file is absent or unreadable, continue with this prompt;",
+    "   missing memory must never block diary finalization.",
     "2. Read ALL diary entries and notes written today. Gather everything together.",
     "3. Merge and polish them into a single cohesive diary entry for today. Write it",
     "   in the standard diary voice — warm, lyrical, writing to her not about her.",
@@ -176,8 +171,8 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     "8. After both screenshots have been sent, return silent. The day's diary work is complete.",
     "",
     "Do not edit the final diary file directly or manually run diary-view/diary-screenshot.",
-    "Do not render, send, or return silent until all specification reads are complete and",
-    "the final Markdown is ready for cyberboss_diary_finalize validation.",
+    "Do not render, send, or return silent until the final Markdown is ready for",
+    "cyberboss_diary_finalize validation.",
     "Do not send or return silent until cyberboss_diary_finalize accepts the Markdown.",
     "",
     "Return exactly one JSON object after any tool calls:",

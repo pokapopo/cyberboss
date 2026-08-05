@@ -52,14 +52,9 @@ at most two sentences. Avoid generic narration such as "still processing",
 - 不用等触发词。当天有值得留的事、一段有意思的对话片段，直接写。
 - 睡前做一次收尾。写完只给 {{USER_NAME}} 一句话，不要写成任务汇报。
 
-### 写前必读
-写日记前先加载这些记忆文件，不跳过：
-- `reference-diary-format.md` — 格式规范
-- `feedback-diary-send-screenshot.md` — 发送方式规范
-- `feedback-diary-detail-precision.md` — 事实精确要求
-- `feedback-verify-before-writing.md` — 不确定时先问
-- `feedback-diary-less-schedule.md` — 少写日程多写感受
-- `feedback-diary-no-templates.md` — 禁用模板句式
+### 写前参考
+- 当前格式、校验、渲染和发送流程以日记工具说明和系统提示为准，不从长期记忆恢复旧机制。
+- 需要补充 uu 的内容与文风偏好时，读 `preference-diary-writing.md`。该文件缺失或读取失败不得阻断日记。
 
 ### 格式规范
 - 笔记本风格：CSS 横线背景、暖纸色 (#faf6ee)、衬线字体 (Georgia / KaiTi / STKaiti)
