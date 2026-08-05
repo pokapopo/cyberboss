@@ -39,6 +39,8 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /Call cyberboss_channel_send_file exactly once/);
   assert.match(prepared.text, /Network delivery is deliberately separate/);
   assert.match(prepared.text, /Do not edit the final diary file directly/);
+  assert.match(prepared.text, /If finalize succeeds with warnings, treat them as reminders only/);
+  assert.match(prepared.text, /Do not revise the\s+saved diary or call finalize again for warnings/);
 });
 
 test("incremental diary prompt explicitly treats append entries as draft fragments", () => {

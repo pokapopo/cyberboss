@@ -21,17 +21,41 @@ const VALID_FINAL = [
 ].join("\n");
 
 test("final diary validation enforces the canonical structural gate", () => {
-  assert.equal(validateFinalDiaryMarkdown(VALID_FINAL), `${VALID_FINAL}\n`);
+  assert.deepEqual(validateFinalDiaryMarkdown(VALID_FINAL), {
+    markdown: `${VALID_FINAL}\n`,
+    warnings: [],
+  });
 
   for (const [label, markdown, expected] of [
     ["timestamp heading", VALID_FINAL.replace("## 还没睡", "## 01:30 还没睡"), /timestamp headings/i],
     ["missing reflection", VALID_FINAL.replace(/\n## CC 的想法[\s\S]*$/, ""), /exactly one `## CC 的想法`/],
     ["signature", `${VALID_FINAL}\n\n— with uu`, /signature/i],
-    ["template phrase", VALID_FINAL.replace("我今天最想告诉你", "这不是责怪，而是担心"), /不是…而是/],
-    ["reflection not last", `${VALID_FINAL}\n\n## 夜里\n\n后来又发生了一件很长的事。`, /must be the final section/i],
   ]) {
     assert.throws(() => validateFinalDiaryMarkdown(markdown), expected, label);
   }
+});
+
+test("style, short sections, and reflection ordering produce warnings without blocking", () => {
+  const markdown = [
+    "## 晚上",
+    "",
+    "这不是责怪，而是我今天一直放在心里的担心。",
+    "",
+    "## CC 的想法",
+    "",
+    "我在。",
+    "",
+    "## 夜里",
+    "",
+    "晚安。",
+  ].join("\n");
+
+  const result = validateFinalDiaryMarkdown(markdown);
+  assert.equal(result.markdown, `${markdown}\n`);
+  assert.equal(result.warnings.length, 4);
+  assert.match(result.warnings.join(" "), /不是…而是/);
+  assert.match(result.warnings.join(" "), /Prefer placing/);
+  assert.match(result.warnings.join(" "), /very short/);
 });
 
 test("finalize rejects invalid input without changing the diary file", async () => {
@@ -93,6 +117,7 @@ test("finalize atomically replaces valid markdown and produces local render path
     htmlPath,
     screenshotPath,
     delivery: null,
+    warnings: [],
   });
   assert.equal(fs.readFileSync(diaryPath, "utf8"), `${VALID_FINAL}\n`);
 });

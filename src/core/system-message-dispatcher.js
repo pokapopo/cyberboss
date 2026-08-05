@@ -167,6 +167,8 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     "5. Call cyberboss_diary_finalize with the COMPLETE final Markdown. This is the only",
     "   allowed final write/render path. If validation rejects it, revise the Markdown and",
     "   call finalize again. The tool saves atomically and returns a local screenshotPath.",
+    "   If finalize succeeds with warnings, treat them as reminders only. Do not revise the",
+    "   saved diary or call finalize again for warnings; continue with the returned PNG.",
     "6. Capture a timeline screenshot (day view, Chinese locale) and send it to the user.",
     "7. Call cyberboss_channel_send_file exactly once with the diary screenshotPath returned",
     "   by finalize. Network delivery is deliberately separate. A send failure must not",

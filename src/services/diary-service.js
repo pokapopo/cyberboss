@@ -40,11 +40,11 @@ class DiaryService {
   }
 
   async finalize({ markdown = "", date = "" } = {}) {
-    const finalMarkdown = validateFinalDiaryMarkdown(markdown);
+    const validation = validateFinalDiaryMarkdown(markdown);
     const dateString = normalizeDiaryDate(date) || formatDate(new Date());
     const filePath = path.join(this.config.diaryDir, `${dateString}.md`);
 
-    writeTextFileAtomicSync(filePath, finalMarkdown);
+    writeTextFileAtomicSync(filePath, validation.markdown);
     const rendered = await this.renderDiary({
       date: dateString,
       diaryDir: this.config.diaryDir,
@@ -59,12 +59,14 @@ class DiaryService {
       htmlPath: rendered.htmlPath,
       screenshotPath,
       delivery: null,
+      warnings: validation.warnings,
     };
   }
 }
 
 function validateFinalDiaryMarkdown(value) {
   const markdown = String(value || "").replace(/\r\n/g, "\n").trim();
+  const warnings = [];
   if (!markdown) {
     throw new Error("Diary finalization rejected: final Markdown cannot be empty.");
   }
@@ -78,7 +80,7 @@ function validateFinalDiaryMarkdown(value) {
     throw new Error("Diary finalization rejected: only H2 period headings and `## CC 的想法` are allowed.");
   }
   if (/不是[^\n]{0,100}(?:而是|，是|,是)/.test(markdown)) {
-    throw new Error("Diary finalization rejected: remove the forbidden `不是…而是…` template pattern.");
+    warnings.push("Avoid the reusable `不是…而是…` contrast pattern in future diary writing.");
   }
 
   const lines = markdown.split("\n");
@@ -103,7 +105,7 @@ function validateFinalDiaryMarkdown(value) {
     throw new Error("Diary finalization rejected: include exactly one `## CC 的想法` section.");
   }
   if (sections.at(-1)?.title !== "CC 的想法") {
-    throw new Error("Diary finalization rejected: `## CC 的想法` must be the final section.");
+    warnings.push("Prefer placing `## CC 的想法` after the day's time-period sections.");
   }
 
   const periods = sections.filter((section) => section.title !== "CC 的想法");
@@ -117,11 +119,14 @@ function validateFinalDiaryMarkdown(value) {
   }
   for (const section of sections) {
     const plainBody = section.body.join("\n").replace(/[*_`>#\s-]/g, "");
+    if (plainBody.length === 0) {
+      throw new Error(`Diary finalization rejected: section \`${section.title}\` cannot be empty.`);
+    }
     if (plainBody.length < 8) {
-      throw new Error(`Diary finalization rejected: section \`${section.title}\` needs substantive content.`);
+      warnings.push(`Section \`${section.title}\` is very short; add detail next time when the day provides it.`);
     }
   }
-  return `${markdown}\n`;
+  return { markdown: `${markdown}\n`, warnings };
 }
 
 function normalizeDiaryDate(value) {

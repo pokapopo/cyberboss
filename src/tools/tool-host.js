@@ -306,7 +306,7 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_diary_finalize",
-    description: "Validate and finalize one complete diary locally. Supply the entire final Markdown body with one to four natural `## <period title>` sections followed by exactly one substantive final `## CC 的想法` section. Timestamp headings, date headers, signatures, empty sections, extra headings, and the `不是…而是…` template pattern are rejected before any write. On success this tool atomically replaces the diary Markdown, renders HTML, and captures a local PNG. It does not send any network request or WeChat file. After success, call `cyberboss_channel_send_file` once with the returned `screenshotPath`; if delivery fails, do not rerun finalization automatically.",
+    description: "Validate and finalize one complete diary locally. Hard structural failures are limited to problems that would damage the document or rendering: missing/duplicate/empty `## CC 的想法`, zero or more than four period sections, timestamp headings, date headers, signatures, empty sections, or unsupported heading levels. Style findings such as a reusable `不是…而是…` pattern, a short section, or reflection ordering are returned as non-blocking warnings; a successful result is already final and must not be rewritten because of warnings. On success this tool atomically replaces the diary Markdown, renders HTML, and captures a local PNG. It does not send any network request or WeChat file. Then call `cyberboss_channel_send_file` once with the returned `screenshotPath`; if delivery fails, do not rerun finalization automatically.",
     shortHint: "Validate, atomically save, render, and locally screenshot the final diary without sending it.",
     topics: ["diary"],
     inputSchema: {
@@ -320,8 +320,11 @@ const PROJECT_TOOLS = [
     },
     async handler({ services, args }) {
       const result = await services.diary.finalize(args);
+      const warningText = result.warnings?.length
+        ? ` Non-blocking reminders: ${result.warnings.join(" ")} The diary is already finalized; do not rewrite it or call finalize again for these warnings.`
+        : "";
       return {
-        text: `Diary finalized locally: ${result.screenshotPath}. This tool did not send it. Next call cyberboss_channel_send_file once with that screenshotPath.`,
+        text: `Diary finalized locally: ${result.screenshotPath}.${warningText} This tool did not send it. Next call cyberboss_channel_send_file once with that screenshotPath.`,
         data: result,
       };
     },

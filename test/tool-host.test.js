@@ -70,6 +70,7 @@ function createHost() {
             htmlPath: "/tmp/diary.html",
             screenshotPath: "/tmp/diary.png",
             delivery: null,
+            warnings: args.markdown.includes("warning") ? ["Style reminder."] : [],
           };
         },
       },
@@ -410,6 +411,7 @@ test("tool host descriptions include schema summary for models that only surface
   assert.match(diaryFinalize.description, /validate/i);
   assert.match(diaryFinalize.description, /does not send/i);
   assert.match(diaryFinalize.description, /cyberboss_channel_send_file/);
+  assert.match(diaryFinalize.description, /non-blocking warnings/i);
 });
 
 test("diary finalize returns a local screenshot and never invokes channel delivery", async () => {
@@ -428,6 +430,13 @@ test("diary finalize returns a local screenshot and never invokes channel delive
   assert.equal(result.data.delivery, null);
   assert.equal(sends, 0);
   assert.match(result.text, /cyberboss_channel_send_file/);
+
+  const warningResult = await host.invokeTool("cyberboss_diary_finalize", {
+    date: "2026-08-05",
+    markdown: "warning",
+  });
+  assert.match(warningResult.text, /Non-blocking reminders/);
+  assert.match(warningResult.text, /already finalized; do not rewrite/i);
 });
 
 test("tool host exposes agent-visible work-log and verified experience tools", async () => {
