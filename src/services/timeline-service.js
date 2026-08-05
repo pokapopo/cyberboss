@@ -78,6 +78,7 @@ class TimelineService {
     const execution = await this.timelineIntegration.runSubcommand("write", args);
     const verified = await this.read({ date });
     verifyReconciledEvents(preparedEvents, verified.data?.events);
+    const build = await this.build({ locale: "zh-CN" });
     const resolved = this.observationStore.resolve(resolvedObservationIds);
     const remaining = this.observationStore.listPending({ date });
     return {
@@ -92,6 +93,7 @@ class TimelineService {
       proposals: proposals.data,
       warnings: buildReconcileWarnings(verified.data?.events, remaining),
       execution,
+      build,
     };
   }
 

@@ -229,6 +229,9 @@ test("timeline reconcile inspects evidence then safely replaces and verifies the
         dayEvents = payload.events;
         return { stdout: "timeline written" };
       }
+      if (subcommand === "build") {
+        return { stdout: "timeline dashboard built" };
+      }
       throw new Error(`unexpected subcommand ${subcommand}`);
     },
   };
@@ -261,6 +264,11 @@ test("timeline reconcile inspects evidence then safely replaces and verifies the
   assert.equal(writtenPayload.events[0].id, "existing-1");
   assert.equal(writtenPayload.events[1].confidence, 0.95);
   assert.deepEqual(writtenPayload.events[1].sourceMessageIds, ["msg-1"]);
+  const writeIndex = calls.findIndex((call) => call.subcommand === "write");
+  const buildIndex = calls.findIndex((call) => call.subcommand === "build");
+  const finalReadIndex = calls.map((call) => call.subcommand).lastIndexOf("read");
+  assert.ok(writeIndex < finalReadIndex);
+  assert.ok(finalReadIndex < buildIndex);
 });
 
 test("timeline reconcile refuses observations without defensible time evidence", async () => {
@@ -290,6 +298,66 @@ test("timeline reconcile refuses observations without defensible time evidence",
       subcategoryId: "work.coding",
     }],
   }), /must remain pending/);
+});
+
+test("timeline reconcile keeps observations pending when dashboard build fails", async () => {
+  let resolveCount = 0;
+  let dayEvents = [];
+  const observation = {
+    id: "obs-build-failure",
+    date: "2026-08-05",
+    text: "完成验证",
+    startAt: "2026-08-05T06:00:00.000Z",
+    endAt: "2026-08-05T07:00:00.000Z",
+    timePrecision: "exact",
+    status: "completed",
+    sourceMessageIds: ["msg-build"],
+  };
+  const observationStore = {
+    listPending() { return [observation]; },
+    resolve() { resolveCount += 1; return [observation]; },
+  };
+  const integration = {
+    async runSubcommand(subcommand, args) {
+      if (subcommand === "read") {
+        return { stdout: JSON.stringify({
+          date: "2026-08-05",
+          exists: dayEvents.length > 0,
+          status: "draft",
+          eventCount: dayEvents.length,
+          events: dayEvents,
+        }) };
+      }
+      if (subcommand === "categories") {
+        return { stdout: JSON.stringify({ categoryCount: 1, categories: [{ id: "work" }] }) };
+      }
+      if (subcommand === "write") {
+        dayEvents = JSON.parse(args[args.indexOf("--events-json") + 1]).events;
+        return { stdout: "timeline written" };
+      }
+      if (subcommand === "build") {
+        throw new Error("dashboard build failed");
+      }
+      throw new Error(`unexpected subcommand ${subcommand}`);
+    },
+  };
+  const { service } = createService({ timelineIntegration: integration, observationStore });
+
+  await assert.rejects(() => service.reconcile({
+    date: "2026-08-05",
+    events: [{
+      observationIds: [observation.id],
+      startAt: observation.startAt,
+      endAt: observation.endAt,
+      timePrecision: "exact",
+      title: "完成验证",
+      categoryId: "work",
+      subcategoryId: "work.coding",
+    }],
+    resolvedObservationIds: [observation.id],
+  }), /dashboard build failed/);
+  assert.equal(dayEvents.length, 1);
+  assert.equal(resolveCount, 0);
 });
 
 test("timeline service serializes structured screenshot options", async () => {

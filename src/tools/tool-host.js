@@ -685,7 +685,7 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_timeline_reconcile",
-    description: "Inspect pending timeline observations together with the current day and taxonomy, then optionally apply evidence-backed upserts/drops through one safe complete-day replacement and verify by readback. First call with date only to inspect; request proposals only when considering new taxonomy. Every new or corrected event must cite pending observationIds and declare exact or approximate timePrecision. Unknown-time and ongoing observations should remain pending. Use resolvedObservationIds only for observations represented by the applied events or intentionally dismissed as irrelevant. This is the authoritative conversational timeline maintenance path; it avoids merge widening and duplicate correction errors.",
+    description: "Inspect pending timeline observations together with the current day and taxonomy, then optionally apply evidence-backed upserts/drops through one safe complete-day replacement, verify by readback, and automatically rebuild the Chinese dashboard. First call with date only to inspect; request proposals only when considering new taxonomy. Every new or corrected event must cite pending observationIds and declare exact or approximate timePrecision. Unknown-time and ongoing observations should remain pending. Use resolvedObservationIds only for observations represented by the applied events or intentionally dismissed as irrelevant. This is the authoritative conversational timeline maintenance path; it avoids merge widening, duplicate correction, and stale-site errors.",
     shortHint: "Inspect and safely reconcile pending evidence into a verified timeline day.",
     topics: ["timeline"],
     inputSchema: {
@@ -726,7 +726,7 @@ const PROJECT_TOOLS = [
       const result = await services.timeline.reconcile(args);
       return {
         text: result.applied
-          ? `Timeline reconciled and verified: ${result.writtenEventCount} written, ${result.droppedEventCount} dropped, ${result.pendingObservations.length} pending.`
+          ? `Timeline reconciled, verified, and Chinese dashboard rebuilt: ${result.writtenEventCount} written, ${result.droppedEventCount} dropped, ${result.pendingObservations.length} pending.`
           : `Timeline reconciliation state loaded: ${result.pendingObservations.length} pending observations.`,
         data: result,
       };
@@ -734,7 +734,7 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_timeline_write",
-    description: "Low-level timeline write through timeline-for-agent. For conversational activity maintenance, prefer cyberboss_timeline_capture followed by cyberboss_timeline_reconcile so incomplete evidence stays pending and corrections are verified without merge widening.",
+    description: "Low-level timeline write through timeline-for-agent. A successful write automatically rebuilds the Chinese dashboard before returning. For conversational activity maintenance, prefer cyberboss_timeline_capture followed by cyberboss_timeline_reconcile so incomplete evidence stays pending and corrections are verified without merge widening.",
     shortHint: "Write timeline events after checking the current day and taxonomy when needed.",
     topics: ["timeline"],
     inputSchema: {
@@ -774,10 +774,11 @@ const PROJECT_TOOLS = [
     },
     async handler({ services, args }) {
       validateTimelineWriteArgs(args);
-      const result = await services.timeline.write(args);
+      const write = await services.timeline.write(args);
+      const build = await services.timeline.build({ locale: "zh-CN" });
       return {
-        text: "Timeline write completed.",
-        data: result,
+        text: "Timeline write completed and Chinese dashboard rebuilt.",
+        data: { write, build },
       };
     },
   },

@@ -318,6 +318,23 @@ test("tool host captures incomplete observations and reconciles through the auth
   assert.match(inspected.text, /1 pending observations/);
 });
 
+test("low-level timeline write automatically rebuilds the Chinese dashboard", async () => {
+  const host = createHost();
+  const result = await host.invokeTool("cyberboss_timeline_write", {
+    date: "2026-08-05",
+    events: [{
+      startAt: "2026-08-05T06:00:00.000Z",
+      endAt: "2026-08-05T07:00:00.000Z",
+      title: "整理代码",
+      categoryId: "work",
+      subcategoryId: "work.coding",
+    }],
+  }, {});
+
+  assert.equal(result.text, "Timeline write completed and Chinese dashboard rebuilt.");
+  assert.deepEqual(result.data.build, { locale: "zh-CN" });
+});
+
 test("tool host validates structured reminder input types", async () => {
   const host = createHost();
   await assert.rejects(async () => {
@@ -439,9 +456,11 @@ test("tool host descriptions include schema summary for models that only surface
   assert.match(timelineWrite.description, /date: string/);
   assert.match(timelineWrite.description, /events: \{/);
   assert.match(timelineWrite.description, /prefer cyberboss_timeline_capture/);
+  assert.match(timelineWrite.description, /automatically rebuilds the Chinese dashboard/);
   assert.match(timelineCapture.description, /does not write a guessed final timeline event/);
   assert.match(timelineReconcile.description, /authoritative conversational timeline maintenance path/);
   assert.match(timelineReconcile.description, /observationIds/);
+  assert.match(timelineReconcile.description, /automatically rebuild the Chinese dashboard/);
   assert.match(diaryAppend.description, /raw timestamped fragment/i);
   assert.match(diaryAppend.description, /at most four natural time-period sections/i);
   assert.match(diaryAppend.description, /exact standalone `## CC 的想法` section/);
