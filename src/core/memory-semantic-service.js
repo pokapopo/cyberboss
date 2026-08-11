@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { redactSensitiveText } = require("../adapters/channel/weixin/redact");
+const { RecentMemoryStore } = require("./recent-memory-store");
 const {
   readJsonFileSync,
   withFileLockSync,
@@ -14,13 +15,20 @@ const DEFAULT_TOP_K = 3;
 const DEFAULT_SCORE_THRESHOLD = 0.4;
 const MAX_MEMORY_BODY_CHARS = 2_400;
 const MAX_EXTRACTION_INPUT_CHARS = 14_000;
+const MAX_EXTRACTED_CANDIDATES = 2;
+const MAX_PROVIDER_CANDIDATES = 10;
 const MAX_CANDIDATES = 100;
 const EMBEDDING_BATCH_SIZE = 10;
-const AUTO_SAVE_CONFIDENCE = 0.92;
+const AUTO_SAVE_CONFIDENCE = 0.95;
 const DUPLICATE_SCORE = 0.86;
 
 class MemorySemanticService {
-  constructor({ config = {}, fetchImpl = global.fetch, now = () => new Date() } = {}) {
+  constructor({
+    config = {},
+    fetchImpl = global.fetch,
+    now = () => new Date(),
+    recentMemoryStore = null,
+  } = {}) {
     this.config = config;
     this.fetchImpl = fetchImpl;
     this.now = now;
@@ -29,6 +37,10 @@ class MemorySemanticService {
       || path.join(config.stateDir || "", "memory-search", "embeddings.json");
     this.candidatesFile = config.memoryCandidatesFile
       || path.join(config.stateDir || "", "memory-candidates.json");
+    this.recentMemoryStore = recentMemoryStore || new RecentMemoryStore({
+      filePath: config.recentMemoryFile || path.join(config.stateDir || "", "recent-memory.json"),
+      now,
+    });
   }
 
   isRecallConfigured() {
@@ -43,6 +55,13 @@ class MemorySemanticService {
 
   isExtractionConfigured() {
     return this.isRecallConfigured() && Boolean(normalizeText(this.config.memoryExtractionModel));
+  }
+
+  searchRecent(query, { topK = 3 } = {}) {
+    if (this.config.memoryEnabled === false) {
+      return [];
+    }
+    return this.recentMemoryStore?.recall?.(query, { limit: topK }) || [];
   }
 
   async search(query, {
@@ -150,11 +169,12 @@ class MemorySemanticService {
 
   async extractConversation(turns) {
     if (!this.isExtractionConfigured()) {
-      return { saved: [], pending: [], ignored: [], disabled: true };
+      return { saved: [], recent: [], pending: [], ignored: [], disabled: true };
     }
-    const transcript = formatExtractionTranscript(turns);
+    const extractionTurns = selectExtractionTurns(turns);
+    const transcript = formatExtractionTranscript(extractionTurns);
     if (!transcript) {
-      return { saved: [], pending: [], ignored: [] };
+      return { saved: [], recent: [], pending: [], ignored: [] };
     }
     const response = await this.chatCompletion({
       model: this.config.memoryExtractionModel,
@@ -162,14 +182,26 @@ class MemorySemanticService {
         {
           role: "system",
           content: [
-            "You extract durable personal-assistant memory from a conversation batch.",
+            "You extract useful personal-assistant memory from USER messages in a conversation batch.",
             "Return JSON only: {\"candidates\":[...]}.",
-            "Each candidate must contain: type, name, description, content, confidence, sensitive, explicit.",
+            "Zero candidates is the normal and preferred result when nothing clearly deserves memory.",
+            "The maximum is two distinct candidates. This is a ceiling, never a quota; merge overlapping candidates before returning.",
+            "Each candidate must contain: type, name, description, content, evidence, retention, kind, status, confidence, sensitive, explicit.",
+            "evidence must be one exact, verbatim quote from a USER turn that directly supports the candidate.",
+            "Only USER messages are provided. Never invent an ASSISTANT statement, promise, interpretation, or event.",
             "Allowed types: preference, feedback, profile, project, reference.",
-            "Extract only user-stated durable facts, stable preferences, corrections, ongoing projects, or explicit remember requests.",
-            "Ignore temporary mood, small talk, one-off requests, assistant claims, guesses, and facts already contradicted later.",
-            "Mark health, sexual/intimate, precise location, identity, credentials, financial, or similarly private facts as sensitive.",
-            "Use concise Chinese. Maximum five candidates. Never request deletion.",
+            "retention must be durable or recent. Durable means stable preferences, corrections, profiles, long-running projects, or explicit remember requests that should remain useful beyond 30 days.",
+            "Recent means a meaningful state, event, topic, or near-term plan that helps companion continuity during the next 14 days.",
+            "For recent candidates, kind must be state, event, topic, or plan; status must be active or completed.",
+            "Write candidate description and content in CC's first-person voice as uu's close companion and partner.",
+            "Refer to CC as 我, and refer to the user naturally as uu or 你. Candidate names should be concise relationship-native labels.",
+            "Never write from a detached observer or system-record perspective. Do not use 用户, 助手, 助理, AI, 模型, 客服, or similar labels in name, description, or content.",
+            "content must be CC's concise understanding of why the fact matters for future continuity. It must not equal, quote, or merely wrap evidence with phrases such as 你说, 你提到, or 用户表示.",
+            "Keep every fact grounded in the user's evidence; first-person companion voice must not invent CC feelings, promises, or events.",
+            "The evidence field is the only exception: preserve the user's exact quote verbatim even if it contains those words.",
+            "Ignore praise with no lasting relational meaning, emoji-only reactions, empty small talk, assistant claims, guesses, secrets, and facts contradicted later.",
+            "Mark health, sexual/intimate, precise location, identity, credentials, financial, or similarly private facts as sensitive. Sensitive facts may still be durable when explicitly supported and useful long term.",
+            "Use concise Chinese. Do not invent candidates merely to fill the array. Never request deletion.",
           ].join("\n"),
         },
         {
@@ -179,12 +211,31 @@ class MemorySemanticService {
       ],
     });
     const candidates = normalizeExtractedCandidates(parseJsonObject(response)?.candidates);
-    return this.processCandidates(candidates);
+    return this.processCandidates(candidates, {
+      userTexts: extractionTurns.map((turn) => turn?.user),
+      assistantTexts: extractionTurns.map((turn) => turn?.assistant),
+    });
   }
 
-  async processCandidates(candidates) {
-    const result = { saved: [], pending: [], ignored: [] };
-    for (const candidate of candidates) {
+  async processCandidates(candidates, { userTexts = [], assistantTexts = [] } = {}) {
+    const result = { saved: [], recent: [], pending: [], ignored: [] };
+    const distinctCandidates = deduplicateExtractedCandidates(
+      (Array.isArray(candidates) ? candidates : [])
+        .map(normalizeCandidate)
+        .filter(Boolean),
+    );
+    for (const candidate of distinctCandidates) {
+      const evidenceVerified = hasExactUserEvidence(candidate.evidence, userTexts);
+      if (!evidenceVerified) {
+        result.ignored.push({ candidate, reason: "missing_user_evidence" });
+        continue;
+      }
+      const qualityIssue = findCandidateQualityIssue(candidate, { userTexts, assistantTexts });
+      if (qualityIssue) {
+        result.ignored.push({ candidate, reason: qualityIssue });
+        continue;
+      }
+      const sensitive = candidate.sensitive || containsSensitiveMemory(candidate);
       const matches = await this.search(candidate.description || candidate.content, {
         topK: 1,
         scoreThreshold: -1,
@@ -196,14 +247,31 @@ class MemorySemanticService {
         continue;
       }
 
-      const sensitive = candidate.sensitive || containsSensitiveMemory(candidate);
-      const canAutoSave = !sensitive
-        && candidate.confidence >= AUTO_SAVE_CONFIDENCE
-        && candidate.explicit;
+      if (candidate.retention === "recent") {
+        const recent = this.recentMemoryStore?.add?.({
+          type: candidate.type,
+          kind: deriveRecentKind(candidate),
+          name: candidate.name,
+          description: candidate.description,
+          summary: candidate.content,
+          evidence: candidate.evidence,
+          status: candidate.status,
+          sensitive,
+        });
+        if (recent) {
+          result.recent.push(recent);
+        }
+        continue;
+      }
+
+      const canAutoSave = candidate.confidence >= AUTO_SAVE_CONFIDENCE
+        && candidate.explicit
+        && hasDurableIntentSignal(candidate.evidence);
       if (!canAutoSave) {
         const pending = this.recordCandidate({
           ...candidate,
           sensitive,
+          evidenceVerified,
           closestFile: closest?.file || "",
           closestScore: closest?.score || 0,
         });
@@ -241,6 +309,7 @@ class MemorySemanticService {
     fs.writeFileSync(targetPath, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
     try {
       await this.indexMemoryFile(fileName, body);
+      this._appendToMemoryIndexMd(fileName, candidate.name, candidate.description, candidate.type);
     } catch (error) {
       try {
         fs.unlinkSync(targetPath);
@@ -278,6 +347,62 @@ class MemorySemanticService {
     });
   }
 
+  _appendToMemoryIndexMd(fileName, name, description, type) {
+    const indexPath = path.join(this.memoryDir, "MEMORY.md");
+    let md;
+    try {
+      md = fs.readFileSync(indexPath, "utf8");
+    } catch {
+      return;
+    }
+
+    const sectionMap = {
+      preference: "偏好",
+      feedback: "偏好",
+      reference: "参考",
+      project: "项目",
+      bug: "Bug",
+      user: "偏好",
+    };
+    const sectionKey = sectionMap[type] || "偏好";
+    const entry = `- [${name}](${fileName}) — ${description}`;
+
+    if (md.includes(`[${name}](${fileName})`)) {
+      return;
+    }
+
+    const lines = md.split("\n");
+    let sectionStart = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith("## ") && lines[i].includes(sectionKey)) {
+        sectionStart = i;
+        break;
+      }
+    }
+    if (sectionStart === -1) {
+      return;
+    }
+
+    let insertAt = sectionStart + 1;
+    for (let i = sectionStart + 1; i < lines.length; i++) {
+      if (lines[i].startsWith("## ")) {
+        break;
+      }
+      if (lines[i].startsWith("- [") || lines[i].startsWith("  - [") || lines[i].startsWith("> ")) {
+        insertAt = i + 1;
+      }
+    }
+
+    lines.splice(insertAt, 0, entry);
+    if (insertAt < lines.length && lines[insertAt + 1] !== "") {
+      lines.splice(insertAt + 1, 0, "");
+    }
+
+    try {
+      fs.writeFileSync(indexPath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
+    } catch {}
+  }
+
   recordCandidate(candidate) {
     fs.mkdirSync(path.dirname(this.candidatesFile), { recursive: true, mode: 0o700 });
     return withFileLockSync(this.candidatesFile, () => {
@@ -304,6 +429,11 @@ class MemorySemanticService {
         name: candidate.name,
         description: candidate.description,
         content: candidate.content,
+        evidence: candidate.evidence,
+        evidenceVerified: Boolean(candidate.evidenceVerified),
+        retention: candidate.retention,
+        kind: candidate.kind,
+        recentStatus: candidate.status,
         confidence: candidate.confidence,
         sensitive: Boolean(candidate.sensitive),
         explicit: Boolean(candidate.explicit),
@@ -474,33 +604,231 @@ function formatExtractionTranscript(turns) {
   const lines = [];
   for (const turn of Array.isArray(turns) ? turns.slice(-12) : []) {
     const user = sanitizeText(turn?.user, 1_200);
-    const assistant = sanitizeText(turn?.assistant, 1_200);
     if (user) {
       lines.push(`USER: ${user}`);
-    }
-    if (assistant) {
-      lines.push(`ASSISTANT: ${assistant}`);
     }
   }
   return lines.join("\n\n").slice(0, MAX_EXTRACTION_INPUT_CHARS);
 }
 
+function selectExtractionTurns(turns) {
+  return (Array.isArray(turns) ? turns.slice(-12) : [])
+    .filter((turn) => isPotentiallyDurableUserText(turn?.user));
+}
+
+function isPotentiallyDurableUserText(value) {
+  const text = normalizeText(value);
+  if (!text) {
+    return false;
+  }
+  if (hasDurableIntentSignal(text)) {
+    return true;
+  }
+  const meaningful = text
+    .replace(/\[[^\]\r\n]{1,20}\]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+  if (meaningful.length < 8) {
+    return false;
+  }
+  return !/^(?:好的?|行吧?|可以|知道了|明白了|谢谢|哈哈+|嗯+|哦+|是吗|真的|算了吧?)$/i.test(meaningful);
+}
+
 function normalizeExtractedCandidates(value) {
+  return deduplicateExtractedCandidates(
+    (Array.isArray(value) ? value : [])
+      .slice(0, MAX_PROVIDER_CANDIDATES)
+      .map(normalizeCandidate)
+      .filter(Boolean),
+  ).slice(0, MAX_EXTRACTED_CANDIDATES);
+}
+
+function normalizeCandidate(item) {
   const allowedTypes = new Set(["preference", "feedback", "profile", "project", "reference"]);
-  return (Array.isArray(value) ? value : [])
-    .slice(0, 5)
-    .map((item) => ({
-      type: allowedTypes.has(normalizeText(item?.type).toLowerCase())
-        ? normalizeText(item.type).toLowerCase()
-        : "reference",
-      name: sanitizeText(item?.name, 100),
-      description: sanitizeText(item?.description, 280),
-      content: sanitizeText(item?.content, 1_500),
-      confidence: clampNumber(item?.confidence, 0, 1, 0),
-      sensitive: Boolean(item?.sensitive),
-      explicit: Boolean(item?.explicit),
-    }))
-    .filter((item) => item.name && item.description && item.content);
+  const candidate = {
+    type: allowedTypes.has(normalizeText(item?.type).toLowerCase())
+      ? normalizeText(item.type).toLowerCase()
+      : "reference",
+    name: sanitizeText(item?.name, 100),
+    description: sanitizeText(item?.description, 280),
+    content: sanitizeText(item?.content, 1_500),
+    evidence: sanitizeText(item?.evidence, 500),
+    retention: normalizeText(item?.retention).toLowerCase() === "recent" ? "recent" : "durable",
+    kind: normalizeRecentKind(item?.kind),
+    status: normalizeText(item?.status).toLowerCase() === "completed" ? "completed" : "active",
+    confidence: clampNumber(item?.confidence, 0, 1, 0),
+    sensitive: Boolean(item?.sensitive),
+    explicit: Boolean(item?.explicit),
+  };
+  return candidate.name && candidate.description && candidate.content && candidate.evidence
+    ? candidate
+    : null;
+}
+
+function normalizeRecentKind(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return ["state", "event", "topic", "plan"].includes(normalized) ? normalized : "event";
+}
+
+function hasExactUserEvidence(evidence, userTexts) {
+  const quote = normalizeEvidenceText(evidence);
+  if (quote.length < 4) {
+    return false;
+  }
+  return (Array.isArray(userTexts) ? userTexts : [])
+    .some((text) => normalizeEvidenceText(text).includes(quote));
+}
+
+function normalizeEvidenceText(value) {
+  return normalizeText(value).replace(/\s+/g, " ");
+}
+
+function hasDurableIntentSignal(value) {
+  const text = normalizeText(value);
+  return /(?:\bremember\b|\balways\b|\bnever\b|\bfrom now on\b|记住|以后|从今|每次|总是|一直|长期|固定|不再|别再|不要再|务必|我(?:更)?喜欢|我不喜欢|我讨厌|我习惯|我正在(?:做|开发)|我在做|我的.{1,30}是)/i.test(text);
+}
+
+function findCandidateQualityIssue(candidate, { userTexts = [], assistantTexts = [] } = {}) {
+  const content = normalizeText(candidate?.content);
+  if (/^(?:你|uu)?(?:说|提到|表示|告诉我|补充)[‘'“\"：:,，\s]|^(?:用户|助手|助理|AI|模型|客服)/i.test(content)) {
+    return "observer_style_content";
+  }
+  if (/(?:用户|助手|助理|AI|模型|客服)(?:说|表示|认为|告诉|解释|承诺)/i.test(content)) {
+    return "detached_role_content";
+  }
+  if (isQuoteOnlyContent(content, candidate.evidence)) {
+    return "quote_only_content";
+  }
+  if (hasAssistantOnlyCopy(content, { userTexts, assistantTexts })) {
+    return "assistant_derived_content";
+  }
+  if (candidate.retention === "recent" && !hasRecentUtilitySignal(candidate)) {
+    return "low_value_recent";
+  }
+  return "";
+}
+
+function isQuoteOnlyContent(content, evidence) {
+  const normalizedContent = normalizeComparable(content);
+  const normalizedEvidence = normalizeComparable(evidence);
+  if (!normalizedContent || !normalizedEvidence) {
+    return true;
+  }
+  if (normalizedContent === normalizedEvidence) {
+    return true;
+  }
+  return normalizedContent.includes(normalizedEvidence)
+    && normalizedContent.length - normalizedEvidence.length < 12;
+}
+
+function hasAssistantOnlyCopy(content, { userTexts = [], assistantTexts = [] } = {}) {
+  const normalizedContent = normalizeComparable(content);
+  if (normalizedContent.length < 14) {
+    return false;
+  }
+  const normalizedUsers = (Array.isArray(userTexts) ? userTexts : []).map(normalizeComparable);
+  for (const assistantText of Array.isArray(assistantTexts) ? assistantTexts : []) {
+    const normalizedAssistant = normalizeComparable(assistantText);
+    for (let index = 0; index <= normalizedAssistant.length - 14; index += 1) {
+      const fragment = normalizedAssistant.slice(index, index + 14);
+      if (normalizedContent.includes(fragment) && !normalizedUsers.some((text) => text.includes(fragment))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function hasRecentUtilitySignal(candidate) {
+  const evidence = normalizeText(candidate?.evidence);
+  const combined = `${evidence}\n${candidate?.content || ""}`;
+  if (hasDurableIntentSignal(evidence)) {
+    return true;
+  }
+  if (/[?？]\s*$/.test(evidence) && candidate.type === "reference") {
+    return false;
+  }
+  if (candidate.type === "project" && /(?:项目|开发|改版|网站|系统|部署|配置|代码|bug)/i.test(combined)) {
+    return true;
+  }
+  return /(?:今天|今晚|最近|这几天|这周|刚刚?|刚才|正在|准备|打算|计划|接下来|明天|之后|已经|完成|做完|昨晚|昨天|睡不着|有点|感觉|需要|想要|我想|我要|我在|我会)/i.test(combined);
+}
+
+function deriveRecentKind(candidate) {
+  const text = `${candidate?.evidence || ""}\n${candidate?.content || ""}`;
+  if (/(?:刚刚?|刚才|已经|完成|做完|昨天|昨晚|注册了|买了|去了|发生了)/i.test(text)) {
+    return "event";
+  }
+  if (/(?:准备|打算|计划|接下来|明天|之后|要去|想去|会去)/i.test(text)) {
+    return "plan";
+  }
+  if (/(?:现在|今天|今晚|这会儿|有点|感觉|需要|想要|睡不着|难受|疲惫|开心|烦|生气|难过)/i.test(text)) {
+    return "state";
+  }
+  return "event";
+}
+
+function deduplicateExtractedCandidates(candidates) {
+  const distinct = [];
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const duplicateIndex = distinct.findIndex((existing) => candidatesOverlap(existing, candidate));
+    if (duplicateIndex < 0) {
+      distinct.push(candidate);
+      continue;
+    }
+    if (candidateQualityScore(candidate) > candidateQualityScore(distinct[duplicateIndex])) {
+      distinct[duplicateIndex] = candidate;
+    }
+  }
+  return distinct;
+}
+
+function candidatesOverlap(left, right) {
+  const leftEvidence = normalizeComparable(left?.evidence);
+  const rightEvidence = normalizeComparable(right?.evidence);
+  if (leftEvidence && rightEvidence && (
+    leftEvidence === rightEvidence
+    || (Math.min(leftEvidence.length, rightEvidence.length) >= 8
+      && (leftEvidence.includes(rightEvidence) || rightEvidence.includes(leftEvidence)))
+  )) {
+    return true;
+  }
+  const leftFeatures = buildTextFeatures(`${left?.name || ""}\n${left?.description || ""}\n${left?.content || ""}`);
+  const rightFeatures = buildTextFeatures(`${right?.name || ""}\n${right?.description || ""}\n${right?.content || ""}`);
+  return jaccardFeatures(leftFeatures, rightFeatures) >= 0.78;
+}
+
+function candidateQualityScore(candidate) {
+  return (candidate?.explicit ? 2 : 0)
+    + clampNumber(candidate?.confidence, 0, 1, 0)
+    + Math.min(1, normalizeComparable(candidate?.content).length / 80);
+}
+
+function buildTextFeatures(value) {
+  const text = normalizeComparable(value);
+  const features = new Set();
+  for (let index = 0; index < text.length - 1; index += 1) {
+    features.add(text.slice(index, index + 2));
+  }
+  return features;
+}
+
+function jaccardFeatures(left, right) {
+  if (!left.size || !right.size) {
+    return 0;
+  }
+  let intersection = 0;
+  for (const feature of left) {
+    if (right.has(feature)) {
+      intersection += 1;
+    }
+  }
+  return intersection / (left.size + right.size - intersection);
+}
+
+function normalizeComparable(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
 function parseJsonObject(value) {

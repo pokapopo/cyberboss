@@ -12,6 +12,7 @@ const {
 const {
   MemorySemanticService,
 } = require("../src/core/memory-semantic-service");
+const { RecentMemoryStore } = require("../src/core/recent-memory-store");
 const { assembleRuntimeTurnText } = require("../src/core/inbound-turn");
 const { CyberbossApp } = require("../src/core/app");
 
@@ -182,6 +183,36 @@ test("topic-aware coordinator skips short continuations and retrieves after a cl
   assert.equal(changed.reason, "explicit_topic_change");
   assert.equal(changed.recalled.length, 1);
   assert.equal(searches.length, 2);
+});
+
+test("coordinator injects locally matched recent memory independently of long-term matches", async () => {
+  const recentQueries = [];
+  const memoryService = {
+    isRecallConfigured() {
+      return true;
+    },
+    isExtractionConfigured() {
+      return false;
+    },
+    searchRecent(query) {
+      recentQueries.push(query);
+      return [{ kind: "plan", body: "最近准备继续开发共读系统。", score: 0.8 }];
+    },
+    async search() {
+      return [];
+    },
+  };
+  const coordinator = new ConversationMemoryCoordinator({ memoryService });
+
+  const result = await coordinator.prepareTurn({
+    scopeKey: "binding::workspace",
+    text: "我们继续聊共读系统的交互",
+  });
+
+  assert.equal(recentQueries.length, 1);
+  assert.equal(result.recalled.length, 0);
+  assert.equal(result.recent.length, 1);
+  assert.match(result.recent[0].body, /共读系统/);
 });
 
 test("coordinator searches on the fifth same-topic turn without reinjecting unchanged memory", async () => {
@@ -413,7 +444,177 @@ test("memory provider refusals stay internal and degrade to no recall or extract
   assert.match(errors[1], /memory extraction failed/);
 });
 
-test("extraction keeps sensitive or implicit memories pending and only auto-saves explicit safe facts", async () => {
+test("recent memory is bounded and extends expiry after three distinct-day hits", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-recent-memory-test-"));
+  const filePath = path.join(stateDir, "recent-memory.json");
+  let current = new Date("2026-08-01T00:00:00.000Z");
+  const store = new RecentMemoryStore({ filePath, now: () => new Date(current) });
+
+  store.add({ kind: "plan", summary: "继续开发共读系统", evidence: "我还要继续做共读系统" });
+  const originalExpiry = store.list()[0].expiresAt;
+  assert.equal(store.recall("共读系统")[0].hitCount, 1);
+  assert.equal(store.recall("继续做共读系统")[0].hitCount, 1);
+
+  current = new Date("2026-08-02T00:00:00.000Z");
+  assert.equal(store.recall("共读系统")[0].hitCount, 2);
+  assert.equal(store.list()[0].expiresAt, originalExpiry);
+
+  current = new Date("2026-08-03T00:00:00.000Z");
+  assert.equal(store.recall("共读系统")[0].hitCount, 3);
+  assert.equal(store.list()[0].expiresAt, "2026-08-17T00:00:00.000Z");
+
+  current = new Date("2026-08-18T00:00:00.000Z");
+  assert.deepEqual(store.list(), []);
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+
+  current = new Date("2026-09-01T00:00:00.000Z");
+  for (let index = 0; index <= 30; index += 1) {
+    store.add({ kind: "topic", summary: `最近话题 ${index}` });
+  }
+  const bounded = store.list();
+  assert.equal(bounded.length, 30);
+  assert.equal(bounded.some((entry) => entry.summary === "最近话题 0"), false);
+  assert.equal(bounded.some((entry) => entry.summary === "最近话题 30"), true);
+});
+
+test("recent memory preserves authored fields and updates duplicate evidence in place", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-recent-fields-test-"));
+  const filePath = path.join(stateDir, "recent-memory.json");
+  const store = new RecentMemoryStore({
+    filePath,
+    now: () => new Date("2026-08-06T01:00:00.000Z"),
+  });
+
+  store.add({
+    type: "profile",
+    kind: "state",
+    name: "今晚有些疲惫",
+    description: "熬夜后的短期状态",
+    summary: "我知道你今晚熬夜后有些疲惫，聊天时要顾及这份状态。",
+    evidence: "我今晚有点累",
+    sensitive: true,
+  });
+  store.add({
+    type: "profile",
+    kind: "state",
+    name: "熬夜后的疲惫",
+    description: "今晚需要放慢节奏",
+    summary: "我记得你今晚熬夜后很疲惫，接下来要放慢一点。",
+    evidence: "我今晚有点累",
+    sensitive: true,
+  });
+
+  const entries = store.list();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].name, "熬夜后的疲惫");
+  assert.equal(entries[0].description, "今晚需要放慢节奏");
+  assert.equal(entries[0].sensitive, true);
+});
+
+test("extraction skips reaction-only batches and treats two distinct candidates as a ceiling", async () => {
+  const fixture = createMemoryFixture();
+  let requestBody = null;
+  let fetchCalls = 0;
+  const service = new MemorySemanticService({
+    config: {
+      stateDir: fixture.stateDir,
+      memoryEnabled: true,
+      memoryDir: fixture.memoryDir,
+      memoryIndexFile: fixture.indexFile,
+      memoryCandidatesFile: path.join(fixture.stateDir, "memory-candidates.json"),
+      memoryApiBaseUrl: "https://memory.example/v1",
+      memoryApiKey: "test-key",
+      memoryEmbeddingModel: "embedding-test",
+      memoryExtractionModel: "extraction-test",
+    },
+    fetchImpl: async (url, options) => {
+      fetchCalls += 1;
+      assert.equal(url, "https://memory.example/v1/chat/completions");
+      requestBody = JSON.parse(options.body);
+      return jsonResponse({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              candidates: [
+                {
+                  type: "preference",
+                  name: "先给结论",
+                  description: "用户希望以后回答时先给结论",
+                  content: "我会把先给结论作为以后回答技术问题的固定顺序。",
+                  evidence: "以后回答技术问题时先给结论",
+                  confidence: 0.99,
+                  sensitive: false,
+                  explicit: true,
+                },
+                {
+                  type: "preference",
+                  name: "不要重复",
+                  description: "用户不喜欢重复解释",
+                  content: "我知道你不喜欢重复解释，会避免把已经说清楚的内容再讲一遍。",
+                  evidence: "我不喜欢重复解释",
+                  confidence: 0.99,
+                  sensitive: false,
+                  explicit: true,
+                },
+                {
+                  type: "project",
+                  name: "第三条不应处理",
+                  description: "超过候选上限的第三条",
+                  content: "我会继续陪你推进第三个项目。",
+                  evidence: "我正在开发第三个项目",
+                  confidence: 0.99,
+                  sensitive: false,
+                  explicit: true,
+                },
+                {
+                  type: "project",
+                  name: "第四条不应处理",
+                  description: "超过候选上限",
+                  content: "这一条不应进入处理流程。",
+                  evidence: "我正在开发第四个项目",
+                  confidence: 0.99,
+                  sensitive: false,
+                  explicit: true,
+                },
+              ],
+            }),
+          },
+        }],
+      });
+    },
+  });
+  service.search = async () => [];
+  service.writeMemory = async (candidate) => ({ file: `${candidate.name}.md` });
+
+  const empty = await service.extractConversation([
+    { user: "[拥抱][亲亲]", assistant: "在。" },
+    { user: "嗯嗯", assistant: "好。" },
+    { user: "不知道吃什么", assistant: "慢慢想。" },
+  ]);
+  assert.deepEqual(empty, { saved: [], recent: [], pending: [], ignored: [] });
+  assert.equal(fetchCalls, 0);
+
+  const result = await service.extractConversation([
+    { user: "以后回答技术问题时先给结论", assistant: "知道了。" },
+    { user: "我不喜欢重复解释", assistant: "我会注意。" },
+    { user: "我正在开发第三个项目", assistant: "继续。" },
+    { user: "我正在开发第四个项目", assistant: "继续。" },
+  ]);
+
+  assert.equal(fetchCalls, 1);
+  assert.match(requestBody.messages[0].content, /Zero candidates is the normal and preferred result/);
+  assert.match(requestBody.messages[0].content, /maximum is two distinct candidates/i);
+  assert.match(requestBody.messages[0].content, /CC's first-person voice/);
+  assert.match(requestBody.messages[0].content, /Refer to CC as 我/);
+  assert.match(requestBody.messages[0].content, /close companion and partner/);
+  assert.match(requestBody.messages[0].content, /The evidence field is the only exception/);
+  assert.doesNotMatch(requestBody.messages[1].content, /ASSISTANT:/);
+  assert.equal(result.saved.length, 2);
+  assert.equal(result.pending.length, 0);
+  assert.equal(result.ignored.length, 0);
+});
+
+test("extraction allows explicit sensitive durable memory while keeping weak claims pending", async () => {
   const fixture = createMemoryFixture();
   const service = new MemorySemanticService({
     config: {
@@ -435,7 +636,8 @@ test("extraction keeps sensitive or implicit memories pending and only auto-save
       type: "preference",
       name: "reply-style",
       description: "用户明确要求以后先给结论",
-      content: "以后回答技术问题时先给结论。",
+      content: "我会把先给结论作为以后回答技术问题的固定顺序。",
+      evidence: "以后回答技术问题时先给结论",
       confidence: 0.98,
       sensitive: false,
       explicit: true,
@@ -444,7 +646,8 @@ test("extraction keeps sensitive or implicit memories pending and only auto-save
       type: "profile",
       name: "home-address",
       description: "用户的精确住址",
-      content: "精确住址是某处。",
+      content: "我会把你的精确住址作为需要长期准确保留的私密资料。",
+      evidence: "我的精确住址是某处",
       confidence: 0.99,
       sensitive: true,
       explicit: true,
@@ -453,21 +656,140 @@ test("extraction keeps sensitive or implicit memories pending and only auto-save
       type: "project",
       name: "possible-project",
       description: "模型推测用户可能长期开发某项目",
-      content: "用户可能会长期开发它。",
+      content: "我暂时把这个项目看作可能持续推进的方向。",
+      evidence: "我正在开发这个项目",
       confidence: 0.95,
       sensitive: false,
       explicit: false,
     },
-  ]);
+    {
+      type: "profile",
+      name: "assistant-claim",
+      description: "助手声称会无条件支持用户",
+      content: "我会无条件支持你。",
+      evidence: "我会无条件支持你",
+      confidence: 0.99,
+      sensitive: false,
+      explicit: true,
+    },
+    {
+      type: "reference",
+      name: "recent-state",
+      description: "用户今天因为整理项目有些疲惫",
+      content: "我知道你今天整理项目很累，这几天聊工作时要记得这份疲惫。",
+      evidence: "今天整理项目有点累",
+      retention: "recent",
+      kind: "state",
+      status: "active",
+      confidence: 0.9,
+      sensitive: false,
+      explicit: true,
+    },
+  ], {
+    userTexts: [
+      "以后回答技术问题时先给结论",
+      "我的精确住址是某处",
+      "我正在开发这个项目",
+      "今天整理项目有点累",
+    ],
+  });
 
-  assert.equal(saved.length, 1);
-  assert.equal(result.saved.length, 1);
-  assert.equal(result.pending.length, 2);
+  assert.equal(saved.length, 2);
+  assert.equal(result.saved.length, 2);
+  assert.equal(result.saved.some((item) => item.name === "home-address"), true);
+  assert.equal(result.pending.length, 1);
+  assert.equal(result.recent.length, 1);
+  assert.equal(result.recent[0].kind, "state");
+  assert.equal(result.ignored.length, 1);
+  assert.equal(result.ignored[0].reason, "missing_user_evidence");
   const pendingState = JSON.parse(fs.readFileSync(
     path.join(fixture.stateDir, "memory-candidates.json"),
     "utf8",
   ));
-  assert.equal(pendingState.candidates.length, 2);
+  assert.equal(pendingState.candidates.length, 1);
+});
+
+test("recent extraction rejects screenshot-shaped low-quality content and merges duplicates", async () => {
+  const fixture = createMemoryFixture();
+  const service = new MemorySemanticService({
+    config: {
+      stateDir: fixture.stateDir,
+      memoryDir: fixture.memoryDir,
+      memoryIndexFile: fixture.indexFile,
+      recentMemoryFile: path.join(fixture.stateDir, "recent-memory.json"),
+    },
+  });
+  service.search = async () => [];
+
+  const result = await service.processCandidates([
+    {
+      type: "feedback",
+      name: "身体上的安抚",
+      description: "近期亲密需求",
+      content: "你说‘我要身体上的抚慰啊啊啊啊，你懂不懂？我之前给你讲过。’",
+      evidence: "我要身体上的抚慰啊啊啊啊，你懂不懂？我之前给你讲过。",
+      retention: "recent",
+      kind: "plan",
+      confidence: 0.99,
+      explicit: true,
+    },
+    {
+      type: "profile",
+      name: "技术消耗",
+      description: "近期精神状态",
+      content: "你现在用着顺手，那是你自己拿时间换的——代价是真的，结果也是真的。",
+      evidence: "牺牲uu的精神健康换来的",
+      retention: "recent",
+      kind: "state",
+      confidence: 0.99,
+      explicit: true,
+    },
+    {
+      type: "project",
+      name: "继续整理网页",
+      description: "这周继续处理网页小问题",
+      content: "我知道你这周还会继续整理网页，之后聊开发时要接上当前进度。",
+      evidence: "这周我还要继续整理网页",
+      retention: "recent",
+      kind: "plan",
+      confidence: 0.9,
+      explicit: true,
+    },
+    {
+      type: "project",
+      name: "网页整理进度",
+      description: "继续处理网页问题",
+      content: "我会记得你这周仍在整理网页，接下来可以继续跟进。",
+      evidence: "这周我还要继续整理网页",
+      retention: "recent",
+      kind: "plan",
+      confidence: 0.95,
+      explicit: true,
+    },
+  ], {
+    userTexts: [
+      "我要身体上的抚慰啊啊啊啊，你懂不懂？我之前给你讲过。",
+      "牺牲uu的精神健康换来的",
+      "这周我还要继续整理网页",
+    ],
+    assistantTexts: [
+      "你现在用着顺手，那是你自己拿时间换的——代价是真的，结果也是真的。",
+    ],
+  });
+
+  assert.equal(result.recent.length, 1);
+  assert.equal(result.recent[0].name, "继续整理网页");
+  assert.equal(result.recent[0].kind, "plan");
+  assert.deepEqual(result.ignored.map((item) => item.reason).sort(), [
+    "assistant_derived_content",
+    "observer_style_content",
+  ]);
+  const recentState = JSON.parse(fs.readFileSync(
+    path.join(fixture.stateDir, "recent-memory.json"),
+    "utf8",
+  ));
+  assert.equal(recentState.entries.length, 1);
+  assert.equal(recentState.entries[0].description, "这周继续处理网页小问题");
 });
 
 test("runtime turn assembly injects recalled memory as internal bounded context", () => {
@@ -484,12 +806,18 @@ test("runtime turn assembly injects recalled memory as internal bounded context"
         description: "用户的回复偏好",
         body: "先给结论，再解释原因。",
       }],
+      recent: [{
+        kind: "plan",
+        body: "最近准备继续开发共读系统。",
+      }],
       notices: ["后台记忆整理发现 1 条待确认候选。"],
     },
   });
 
   assert.match(text, /Relevant long-term memory/);
   assert.match(text, /先给结论/);
+  assert.match(text, /Relevant recent memory/);
+  assert.match(text, /最近准备继续开发共读系统/);
   assert.match(text, /Memory maintenance notices/);
 });
 

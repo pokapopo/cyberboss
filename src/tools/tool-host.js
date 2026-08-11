@@ -282,7 +282,7 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_diary_append",
-    description: "Append one raw timestamped fragment to today's Cyberboss diary. Use this during the day to accumulate factual material; the timestamp is draft metadata and multiple fragments are expected. At end-of-day, consolidate the complete file into at most four natural time-period sections using `## <colloquial period title>` headings, with continuous prose and no timestamp subheadings. Then add an exact standalone `## CC 的想法` section containing substantive first-person reflection. Write from CC to her, emphasize observations and feelings over schedule recap, include direct address, avoid reusable template language and the `不是…而是…` pattern, and verify uncertain facts before writing. The renderer supplies the bilingual date header and `— with uu` signature. Do not depend on recalled memory for this contract, and do not append a final reflection or signature as another raw fragment.",
+    description: "Append one raw timestamped fragment to today's Cyberboss diary. Use this during the day to accumulate factual material; the timestamp is draft metadata and multiple fragments are expected. `## CC 的想法` is a hard end-of-day marker: if the requested diary already contains it, this tool automatically starts the next non-finalized calendar file and never appends after the reflection. At end-of-day, consolidate the complete file into at most four natural time-period sections using `## <colloquial period title>` headings, with continuous prose and no timestamp subheadings. Then add an exact standalone `## CC 的想法` section as the final section, containing substantive first-person reflection. Write from CC to her, emphasize observations and feelings over schedule recap, include direct address, avoid reusable template language and the `不是…而是…` pattern, and verify uncertain facts before writing. The renderer supplies the bilingual date header and `— with uu` signature. Do not depend on recalled memory for this contract, and do not append a final reflection or signature as another raw fragment.",
     shortHint: "Append a raw diary fragment; consolidate later into four natural periods plus CC's reflection.",
     topics: ["diary"],
     inputSchema: {
@@ -298,15 +298,18 @@ const PROJECT_TOOLS = [
     },
     async handler({ services, args }) {
       const result = await services.diary.append(args);
+      const rolloverText = result.rolledOverFrom
+        ? ` The ${result.rolledOverFrom} diary was already closed by CC's reflection, so this fragment started ${result.date}.`
+        : "";
       return {
-        text: `Diary appended to ${result.filePath}`,
+        text: `Diary appended to ${result.filePath}.${rolloverText}`,
         data: result,
       };
     },
   },
   {
     name: "cyberboss_diary_finalize",
-    description: "Validate and finalize one complete diary locally. Hard structural failures are limited to problems that would damage the document or rendering: missing/duplicate/empty `## CC 的想法`, zero or more than four period sections, timestamp headings, date headers, signatures, empty sections, or unsupported heading levels. Style findings such as a reusable `不是…而是…` pattern, a short section, or reflection ordering are returned as non-blocking warnings; a successful result is already final and must not be rewritten because of warnings. On success this tool atomically replaces the diary Markdown, renders HTML, and captures a local PNG. It does not send any network request or WeChat file. Then call `cyberboss_channel_send_file` once with the returned `screenshotPath`; if delivery fails, do not rerun finalization automatically.",
+    description: "Validate and finalize one complete diary locally. `## CC 的想法` must be the last section and is the hard end-of-day marker; no successful final diary can contain later sections. Other hard structural failures include missing/duplicate/empty reflection, zero or more than four period sections, timestamp headings, date headers, signatures, empty sections, or unsupported heading levels. Style findings such as a reusable `不是…而是…` pattern or a short section are returned as non-blocking warnings; a successful result is already final and must not be rewritten because of warnings. On success this tool atomically replaces the diary Markdown, renders HTML, and captures a local PNG. It does not send any network request or WeChat file. Then call `cyberboss_channel_send_file` once with the returned `screenshotPath`; if delivery fails, do not rerun finalization automatically.",
     shortHint: "Validate, atomically save, render, and locally screenshot the final diary without sending it.",
     topics: ["diary"],
     inputSchema: {
@@ -679,6 +682,42 @@ const PROJECT_TOOLS = [
       });
       return {
         text: `Timeline observations captured: ${result.capturedCount}. Reconcile only when the time range is evidence-backed; leave unknown or ongoing observations pending.`,
+        data: result,
+      };
+    },
+  },
+  {
+    name: "cyberboss_timeline_patch_event",
+    description: "Fast path for an explicit correction to one existing timeline event identified by stable eventId. Use this instead of capture/reconcile when the user clearly changes that event's start, end, title, note, category, node, or tags. It reads the day, replaces only that event while preserving all others, verifies the corrected fields by readback, and rebuilds the Chinese dashboard. Do not use it to infer a missing event, reconcile pending observations, or reorganize a whole day.",
+    shortHint: "Quickly patch one known timeline event and verify the result.",
+    topics: ["timeline"],
+    inputSchema: {
+      type: "object",
+      required: ["date", "eventId", "patch"],
+      properties: {
+        date: { type: "string", description: "Target Asia/Shanghai date in YYYY-MM-DD." },
+        eventId: { type: "string", description: "Stable id of the existing event to correct." },
+        patch: {
+          type: "object",
+          properties: {
+            startAt: { type: "string" },
+            endAt: { type: "string" },
+            title: { type: "string" },
+            note: { type: "string" },
+            categoryId: { type: "string" },
+            subcategoryId: { type: "string" },
+            eventNodeId: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.timeline.patchEvent(args);
+      return {
+        text: `Timeline event ${args.eventId} corrected, verified, and dashboard rebuilt.`,
         data: result,
       };
     },

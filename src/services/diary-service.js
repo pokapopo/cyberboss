@@ -19,9 +19,14 @@ class DiaryService {
     }
 
     const now = new Date();
-    const dateString = date || formatDate(now);
+    const requestedDate = normalizeDiaryDate(date) || formatDate(now);
+    let dateString = requestedDate;
     const timeString = time || formatTime(now);
-    const filePath = path.join(this.config.diaryDir, `${dateString}.md`);
+    let filePath = path.join(this.config.diaryDir, `${dateString}.md`);
+    while (isFinalizedDiaryFile(filePath)) {
+      dateString = nextDiaryDate(dateString);
+      filePath = path.join(this.config.diaryDir, `${dateString}.md`);
+    }
     const entry = buildDiaryEntry({
       timeString,
       title,
@@ -36,6 +41,7 @@ class DiaryService {
       date: dateString,
       time: timeString,
       body,
+      rolledOverFrom: dateString === requestedDate ? null : requestedDate,
     };
   }
 
@@ -105,7 +111,7 @@ function validateFinalDiaryMarkdown(value) {
     throw new Error("Diary finalization rejected: include exactly one `## CC 的想法` section.");
   }
   if (sections.at(-1)?.title !== "CC 的想法") {
-    warnings.push("Prefer placing `## CC 的想法` after the day's time-period sections.");
+    throw new Error("Diary finalization rejected: `## CC 的想法` must be the final section and closes the diary day.");
   }
 
   const periods = sections.filter((section) => section.title !== "CC 的想法");
@@ -168,6 +174,19 @@ function writeTextFileAtomicSync(filePath, body, { mode = 0o600 } = {}) {
 function buildDiaryEntry({ timeString, title, body }) {
   const heading = title ? `## ${timeString} ${String(title).trim()}` : `## ${timeString}`;
   return `${heading}\n\n${body}`;
+}
+
+function isFinalizedDiaryFile(filePath) {
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
+    return false;
+  }
+  return /^##\s+CC 的想法\s*$/m.test(fs.readFileSync(filePath, "utf8"));
+}
+
+function nextDiaryDate(dateString) {
+  const date = new Date(`${dateString}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
 }
 
 function formatDate(date) {

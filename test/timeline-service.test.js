@@ -300,6 +300,111 @@ test("timeline reconcile refuses observations without defensible time evidence",
   }), /must remain pending/);
 });
 
+test("timeline reconcile accepts complementary state-transition boundaries", async () => {
+  let dayEvents = [];
+  const pending = [{
+    id: "obs-sleep",
+    text: "准备睡觉",
+    startAt: "2026-08-05T16:00:00.000Z",
+    timePrecision: "exact",
+    status: "ongoing",
+    sourceMessageIds: ["msg-sleep"],
+  }, {
+    id: "obs-wake",
+    text: "我醒来了",
+    observedAt: "2026-08-05T22:30:00.000Z",
+    timePrecision: "exact",
+    status: "completed",
+    sourceMessageIds: ["msg-wake"],
+  }];
+  const observationStore = {
+    listPending() { return pending; },
+    resolve() { return pending; },
+  };
+  const integration = {
+    async runSubcommand(subcommand, args) {
+      if (subcommand === "read") {
+        return { stdout: JSON.stringify({ date: "2026-08-06", events: dayEvents, eventCount: dayEvents.length }) };
+      }
+      if (subcommand === "categories") {
+        return { stdout: JSON.stringify({ categories: [{ id: "sleep" }] }) };
+      }
+      if (subcommand === "write") {
+        dayEvents = JSON.parse(args[args.indexOf("--events-json") + 1]).events;
+        return { stdout: "written" };
+      }
+      if (subcommand === "build") {
+        return { stdout: "built" };
+      }
+      throw new Error(`unexpected subcommand ${subcommand}`);
+    },
+  };
+  const { service } = createService({ timelineIntegration: integration, observationStore });
+
+  const result = await service.reconcile({
+    date: "2026-08-06",
+    events: [{
+      observationIds: ["obs-sleep", "obs-wake"],
+      startAt: "2026-08-05T16:00:00.000Z",
+      endAt: "2026-08-05T22:30:00.000Z",
+      timePrecision: "exact",
+      title: "睡觉",
+      categoryId: "sleep",
+    }],
+    resolvedObservationIds: ["obs-sleep", "obs-wake"],
+  });
+
+  assert.equal(result.applied, true);
+  assert.equal(result.day.events[0].title, "睡觉");
+  assert.deepEqual(result.day.events[0].sourceMessageIds, ["msg-sleep", "msg-wake"]);
+});
+
+test("timeline event patch updates one stable event without loading reconciliation state", async () => {
+  const calls = [];
+  let dayEvents = [{
+    id: "evt-code",
+    startAt: "2026-08-08T14:00:00.000Z",
+    endAt: "2026-08-08T16:00:00.000Z",
+    title: "整理代码",
+    note: "",
+    categoryId: "work",
+    tags: [],
+  }, {
+    id: "evt-rest",
+    startAt: "2026-08-08T16:00:00.000Z",
+    endAt: "2026-08-08T16:30:00.000Z",
+    title: "休息",
+  }];
+  const integration = {
+    async runSubcommand(subcommand, args) {
+      calls.push(subcommand);
+      if (subcommand === "read") {
+        return { stdout: JSON.stringify({ date: "2026-08-08", events: dayEvents, eventCount: dayEvents.length }) };
+      }
+      if (subcommand === "write") {
+        dayEvents = JSON.parse(args[args.indexOf("--events-json") + 1]).events;
+        return { stdout: "written" };
+      }
+      if (subcommand === "build") {
+        return { stdout: "built" };
+      }
+      throw new Error(`unexpected subcommand ${subcommand}`);
+    },
+  };
+  const { service } = createService({ timelineIntegration: integration });
+
+  const result = await service.patchEvent({
+    date: "2026-08-08",
+    eventId: "evt-code",
+    patch: { startAt: "2026-08-08T13:00:00.000Z" },
+  });
+
+  assert.deepEqual(calls, ["read", "write", "read", "build"]);
+  assert.equal(result.event.startAt, "2026-08-08T13:00:00.000Z");
+  assert.equal(result.event.title, "整理代码");
+  assert.equal(result.day.events[1].id, "evt-rest");
+});
+
 test("timeline reconcile keeps observations pending when dashboard build fails", async () => {
   let resolveCount = 0;
   let dayEvents = [];

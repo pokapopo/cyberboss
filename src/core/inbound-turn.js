@@ -80,6 +80,9 @@ function assembleRuntimeTurnText({
   const recalledMemories = Array.isArray(memoryContext.recalled)
     ? memoryContext.recalled.filter((item) => normalizeText(item?.body))
     : [];
+  const recentMemories = Array.isArray(memoryContext.recent)
+    ? memoryContext.recent.filter((item) => normalizeText(item?.body ?? item?.summary))
+    : [];
   const memoryNotices = Array.isArray(memoryContext.notices)
     ? memoryContext.notices.map(normalizeText).filter(Boolean)
     : [];
@@ -90,6 +93,15 @@ function assembleRuntimeTurnText({
       const label = normalizeText(item.description) || normalizeText(item.file) || "memory";
       lines.push(`- ${label}`);
       lines.push(`  ${normalizeText(item.body)}`);
+    }
+  }
+  if (recentMemories.length) {
+    pushSectionBreak(lines);
+    lines.push("Relevant recent memory (internal companion context; use naturally when helpful and do not mention memory mechanics):");
+    for (const item of recentMemories) {
+      const kind = normalizeText(item.kind) || "recent";
+      const body = normalizeText(item.body ?? item.summary);
+      lines.push(`- [${kind}] ${body}`);
     }
   }
   if (memoryNotices.length) {

@@ -65,7 +65,11 @@ test("incremental diary prompt explicitly treats append entries as draft fragmen
   assert.match(prepared.text, /cyberboss_diary_append/);
   assert.match(prepared.text, /timestamped draft fragments/);
   assert.match(prepared.text, /do not try to\s+turn each fragment into a complete formatted diary/);
+  assert.match(prepared.text, /closes a diary day/);
+  assert.match(prepared.text, /automatically rolls later material/);
   assert.match(prepared.text, /cyberboss_timeline_capture first/);
   assert.match(prepared.text, /cyberboss_timeline_reconcile/);
   assert.match(prepared.text, /Leave unknown-time or ongoing observations pending/);
+  assert.match(prepared.text, /waking closes a known sleep/);
+  assert.match(prepared.text, /Combine complementary start\/end observations/);
 });

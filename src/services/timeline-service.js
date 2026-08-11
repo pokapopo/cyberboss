@@ -97,6 +97,51 @@ class TimelineService {
     };
   }
 
+  async patchEvent({ date = "", eventId = "", patch = {} } = {}) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizeText(date))) {
+      throw new Error("Timeline event patch requires date in YYYY-MM-DD.");
+    }
+    const normalizedEventId = normalizeText(eventId);
+    if (!normalizedEventId) {
+      throw new Error("Timeline event patch requires eventId.");
+    }
+    const day = await this.read({ date });
+    const events = Array.isArray(day.data?.events) ? day.data.events : [];
+    const index = events.findIndex((event) => normalizeText(event?.id) === normalizedEventId);
+    if (index < 0) {
+      throw new Error(`Timeline event not found: ${normalizedEventId}`);
+    }
+    const normalizedPatch = prepareEventPatch(patch);
+    if (!Object.keys(normalizedPatch).length) {
+      throw new Error("Timeline event patch requires at least one changed field.");
+    }
+    const updated = { ...events[index], ...normalizedPatch, id: normalizedEventId };
+    const startAt = normalizeIso(updated.startAt);
+    const endAt = normalizeIso(updated.endAt);
+    if (!startAt || !endAt || Date.parse(endAt) <= Date.parse(startAt)) {
+      throw new Error("Patched timeline event requires a valid startAt/endAt range.");
+    }
+    updated.startAt = startAt;
+    updated.endAt = endAt;
+    if (!normalizeText(updated.title) && !normalizeText(updated.eventNodeId)) {
+      throw new Error("Patched timeline event requires title or eventNodeId.");
+    }
+    const nextEvents = [...events];
+    nextEvents[index] = updated;
+    const args = ["--date", date, "--mode", "replace", "--events-json", JSON.stringify({ events: nextEvents })];
+    const execution = await this.timelineIntegration.runSubcommand("write", args);
+    const verified = await this.read({ date });
+    verifyPatchedEvent(updated, verified.data?.events, Object.keys(normalizedPatch));
+    const build = await this.build({ locale: "zh-CN" });
+    return {
+      date,
+      event: (verified.data?.events || []).find((event) => event.id === normalizedEventId),
+      day: verified.data,
+      execution,
+      build,
+    };
+  }
+
   async read({ date = "" } = {}) {
     const args = [];
     if (date) {
@@ -337,13 +382,20 @@ function prepareReconciledEvent(event, pendingById) {
       && normalizeIso(item.startAt)
       && normalizeIso(item.endAt)
   ));
-  if (!hasCompletedTimedEvidence) {
-    throw new Error("Unknown-time or ongoing observations must remain pending until completed evidence supplies a defensible range.");
-  }
   const startAt = normalizeIso(event?.startAt);
   const endAt = normalizeIso(event?.endAt);
   if (!startAt || !endAt || Date.parse(endAt) <= Date.parse(startAt)) {
     throw new Error("Reconciled timeline events require a valid startAt/endAt range.");
+  }
+  const hasCollectiveBoundaryEvidence = observations.some((item) => (
+    item.timePrecision !== "unknown" && normalizeIso(item.startAt) === startAt
+  )) && observations.some((item) => (
+    item.status === "completed"
+      && item.timePrecision !== "unknown"
+      && [normalizeIso(item.endAt), normalizeIso(item.observedAt)].includes(endAt)
+  ));
+  if (!hasCompletedTimedEvidence && !hasCollectiveBoundaryEvidence) {
+    throw new Error("Unknown-time or ongoing observations must remain pending until completed evidence supplies a defensible range or complementary transition boundaries.");
   }
   const timePrecision = normalizeText(event?.timePrecision).toLowerCase();
   if (!["exact", "approximate"].includes(timePrecision)) {
@@ -369,6 +421,50 @@ function prepareReconciledEvent(event, pendingById) {
     throw new Error("Reconciled timeline events require title or eventNodeId.");
   }
   return prepared;
+}
+
+function prepareEventPatch(patch) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return {};
+  }
+  const prepared = {};
+  for (const field of ["title", "note", "categoryId", "subcategoryId", "eventNodeId"]) {
+    if (Object.prototype.hasOwnProperty.call(patch, field)) {
+      prepared[field] = normalizeText(patch[field]);
+    }
+  }
+  for (const field of ["startAt", "endAt"]) {
+    if (Object.prototype.hasOwnProperty.call(patch, field)) {
+      const normalized = normalizeIso(patch[field]);
+      if (!normalized) {
+        throw new Error(`Timeline event patch ${field} must be a valid ISO datetime.`);
+      }
+      prepared[field] = normalized;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "tags")) {
+    prepared.tags = uniqueStrings(patch.tags);
+  }
+  return prepared;
+}
+
+function verifyPatchedEvent(expected, actualEvents, patchedFields) {
+  const actual = (Array.isArray(actualEvents) ? actualEvents : [])
+    .find((event) => normalizeText(event?.id) === expected.id);
+  if (!actual) {
+    throw new Error(`Timeline event patch readback failed for event ${expected.id}.`);
+  }
+  for (const field of patchedFields) {
+    const expectedValue = field === "startAt" || field === "endAt"
+      ? normalizeIso(expected[field])
+      : expected[field];
+    const actualValue = field === "startAt" || field === "endAt"
+      ? normalizeIso(actual[field])
+      : actual[field];
+    if (JSON.stringify(actualValue) !== JSON.stringify(expectedValue)) {
+      throw new Error(`Timeline event patch readback failed for event ${expected.id} field ${field}.`);
+    }
+  }
 }
 
 function verifyReconciledEvents(expectedEvents, actualEvents) {

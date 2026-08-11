@@ -1,138 +1,676 @@
-diff --git a/node_modules/timeline-for-agent/src/application/timeline/capture-screenshot.js b/node_modules/timeline-for-agent/src/application/timeline/capture-screenshot.js
-index 49164fc..59b203f 100644
---- a/node_modules/timeline-for-agent/src/application/timeline/capture-screenshot.js
-+++ b/node_modules/timeline-for-agent/src/application/timeline/capture-screenshot.js
-@@ -43,6 +43,18 @@ async function captureTimelineScreenshot(config, options = {}) {
- 
-   await buildTimelineSite(config);
- 
-+  if (screenshotOptions.rangeValue) {
-+    const dataPath = path.join(config.timelineSiteDir, "dashboard-data.json");
-+    try {
-+      const raw = fs.readFileSync(dataPath, "utf8");
-+      const data = JSON.parse(raw);
-+      if (data?.meta) {
-+        data.meta.latestDate = screenshotOptions.rangeValue;
-+        fs.writeFileSync(dataPath, JSON.stringify(data), "utf8");
-+      }
-+    } catch (_) {}
-+  }
-+
-   let server = null;
-   let serverInfo = null;
-   let browser = null;
-@@ -158,6 +170,7 @@ function resolveScreenshotRangeSelection(options = {}) {
-   const date = resolveSelectionText(options.date);
-   const week = resolveSelectionText(options.week);
-   const month = resolveSelectionText(options.month);
-+  const explicitValue = resolveSelectionText(options.rangeValue);
-   const provided = [date ? "day" : "", week ? "week" : "", month ? "month" : ""].filter(Boolean);
- 
-   if (provided.length > 1) {
-@@ -187,7 +200,7 @@ function resolveScreenshotRangeSelection(options = {}) {
- 
-   return {
-     range,
--    value: range === "day" ? date : range === "week" ? week : range === "month" ? month : "",
-+    value: range === "day" ? (date || explicitValue) : range === "week" ? (week || explicitValue) : range === "month" ? (month || explicitValue) : "",
-   };
+diff --git a/node_modules/timeline-for-agent/src/application/timeline/serve-site.js b/node_modules/timeline-for-agent/src/application/timeline/serve-site.js
+index b230e58..8d96b53 100644
+--- a/node_modules/timeline-for-agent/src/application/timeline/serve-site.js
++++ b/node_modules/timeline-for-agent/src/application/timeline/serve-site.js
+@@ -4,7 +4,10 @@ async function startTimelineSiteServer(config, options = {}) {
+   const port = Number.isFinite(options.port) && options.port >= 0
+     ? options.port
+     : config.timelinePort;
+-  const server = createTimelineSiteServer({ siteDir: config.timelineSiteDir });
++  const server = createTimelineSiteServer({
++    siteDir: config.timelineSiteDir,
++    stateDir: config.stateDir,
++  });
+   const info = await listenTimelineSiteServer(server, { port });
+   return { server, info };
  }
- 
-@@ -465,9 +478,40 @@ async function selectRangeTab(page, range) {
- async function selectRangeValue(page, requestedValue) {
-   const trigger = page.locator('.range-select-trigger[data-range-trigger="true"]').first();
-   await trigger.waitFor({ state: "visible", timeout: 15_000 });
-+
-+  // Skip if the correct value is already selected.
-+  const currentText = (await trigger.textContent().catch(() => "")).trim();
-+  if (normalizeLookupValue(currentText) === normalizeLookupValue(requestedValue)) {
-+    return;
+diff --git a/node_modules/timeline-for-agent/src/infra/timeline/category-theme.js b/node_modules/timeline-for-agent/src/infra/timeline/category-theme.js
+index 058895c..7d31497 100644
+--- a/node_modules/timeline-for-agent/src/infra/timeline/category-theme.js
++++ b/node_modules/timeline-for-agent/src/infra/timeline/category-theme.js
+@@ -1,4 +1,30 @@
+ const FALLBACK_CATEGORY_ID = "life";
++const BUILT_IN_CATEGORY_IDS = new Set([
++  "life",
++  "work",
++  "study",
++  "exercise",
++  "entertainment",
++  "health",
++  "social",
++  "care",
++  "travel",
++  "rest",
++]);
++const CUSTOM_CATEGORY_THEMES = new Map([
++  ["daily", { fill: "#D8D5EC", ink: "#4F4A68" }],
++  ["intimacy", { fill: "#E8D8E2", ink: "#654C5D" }],
++  ["nsfw", { fill: "#D7E6E2", ink: "#465F59" }],
++  ["troubleshooting", { fill: "#F1DDCE", ink: "#6A5140" }],
++]);
++const CUSTOM_FALLBACK_THEMES = [
++  { fill: "#E8D8E2", ink: "#654C5D" },
++  { fill: "#D7E1EC", ink: "#495B6C" },
++  { fill: "#DFE5D2", ink: "#566047" },
++  { fill: "#F1DDCE", ink: "#6A5140" },
++  { fill: "#E4DCEE", ink: "#574D69" },
++  { fill: "#D7E6E2", ink: "#465F59" },
++];
+
+ function normalizeCategoryThemeId(rawCategoryId) {
+   const normalized = String(rawCategoryId || "").trim().toLowerCase();
+@@ -7,13 +33,33 @@ function normalizeCategoryThemeId(rawCategoryId) {
+
+ function buildCategoryTheme(categoryId, fallbackFill = "") {
+   const normalizedId = normalizeCategoryThemeId(categoryId);
+-  const fill = normalizedId.includes(".")
+-    ? String(fallbackFill || "").trim() || `var(--cat-${FALLBACK_CATEGORY_ID})`
+-    : `var(--cat-${normalizedId})`;
+-  const ink = normalizedId.includes(".")
+-    ? "var(--text)"
+-    : `var(--cat-${normalizedId}-ink)`;
+-  return { fill, ink };
++  const rootId = normalizedId.split(".")[0] || FALLBACK_CATEGORY_ID;
++  if (BUILT_IN_CATEGORY_IDS.has(rootId)) {
++    return {
++      fill: `var(--cat-${rootId})`,
++      ink: `var(--cat-${rootId}-ink)`,
++    };
 +  }
 +
-   await trigger.click();
-   const optionSelector = ".range-select-option";
-   await page.locator(optionSelector).first().waitFor({ state: "visible", timeout: 15_000 });
++  const customTheme = CUSTOM_CATEGORY_THEMES.get(rootId);
++  if (customTheme) {
++    return customTheme;
++  }
 +
-+  // Press ArrowDown to check if more options appear
-+  let optionCount = await page.locator(optionSelector).count();
-+  console.error("[selectRangeValue] initial option count:", optionCount);
-+  for (let i = 0; i < 5 && optionCount < 3; i++) {
-+    await page.keyboard.press("ArrowDown");
-+    await page.waitForTimeout(100);
-+    const newCount = await page.locator(optionSelector).count();
-+    if (newCount !== optionCount) {
-+      console.error("[selectRangeValue] ArrowDown", i, ": count changed from", optionCount, "to", newCount);
-+      optionCount = newCount;
++  const explicitFill = String(fallbackFill || "").trim();
++  if (explicitFill) {
++    return { fill: explicitFill, ink: "var(--text)" };
++  }
++
++  return CUSTOM_FALLBACK_THEMES[hashCategoryId(rootId) % CUSTOM_FALLBACK_THEMES.length];
++}
++
++function hashCategoryId(value) {
++  let hash = 0;
++  for (const character of String(value || "")) {
++    hash = ((hash * 31) + character.codePointAt(0)) >>> 0;
++  }
++  return hash;
+ }
+
+ function resolveCategoryFill(categoryId, fallbackFill = "") {
+diff --git a/node_modules/timeline-for-agent/src/infra/timeline/personal-dashboard-api.js b/node_modules/timeline-for-agent/src/infra/timeline/personal-dashboard-api.js
+new file mode 100644
+index 0000000..ee1765a
+--- /dev/null
++++ b/node_modules/timeline-for-agent/src/infra/timeline/personal-dashboard-api.js
+@@ -0,0 +1,475 @@
++const fs = require("fs");
++const path = require("path");
++
++const DATE_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.md$/;
++const MEMORY_FILE_RE = /^[^/\\\0]+\.md$/u;
++const MAX_BODY_BYTES = 16 * 1024;
++const LOCK_SLEEP_BUFFER = new SharedArrayBuffer(4);
++const LOCK_SLEEP_VIEW = new Int32Array(LOCK_SLEEP_BUFFER);
++
++function createPersonalDashboardApi({ stateDir }) {
++  const root = path.resolve(String(stateDir || ""));
++  const diaryDir = path.join(root, "diary");
++  const memoryDir = path.join(root, "memory");
++  const recentMemoryFile = path.join(root, "recent-memory.json");
++  const candidatesFile = path.join(root, "memory-candidates.json");
++  const indexFile = path.join(root, "memory-search", "embeddings.json");
++  const trashDir = path.join(root, "memory-trash", "dashboard");
++
++  return async function handlePersonalDashboardApi(request, response) {
++    const url = new URL(request.url || "/", "http://127.0.0.1");
++    if (!url.pathname.startsWith("/__cyberboss/")) {
++      return false;
++    }
++
++    try {
++      if (request.method === "GET" && url.pathname === "/__cyberboss/diary") {
++        sendJson(response, 200, { entries: listDiaryEntries(diaryDir) });
++        return true;
++      }
++      if (request.method === "GET" && url.pathname === "/__cyberboss/memories") {
++        sendJson(response, 200, listMemories({ memoryDir, recentMemoryFile, candidatesFile }));
++        return true;
++      }
++      if (request.method === "DELETE" && url.pathname.startsWith("/__cyberboss/memories/")) {
++        if (request.headers["x-cyberboss-dashboard"] !== "1") {
++          sendJson(response, 403, { error: "missing dashboard request header" });
++          return true;
++        }
++        const parts = url.pathname.split("/").filter(Boolean);
++        const kind = decodeURIComponent(parts[2] || "");
++        const id = decodeURIComponent(parts.slice(3).join("/") || "");
++        const result = deleteMemory({
++          kind,
++          id,
++          memoryDir,
++          recentMemoryFile,
++          candidatesFile,
++          indexFile,
++          trashDir,
++        });
++        sendJson(response, 200, result);
++        return true;
++      }
++      if (request.method === "POST" && url.pathname.startsWith("/__cyberboss/memories/review/")) {
++        if (request.headers["x-cyberboss-dashboard"] !== "1") {
++          sendJson(response, 403, { error: "missing dashboard request header" });
++          return true;
++        }
++        const parts = url.pathname.split("/").filter(Boolean);
++        const id = decodeURIComponent(parts[3] || "");
++        const action = String(parts[4] || "").toLowerCase();
++        if (!id || !["approve", "approve-recent", "approve-durable", "reject"].includes(action)) {
++          throw badRequest("invalid review action");
++        }
++        const result = reviewMemoryCandidate({ action, id, memoryDir, recentMemoryFile, candidatesFile });
++        sendJson(response, 200, result);
++        return true;
++      }
++      sendJson(response, 404, { error: "not found" });
++      return true;
++    } catch (error) {
++      const status = error?.code === "ENOENT" ? 404 : error?.statusCode || 500;
++      sendJson(response, status, { error: status >= 500 ? "dashboard request failed" : error.message });
++      return true;
++    }
++  };
++}
++
++function listDiaryEntries(diaryDir) {
++  if (!fs.existsSync(diaryDir)) {
++    return [];
++  }
++  return fs.readdirSync(diaryDir, { withFileTypes: true })
++    .filter((entry) => entry.isFile() && DATE_FILE_RE.test(entry.name))
++    .map((entry) => {
++      const date = entry.name.match(DATE_FILE_RE)[1];
++      const filePath = path.join(diaryDir, entry.name);
++      const body = fs.readFileSync(filePath, "utf8").slice(0, MAX_BODY_BYTES);
++      const title = extractDiaryTitle(body) || formatChineseDate(date);
++      return {
++        id: date,
++        date,
++        title,
++        preview: markdownToPlainText(body).slice(0, 140),
++        body,
++      };
++    })
++    .sort((left, right) => right.date.localeCompare(left.date));
++}
++
++function listMemories({ memoryDir, recentMemoryFile, candidatesFile }) {
++  const longTerm = fs.existsSync(memoryDir)
++    ? fs.readdirSync(memoryDir, { withFileTypes: true })
++      .filter((entry) => entry.isFile() && MEMORY_FILE_RE.test(entry.name) && entry.name !== "MEMORY.md")
++      .map((entry) => readLongTermMemory(path.join(memoryDir, entry.name), entry.name))
++      .filter(Boolean)
++      .sort(sortNewest)
++    : [];
++
++  const recentState = readJson(recentMemoryFile, { entries: [] });
++  const recent = (Array.isArray(recentState.entries) ? recentState.entries : [])
++    .map((entry) => ({
++      id: String(entry.id || ""),
++      type: String(entry.type || "reference"),
++      kind: String(entry.kind || "event"),
++      status: String(entry.status || "active"),
++      name: String(entry.name || ""),
++      description: String(entry.description || ""),
++      content: String(entry.summary || ""),
++      evidence: String(entry.evidence || ""),
++      sensitive: Boolean(entry.sensitive),
++      createdAt: String(entry.createdAt || ""),
++      expiresAt: String(entry.expiresAt || ""),
++      hitCount: Math.max(0, Number(entry.hitCount) || 0),
++    }))
++    .filter((entry) => entry.id && entry.content)
++    .sort(sortNewest);
++
++  const candidateState = readJson(candidatesFile, { candidates: [] });
++  const review = (Array.isArray(candidateState.candidates) ? candidateState.candidates : [])
++    .filter((entry) => String(entry.status || "pending") === "pending")
++    .map((entry) => ({
++      id: String(entry.id || ""),
++      type: String(entry.type || "reference"),
++      name: String(entry.name || "待确认记忆"),
++      description: String(entry.description || ""),
++      content: String(entry.content || ""),
++      evidence: String(entry.evidence || ""),
++      sensitive: Boolean(entry.sensitive),
++      retention: ["recent", "durable"].includes(String(entry.retention || "")) ? String(entry.retention) : "",
++      kind: String(entry.kind || ""),
++      confidence: Number(entry.confidence) || 0,
++      createdAt: String(entry.createdAt || ""),
++    }))
++    .filter((entry) => entry.id && entry.content)
++    .sort(sortNewest);
++
++  return { longTerm, recent, review };
++}
++
++function readLongTermMemory(filePath, fileName) {
++  const source = fs.readFileSync(filePath, "utf8").slice(0, MAX_BODY_BYTES);
++  const stats = fs.statSync(filePath);
++  const frontmatter = parseFrontmatter(source);
++  const markdownBody = source.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
++  const heading = markdownBody.match(/^#\s+(.+)$/m)?.[1]?.trim() || "";
++  const content = markdownBody
++    .replace(/^#\s+.+$/m, "")
++    .trim();
++  return {
++    id: fileName,
++    type: frontmatter.type || fileName.split("-")[0] || "reference",
++    name: frontmatter.name || heading || fileName.replace(/\.md$/i, ""),
++    description: frontmatter.description || "",
++    content,
++    createdAt: stats.birthtime.toISOString(),
++    updatedAt: stats.mtime.toISOString(),
++  };
++}
++
++function deleteMemory({ kind, id, memoryDir, recentMemoryFile, candidatesFile, indexFile, trashDir }) {
++  if (kind === "long-term") {
++    if (!MEMORY_FILE_RE.test(id) || id === "MEMORY.md" || path.basename(id) !== id) {
++      throw badRequest("invalid memory id");
++    }
++    const sourcePath = path.join(memoryDir, id);
++    if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
++      throw notFound("memory not found");
++    }
++    fs.mkdirSync(trashDir, { recursive: true, mode: 0o700 });
++    const trashPath = uniqueTrashPath(trashDir, id);
++    fs.renameSync(sourcePath, trashPath);
++    removeIndexEntry(indexFile, id);
++    return { deleted: true, kind, id, recoverable: true };
++  }
++
++  if (kind === "recent") {
++    withFileLockSync(recentMemoryFile, () => {
++      const state = readJson(recentMemoryFile, { version: 1, entries: [] });
++      const entries = Array.isArray(state.entries) ? state.entries : [];
++      const target = entries.find((entry) => String(entry.id || "") === id);
++      if (!target) {
++        throw notFound("memory not found");
++      }
++      recordDeletedJson(trashDir, { kind, deletedAt: new Date().toISOString(), entry: target });
++      state.entries = entries.filter((entry) => String(entry.id || "") !== id);
++      writeJsonAtomic(recentMemoryFile, state);
++    });
++    return { deleted: true, kind, id, recoverable: true };
++  }
++
++  if (kind === "review") {
++    withFileLockSync(candidatesFile, () => {
++      const state = readJson(candidatesFile, { version: 1, candidates: [] });
++      const candidates = Array.isArray(state.candidates) ? state.candidates : [];
++      const target = candidates.find((entry) => String(entry.id || "") === id);
++      if (!target || String(target.status || "pending") !== "pending") {
++        throw notFound("candidate not found");
++      }
++      target.status = "rejected";
++      target.reviewedAt = new Date().toISOString();
++      writeJsonAtomic(candidatesFile, state);
++    });
++    return { deleted: true, kind, id, recoverable: true };
++  }
++
++  throw badRequest("invalid memory kind");
++}
++
++function reviewMemoryCandidate({ action, id, memoryDir, recentMemoryFile, candidatesFile }) {
++  let approved = null;
++  withFileLockSync(candidatesFile, () => {
++    const state = readJson(candidatesFile, { version: 1, candidates: [] });
++    const candidates = Array.isArray(state.candidates) ? state.candidates : [];
++    const target = candidates.find((entry) => String(entry.id || "") === id && String(entry.status || "pending") === "pending");
++    if (!target) throw notFound("candidate not found");
++    const approvedRetention = action === "approve-recent"
++      ? "recent"
++      : action === "approve-durable"
++        ? "durable"
++        : resolveCandidateRetention(target);
++    if (action.startsWith("approve")) {
++      approved = approvedRetention === "recent"
++        ? writeApprovedRecent(recentMemoryFile, target)
++        : writeApprovedMemory(memoryDir, target);
++    }
++    target.status = action.startsWith("approve") ? "approved" : "rejected";
++    target.reviewedAt = new Date().toISOString();
++    target.approvedRetention = action.startsWith("approve") ? approvedRetention : "";
++    target.savedFile = approved?.file || "";
++    writeJsonAtomic(candidatesFile, state);
++  });
++  return { reviewed: true, action, id, saved: approved };
++}
++
++function resolveCandidateRetention(candidate) {
++  if (candidate.retention === "recent" || candidate.retention === "durable") {
++    return candidate.retention;
++  }
++  return candidate.type === "project" ? "recent" : "durable";
++}
++
++function writeApprovedRecent(recentMemoryFile, candidate) {
++  return withFileLockSync(recentMemoryFile, () => {
++    const now = new Date();
++    const expiresAt = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
++    const state = readJson(recentMemoryFile, { version: 1, entries: [] });
++    const entries = Array.isArray(state.entries) ? state.entries : [];
++    const id = `recent_memory_dashboard_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
++    entries.push({
++      id,
++      type: candidate.type || "reference",
++      kind: candidate.kind || "event",
++      status: candidate.status || "active",
++      summary: String(candidate.content || ""),
++      evidence: String(candidate.evidence || ""),
++      createdAt: now.toISOString(),
++      expiresAt: expiresAt.toISOString(),
++      hitCount: 0,
++      lastHitAt: "",
++    });
++    state.version = 1;
++    state.entries = entries.slice(-60);
++    writeJsonAtomic(recentMemoryFile, state);
++    return { id, kind: "recent", name: candidate.name || "近期记忆" };
++  });
++}
++
++function writeApprovedMemory(memoryDir, candidate) {
++  fs.mkdirSync(memoryDir, { recursive: true, mode: 0o700 });
++  const baseName = `${candidate.type || "reference"}-${slugify(candidate.name) || "memory"}`;
++  let fileName = `${baseName}.md`;
++  let counter = 2;
++  while (fs.existsSync(path.join(memoryDir, fileName))) {
++    fileName = `${baseName}-${counter}.md`;
++    counter += 1;
++  }
++  const body = [
++    "---",
++    `name: ${sanitizeFrontmatter(candidate.name || "未命名记忆")}`,
++    `description: ${sanitizeFrontmatter(candidate.description || "")}`,
++    `type: ${sanitizeFrontmatter(candidate.type || "reference")}`,
++    "---",
++    `# ${candidate.name || "未命名记忆"}`,
++    "",
++    String(candidate.content || ""),
++    "",
++  ].join("\n");
++  fs.writeFileSync(path.join(memoryDir, fileName), body, { encoding: "utf8", mode: 0o600, flag: "wx" });
++  return { file: fileName, name: candidate.name || "未命名记忆", type: candidate.type || "reference" };
++}
++
++function slugify(value) {
++  return String(value || "")
++    .toLowerCase()
++    .replace(/[^a-z0-9\u4e00-\u9fff]+/gu, "-")
++    .replace(/^-+|-+$/g, "")
++    .slice(0, 80);
++}
++
++function sanitizeFrontmatter(value) {
++  return String(value || "").replace(/[\r\n]+/g, " ").replace(/:/g, " -").trim();
++}
++
++function removeIndexEntry(indexFile, fileName) {
++  withFileLockSync(indexFile, () => {
++    const index = readJson(indexFile, {});
++    if (Object.prototype.hasOwnProperty.call(index, fileName)) {
++      delete index[fileName];
++      writeJsonAtomic(indexFile, index);
++    }
++  });
++}
++
++function recordDeletedJson(trashDir, record) {
++  fs.mkdirSync(trashDir, { recursive: true, mode: 0o700 });
++  const filePath = path.join(trashDir, "deleted-state.json");
++  withFileLockSync(filePath, () => {
++    const state = readJson(filePath, { version: 1, records: [] });
++    const records = Array.isArray(state.records) ? state.records : [];
++    records.push(record);
++    state.records = records.slice(-200);
++    writeJsonAtomic(filePath, state);
++  });
++}
++
++function uniqueTrashPath(trashDir, fileName) {
++  const extension = path.extname(fileName);
++  const stem = path.basename(fileName, extension);
++  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
++  return path.join(trashDir, `${stem}-${stamp}${extension}`);
++}
++
++function parseFrontmatter(source) {
++  const match = String(source || "").match(/^---\s*\n([\s\S]*?)\n---/);
++  if (!match) {
++    return {};
++  }
++  return Object.fromEntries(match[1].split(/\r?\n/).map((line) => {
++    const separator = line.indexOf(":");
++    if (separator < 1) {
++      return null;
++    }
++    return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
++  }).filter(Boolean));
++}
++
++function extractDiaryTitle(source) {
++  return String(source || "").match(/^#{1,3}\s+(.+)$/m)?.[1]?.trim() || "";
++}
++
++function markdownToPlainText(source) {
++  return String(source || "")
++    .replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "")
++    .replace(/^#{1,6}\s+/gm, "")
++    .replace(/[*_`>~-]/g, "")
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++function formatChineseDate(value) {
++  const [year, month, day] = value.split("-");
++  return `${year}年${Number(month)}月${Number(day)}日`;
++}
++
++function sortNewest(left, right) {
++  const leftTime = Date.parse(left.updatedAt || left.createdAt || "") || 0;
++  const rightTime = Date.parse(right.updatedAt || right.createdAt || "") || 0;
++  return rightTime - leftTime;
++}
++
++function readJson(filePath, fallback) {
++  try {
++    return JSON.parse(fs.readFileSync(filePath, "utf8"));
++  } catch (error) {
++    if (error?.code === "ENOENT") {
++      return structuredClone(fallback);
++    }
++    throw error;
++  }
++}
++
++function writeJsonAtomic(filePath, value) {
++  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
++  const tempPath = path.join(
++    path.dirname(filePath),
++    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
++  );
++  let fd;
++  try {
++    fd = fs.openSync(tempPath, "wx", 0o600);
++    fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
++    fs.fsyncSync(fd);
++    fs.closeSync(fd);
++    fd = undefined;
++    fs.renameSync(tempPath, filePath);
++    try {
++      fs.chmodSync(filePath, 0o600);
++    } catch {
++      // Best effort on platforms without chmod support.
++    }
++  } finally {
++    if (fd !== undefined) {
++      try { fs.closeSync(fd); } catch {}
++    }
++    try { fs.unlinkSync(tempPath); } catch {}
++  }
++}
++
++function withFileLockSync(filePath, action, { timeoutMs = 2_000, staleLockMs = 30_000 } = {}) {
++  const lockPath = `${filePath}.lock`;
++  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
++  const startedAt = Date.now();
++  let fd;
++  while (fd === undefined) {
++    try {
++      fd = fs.openSync(lockPath, "wx", 0o600);
++      fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
++    } catch (error) {
++      if (error?.code !== "EEXIST") throw error;
++      try {
++        const stats = fs.statSync(lockPath);
++        if (Date.now() - stats.mtimeMs > staleLockMs) fs.unlinkSync(lockPath);
++      } catch {}
++      if (Date.now() - startedAt >= timeoutMs) {
++        throw new Error(`timed out waiting for memory state lock: ${lockPath}`);
++      }
++      Atomics.wait(LOCK_SLEEP_VIEW, 0, 0, 10);
 +    }
 +  }
-+  console.error("[selectRangeValue] final option count:", optionCount);
-+
-+  // Re-check options after keyboard navigation
-+  const debugOptions = await page.locator(optionSelector).evaluateAll((els) =>
-+    els.map((el) => ({
-+      value: String(el.getAttribute("data-range-option-value") || "").trim(),
-+      highlighted: el.hasAttribute("data-highlighted"),
-+    }))
-+  );
-+  console.error("[selectRangeValue] options after nav:", JSON.stringify(debugOptions));
-+
-   const match = await findMatchingItem(page, optionSelector, requestedValue, {
-     idAttribute: "data-range-option-value",
-     labelAttribute: "data-range-option-label",
-@@ -475,7 +519,36 @@ async function selectRangeValue(page, requestedValue) {
-   if (!match) {
-     throw new Error(`Range option not found: ${requestedValue}`);
-   }
--  await page.locator(`${optionSelector}[data-range-option-value="${match.id}"]`).first().click();
-+
-+  // Navigate to the target option via keyboard and press Enter.
-+  // Radix Select.Item fires handleSelect() in its onKeyDown handler
-+  // (Enter / Space) regardless of pointerTypeRef, so keyboard
-+  // selection is immune to the pointerTypeRef race that can prevent
-+  // mouse clicks from registering.
-+  const indices = await page.locator(optionSelector).evaluateAll((elements, targetId) => {
-+    let highlighted = -1;
-+    let target = -1;
-+    elements.forEach((el, i) => {
-+      const val = String(el.getAttribute("data-range-option-value") || "").trim();
-+      if (el.hasAttribute("data-highlighted")) highlighted = i;
-+      if (val === targetId) target = i;
-+    });
-+    return { highlighted, target };
-+  }, match.id);
-+
-+  if (indices.target < 0) {
-+    throw new Error(`Range option not found: ${requestedValue}`);
++  try {
++    return action();
++  } finally {
++    try { fs.closeSync(fd); } catch {}
++    try { fs.unlinkSync(lockPath); } catch {}
 +  }
++}
 +
-+  const start = indices.highlighted >= 0 ? indices.highlighted : 0;
-+  const delta = indices.target - start;
-+  const key = delta > 0 ? "ArrowDown" : "ArrowUp";
-+  for (let i = 0; i < Math.abs(delta); i += 1) {
-+    await page.keyboard.press(key);
-+    await page.waitForTimeout(30);
++function sendJson(response, status, value) {
++  response.writeHead(status, {
++    "content-type": "application/json; charset=utf-8",
++    "cache-control": "no-store",
++    "x-content-type-options": "nosniff",
++  });
++  response.end(JSON.stringify(value));
++}
++
++function badRequest(message) {
++  const error = new Error(message);
++  error.statusCode = 400;
++  return error;
++}
++
++function notFound(message) {
++  const error = new Error(message);
++  error.statusCode = 404;
++  return error;
++}
++
++module.exports = {
++  createPersonalDashboardApi,
++  deleteMemory,
++  listDiaryEntries,
++  listMemories,
++};
+diff --git a/node_modules/timeline-for-agent/src/infra/timeline/timeline-dashboard-builder.js b/node_modules/timeline-for-agent/src/infra/timeline/timeline-dashboard-builder.js
+index 7dfa6f3..210ce11 100644
+--- a/node_modules/timeline-for-agent/src/infra/timeline/timeline-dashboard-builder.js
++++ b/node_modules/timeline-for-agent/src/infra/timeline/timeline-dashboard-builder.js
+@@ -31,6 +31,8 @@ async function buildTimelineDashboard({ store, siteDir, entryFile, cssFile, loca
+     target: ["chrome120", "safari17"],
+   });
+
++  await buildPersonalDashboardAssets({ siteDir });
++
+   const bundledCssPath = path.join(assetsDir, "dashboard.css");
+   if (!fs.existsSync(bundledCssPath)) {
+     fs.copyFileSync(cssFile, bundledCssPath);
+@@ -44,6 +46,28 @@ async function buildTimelineDashboard({ store, siteDir, entryFile, cssFile, loca
+   fs.writeFileSync(path.join(siteDir, "index.html"), buildIndexHtml(resolvedLocale), "utf8");
+ }
+
++async function buildPersonalDashboardAssets({ siteDir }) {
++  const entryFile = path.join(__dirname, "..", "..", "timeline", "personal-dashboard-app.jsx");
++  if (!fs.existsSync(entryFile)) {
++    return;
 +  }
-+  await page.keyboard.press("Enter");
++  await esbuild.build({
++    entryPoints: [entryFile],
++    bundle: true,
++    outfile: path.join(siteDir, "assets", "personal-dashboard.js"),
++    format: "iife",
++    platform: "browser",
++    jsx: "automatic",
++    loader: {
++      ".jsx": "jsx",
++      ".css": "css",
++    },
++    external: [],
++    logLevel: "silent",
++    target: ["chrome120", "safari17"],
++  });
++}
 +
-   await page.waitForFunction((expectedLabel) => {
-     const valueNode = document.querySelector('.range-select-trigger[data-range-trigger="true"]');
-     return !!valueNode && String(valueNode.textContent || "").includes(expectedLabel);
-@@ -571,6 +644,10 @@ function buildPageScreenshotStyles(sidePadding) {
-     `  padding-top: ${horizontalPadding} !important;`,
-     `  padding-bottom: ${horizontalPadding} !important;`,
-     "}",
-+    ".event-block-meta { white-space: normal !important; overflow: visible !important; text-overflow: unset !important; }",
-+    ".event-block-title { -webkit-line-clamp: 4 !important; }",
-+    ".event-block-note { -webkit-line-clamp: 4 !important; }",
-+    ".timeline-tooltip-meta { flex-wrap: wrap !important; overflow: visible !important; }",
+ function buildIndexHtml(locale) {
+   const htmlLang = resolveTimelineLocale(locale) === "zh-CN" ? "zh-CN" : "en";
+   return [
+@@ -54,15 +78,20 @@ function buildIndexHtml(locale) {
+     "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+     "  <title>Timeline for Agent</title>",
+     "  <link rel=\"stylesheet\" href=\"./assets/dashboard.css\" />",
++    "  <link rel=\"stylesheet\" href=\"./assets/personal-dashboard.css\" />",
+     "</head>",
+     "<body>",
+     "  <div id=\"root\"></div>",
++    "  <div id=\"personal-root\"></div>",
+     "  <script src=\"./assets/dashboard.js\"></script>",
++    "  <script src=\"./assets/personal-dashboard.js\"></script>",
+     "</body>",
+     "</html>",
    ].join("\n");
  }
- 
+
+ module.exports = {
++  buildIndexHtml,
++  buildPersonalDashboardAssets,
+   buildTimelineDashboard,
+ };
+diff --git a/node_modules/timeline-for-agent/src/infra/timeline/timeline-site-server.js b/node_modules/timeline-for-agent/src/infra/timeline/timeline-site-server.js
+index 5f023ba..7ce767b 100644
+--- a/node_modules/timeline-for-agent/src/infra/timeline/timeline-site-server.js
++++ b/node_modules/timeline-for-agent/src/infra/timeline/timeline-site-server.js
+@@ -1,10 +1,15 @@
+ const fs = require("fs");
+ const http = require("http");
+ const path = require("path");
++const { createPersonalDashboardApi } = require("./personal-dashboard-api");
+
+-function createTimelineSiteServer({ siteDir }) {
++function createTimelineSiteServer({ siteDir, stateDir = "" }) {
+   fs.mkdirSync(siteDir, { recursive: true });
+-  return http.createServer((request, response) => {
++  const handlePersonalDashboardApi = createPersonalDashboardApi({ stateDir });
++  return http.createServer(async (request, response) => {
++    if (await handlePersonalDashboardApi(request, response)) {
++      return;
++    }
+     const requestPath = normalizeRequestPath(request.url || "/");
+     const siteRoot = path.resolve(siteDir);
+     const resolvedPath = resolveTimelineSiteAssetPath(siteRoot, requestPath);
+@@ -76,6 +81,9 @@ function detectMimeType(filePath) {
+   if (filePath.endsWith(".json")) {
+     return "application/json; charset=utf-8";
+   }
++  if (filePath.endsWith(".svg")) {
++    return "image/svg+xml";
++  }
+   return "text/html; charset=utf-8";
+ }
+
 diff --git a/node_modules/timeline-for-agent/src/infra/timeline/timeline-store.js b/node_modules/timeline-for-agent/src/infra/timeline/timeline-store.js
-index f18aa08..a140e67 100644
+index 12cedb7..f2477a1 100644
 --- a/node_modules/timeline-for-agent/src/infra/timeline/timeline-store.js
 +++ b/node_modules/timeline-for-agent/src/infra/timeline/timeline-store.js
-@@ -174,7 +174,21 @@ class TimelineStore {
+@@ -162,7 +162,21 @@ class TimelineStore {
      const normalizedIncomingEvents = normalizeDayEvents(events, this.state.taxonomy, { strict: true });
      validateDayEvents(normalizedDate, normalizedIncomingEvents, this.state.timezone);
      for (const event of normalizedIncomingEvents) {
@@ -153,12 +691,12 @@ index f18aa08..a140e67 100644
 +        mergedEvents.set(event.id, event);
 +      }
      }
- 
+
      for (const eventId of Array.isArray(dropEventIds) ? dropEventIds : []) {
-@@ -559,6 +573,31 @@ function slugify(value) {
+@@ -547,6 +561,31 @@ function slugify(value) {
      .slice(0, 80) || "event";
  }
- 
+
 +function findOverlappingEvent(existingMap, incoming) {
 +  const inStart = Date.parse(incoming.startAt);
 +  const inEnd = Date.parse(incoming.endAt);
@@ -187,78 +725,1804 @@ index f18aa08..a140e67 100644
  module.exports = {
    TimelineStore,
  };
+diff --git a/node_modules/timeline-for-agent/src/timeline/components/personal/PersonalDashboardApp.jsx b/node_modules/timeline-for-agent/src/timeline/components/personal/PersonalDashboardApp.jsx
+new file mode 100644
+index 0000000..148c99e
+--- /dev/null
++++ b/node_modules/timeline-for-agent/src/timeline/components/personal/PersonalDashboardApp.jsx
+@@ -0,0 +1,587 @@
++import React, { useEffect, useMemo, useState } from "react";
++import {
++  ArchiveIcon,
++  BookmarkIcon,
++  ChevronLeftIcon,
++  ChevronRightIcon,
++  ClockIcon,
++  Cross1Icon,
++  LockClosedIcon,
++  MagnifyingGlassIcon,
++  ReaderIcon,
++  TrashIcon,
++} from "@radix-ui/react-icons";
++
++const ROUTES = new Set(["timeline", "diary", "memory"]);
++const MEMORY_TABS = [
++  { id: "longTerm", label: "Long-term", apiKind: "long-term" },
++  { id: "recent", label: "Recent", apiKind: "recent" },
++  { id: "review", label: "Review", apiKind: "review" },
++];
++
++function PersonalDashboardApp() {
++  const [route, setRoute] = useHashRoute();
++
++  useEffect(() => {
++    const timelineRoot = document.getElementById("root");
++    if (timelineRoot) {
++      timelineRoot.hidden = route !== "timeline";
++    }
++    document.body.dataset.personalRoute = route;
++    return () => {
++      if (timelineRoot) timelineRoot.hidden = false;
++      delete document.body.dataset.personalRoute;
++    };
++  }, [route]);
++
++  return (
++    <div className={`personal-app personal-route-${route}`}>
++      {route === "diary" ? <DiaryPage /> : null}
++      {route === "memory" ? <MemoryPage /> : null}
++      <PersonalNavigation route={route} onNavigate={setRoute} />
++    </div>
++  );
++}
++
++function PersonalNavigation({ route, onNavigate }) {
++  const items = [
++    { id: "timeline", label: "时间轴", Icon: ClockIcon },
++    { id: "diary", label: "日记", Icon: ReaderIcon },
++    { id: "memory", label: "记忆", Icon: ArchiveIcon },
++  ];
++  return (
++    <nav className="personal-bottom-nav" aria-label="个人档案导航">
++      {items.map(({ id, label, Icon }) => (
++        <button
++          key={id}
++          type="button"
++          className="personal-nav-item"
++          data-active={route === id}
++          aria-current={route === id ? "page" : undefined}
++          onClick={() => onNavigate(id)}
++        >
++          <Icon aria-hidden="true" />
++          <span>{label}</span>
++        </button>
++      ))}
++    </nav>
++  );
++}
++
++function DiaryPage() {
++  const [entries, setEntries] = useState([]);
++  const [selectedDate, setSelectedDate] = useState("");
++  const [state, setState] = useState("loading");
++
++  useEffect(() => {
++    let cancelled = false;
++    fetchJson("./__cyberboss/diary")
++      .then((result) => {
++        if (cancelled) return;
++        const nextEntries = Array.isArray(result.entries) ? result.entries : [];
++        setEntries(nextEntries);
++        setSelectedDate(nextEntries[0]?.date || "");
++        setState("ready");
++      })
++      .catch(() => {
++        if (!cancelled) setState("error");
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const selectedIndex = Math.max(0, entries.findIndex((entry) => entry.date === selectedDate));
++  const selected = entries[selectedIndex] || null;
++  const newer = selectedIndex > 0 ? entries[selectedIndex - 1] : null;
++  const older = selectedIndex + 1 < entries.length ? entries[selectedIndex + 1] : null;
++
++  return (
++    <main className="personal-page diary-page">
++      <PersonalPageHeader title="日记" script="Personal Diary" />
++      <section className="diary-date-controls" aria-label="选择日记日期">
++        <button type="button" disabled={!older} onClick={() => setSelectedDate(older?.date || selectedDate)}>
++          <ChevronLeftIcon />
++          <span>前一天</span>
++        </button>
++        <label className="diary-date-select">
++          <select value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)}>
++            {entries.map((entry) => (
++              <option key={entry.date} value={entry.date}>{formatShortDate(entry.date)}</option>
++            ))}
++          </select>
++        </label>
++        <button type="button" disabled={!newer} onClick={() => setSelectedDate(newer?.date || selectedDate)}>
++          <span>后一天</span>
++          <ChevronRightIcon />
++        </button>
++      </section>
++
++      {state === "loading" ? <PageMessage>正在翻开日记……</PageMessage> : null}
++      {state === "error" ? <PageMessage>日记暂时没有打开，请稍后再试。</PageMessage> : null}
++      {state === "ready" && !selected ? <PageMessage>还没有日记记录。</PageMessage> : null}
++      {selected ? <DiaryEntry entry={selected} /> : null}
++    </main>
++  );
++}
++
++function DiaryEntry({ entry }) {
++  const blocks = useMemo(() => parseDiaryMarkdown(entry.body), [entry.body]);
++  return (
++    <article className="diary-paper">
++      <header className="diary-paper-header">
++        <p>{formatChineseDate(entry.date, { weekday: true })}</p>
++        <span className="diary-flourish" aria-hidden="true">❧</span>
++      </header>
++      <div className="diary-body">
++        {blocks.map((block, index) => {
++          if (block.kind === "heading") {
++            return <h2 key={`${block.kind}:${index}`}>{block.text}</h2>;
++          }
++          if (block.kind === "list") {
++            return <ul key={`${block.kind}:${index}`}>{block.items.map((item) => <li key={item}>{item}</li>)}</ul>;
++          }
++          return <p key={`${block.kind}:${index}`}>{block.text}</p>;
++        })}
++      </div>
++    </article>
++  );
++}
++
++function MemoryPage() {
++  const [data, setData] = useState({ longTerm: [], recent: [], review: [] });
++  const [activeTab, setActiveTab] = useState("longTerm");
++  const [query, setQuery] = useState("");
++  const [sortOrder, setSortOrder] = useState("newest");
++  const [state, setState] = useState("loading");
++  const [deleteTarget, setDeleteTarget] = useState(null);
++  const [detailTarget, setDetailTarget] = useState(null);
++  const [deleteError, setDeleteError] = useState("");
++  const [deleting, setDeleting] = useState(false);
++  const [reviewing, setReviewing] = useState(false);
++  const [reviewError, setReviewError] = useState("");
++  const [visibleCount, setVisibleCount] = useState(20);
++
++  useEffect(() => {
++    let cancelled = false;
++    fetchJson("./__cyberboss/memories")
++      .then((result) => {
++        if (cancelled) return;
++        setData({
++          longTerm: Array.isArray(result.longTerm) ? result.longTerm : [],
++          recent: Array.isArray(result.recent) ? result.recent : [],
++          review: Array.isArray(result.review) ? result.review : [],
++        });
++        setState("ready");
++      })
++      .catch(() => {
++        if (!cancelled) setState("error");
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const activeItems = useMemo(() => {
++    const normalizedQuery = query.trim().toLowerCase();
++    const filtered = data[activeTab].filter((item) => {
++      if (!normalizedQuery) return true;
++      return [item.name, item.description, item.content, item.evidence, item.type, item.kind]
++        .filter(Boolean)
++        .join("\n")
++        .toLowerCase()
++        .includes(normalizedQuery);
++    });
++    return [...filtered].sort((left, right) => compareMemories(left, right, sortOrder));
++  }, [activeTab, data, query, sortOrder]);
++
++  const activeTabDefinition = MEMORY_TABS.find((tab) => tab.id === activeTab) || MEMORY_TABS[0];
++
++  useEffect(() => {
++    setVisibleCount(20);
++  }, [activeTab, query, sortOrder]);
++
++  const visibleItems = activeItems.slice(0, visibleCount);
++
++  async function confirmDelete() {
++    if (!deleteTarget || deleting) return;
++    setDeleting(true);
++    setDeleteError("");
++    try {
++      await fetchJson(`./__cyberboss/memories/${encodeURIComponent(deleteTarget.apiKind)}/${encodeURIComponent(deleteTarget.id)}`, {
++        method: "DELETE",
++        headers: { "x-cyberboss-dashboard": "1" },
++      });
++      setData((current) => ({
++        ...current,
++        [deleteTarget.tab]: current[deleteTarget.tab].filter((item) => item.id !== deleteTarget.id),
++      }));
++      setDeleteTarget(null);
++    } catch {
++      setDeleteError("删除没有完成，请稍后再试。");
++    } finally {
++      setDeleting(false);
++    }
++  }
++
++  async function reviewCandidate(action) {
++    if (!detailTarget || reviewing) return;
++    setReviewing(true);
++    setReviewError("");
++    try {
++      await fetchJson(`./__cyberboss/memories/review/${encodeURIComponent(detailTarget.item.id)}/${action}`, {
++        method: "POST",
++        headers: { "x-cyberboss-dashboard": "1" },
++      });
++      setData((current) => ({
++        ...current,
++        review: current.review.filter((item) => item.id !== detailTarget.item.id),
++      }));
++      setDetailTarget(null);
++    } catch {
++      setReviewError(action.startsWith("approve") ? "批准没有完成，请稍后再试。" : "拒绝没有完成，请稍后再试。");
++    } finally {
++      setReviewing(false);
++    }
++  }
++
++  return (
++    <main className="personal-page memory-page">
++      <PersonalPageHeader title="记忆" script="Memory Archive" />
++
++      <nav className="memory-tab-group" aria-label="记忆分类">
++        {MEMORY_TABS.map((tab) => (
++          <button
++            key={tab.id}
++            type="button"
++            data-active={activeTab === tab.id}
++            onClick={() => setActiveTab(tab.id)}
++          >
++            {tab.label}
++          </button>
++        ))}
++      </nav>
++
++      <div className="memory-toolbar">
++        <label className="memory-search">
++          <MagnifyingGlassIcon aria-hidden="true" />
++          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索记忆内容、标签或人物" />
++        </label>
++        <label className="memory-sort">
++          <span className="sr-only">记忆排序</span>
++          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value)}>
++            <option value="newest">最新创建</option>
++            <option value="oldest">最早创建</option>
++            <option value="name">按名称</option>
++          </select>
++        </label>
++      </div>
++
++      <div className="memory-count-row">
++        <span><BookmarkIcon />共 {data[activeTab].length} 条</span>
++        {query ? <span>找到 {activeItems.length} 条</span> : null}
++      </div>
++
++      {state === "loading" ? <PageMessage>正在整理记忆……</PageMessage> : null}
++      {state === "error" ? <PageMessage>记忆暂时没有打开，请稍后再试。</PageMessage> : null}
++      {state === "ready" && activeItems.length === 0 ? <PageMessage>这里暂时没有记忆。</PageMessage> : null}
++      <section className="memory-card-list">
++        {visibleItems.map((item, index) => (
++          <MemoryCard
++            key={item.id}
++            item={item}
++            tab={activeTab}
++            tone={index % 5}
++            onOpen={() => {
++              setReviewError("");
++              setDetailTarget({ item, tab: activeTab });
++            }}
++            onDelete={() => setDeleteTarget({
++              id: item.id,
++              label: memoryTitle(item, activeTab),
++              tab: activeTab,
++              apiKind: activeTabDefinition.apiKind,
++            })}
++          />
++        ))}
++      </section>
++      {activeItems.length > visibleItems.length ? (
++        <button type="button" className="memory-load-more" onClick={() => setVisibleCount((count) => count + 20)}>
++          再看一些
++        </button>
++      ) : null}
++
++      {deleteTarget ? (
++        <DeleteMemoryDialog
++          label={deleteTarget.label}
++          deleting={deleting}
++          error={deleteError}
++          onCancel={() => {
++            if (!deleting) {
++              setDeleteTarget(null);
++              setDeleteError("");
++            }
++          }}
++          onConfirm={confirmDelete}
++        />
++      ) : null}
++      {detailTarget ? (
++        <MemoryDetailSheet
++          item={detailTarget.item}
++          tab={detailTarget.tab}
++          reviewing={reviewing}
++          error={reviewError}
++          onClose={() => {
++            if (!reviewing) {
++              setDetailTarget(null);
++              setReviewError("");
++            }
++          }}
++          onReview={reviewCandidate}
++        />
++      ) : null}
++    </main>
++  );
++}
++
++function MemoryCard({ item, tab, tone, onOpen, onDelete }) {
++  const title = memoryTitle(item, tab);
++  const date = item.updatedAt || item.createdAt || item.expiresAt;
++  const type = tab === "recent" ? item.kind : item.type;
++  return (
++    <article className="memory-card" data-tone={tone} role="button" tabIndex="0" onClick={onOpen} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(); } }}>
++      <div className="memory-card-head">
++        <span className="memory-type-chip">{translateMemoryType(type)}</span>
++        <button type="button" className="memory-delete-button" aria-label={`删除记忆：${title}`} onClick={(event) => { event.stopPropagation(); onDelete(); }}>
++          <TrashIcon />
++        </button>
++      </div>
++      <h2>{title}</h2>
++      {date ? <time dateTime={date}>{formatCompactDate(date)}</time> : null}
++      <p>{memoryContent(item, tab)}</p>
++      {item.sensitive ? <span className="memory-private-chip"><LockClosedIcon />私密内容</span> : null}
++      {tab === "recent" ? (
++        <footer>
++          <span>{item.status === "completed" ? "已完成" : "进行中"}</span>
++          {item.expiresAt ? <span>保留至 {formatCompactDate(item.expiresAt)}</span> : null}
++          <span>命中 {item.hitCount || 0} 次</span>
++        </footer>
++      ) : null}
++      {tab === "review" && item.evidence ? <blockquote>“{item.evidence}”</blockquote> : null}
++    </article>
++  );
++}
++
++function MemoryDetailSheet({ item, tab, reviewing, error, onClose, onReview }) {
++  const title = memoryTitle(item, tab);
++  const date = item.updatedAt || item.createdAt || item.expiresAt;
++  const type = tab === "recent" ? item.kind : item.type;
++  return (
++    <div className="memory-detail-backdrop" role="presentation" onMouseDown={(event) => {
++      if (event.target === event.currentTarget) onClose();
++    }}>
++      <section className="memory-detail-sheet" role="dialog" aria-modal="true" aria-labelledby="memory-detail-title">
++        <div className="memory-detail-grabber" aria-hidden="true" />
++        <button type="button" className="memory-dialog-close" aria-label="关闭" disabled={reviewing} onClick={onClose}>
++          <Cross1Icon />
++        </button>
++        <span className="memory-type-chip">{translateMemoryType(type)}</span>
++        <h2 id="memory-detail-title">{title}</h2>
++        {date ? <time dateTime={date}>{formatCompactDate(date)}</time> : null}
++        {item.description ? <p className="memory-detail-description">{item.description}</p> : null}
++        <div className="memory-detail-content">{memoryContent(item, tab)}</div>
++        {item.evidence ? <blockquote>“{item.evidence}”</blockquote> : null}
++        {item.sensitive ? <span className="memory-private-chip"><LockClosedIcon />私密内容</span> : null}
++        {tab === "review" ? (
++          <div className="memory-review-actions">
++            <button type="button" disabled={reviewing} onClick={() => onReview("reject")}>拒绝</button>
++            <button type="button" className="approve" disabled={reviewing} onClick={() => onReview("approve")}>{reviewing ? "处理中……" : "批准"}</button>
++          </div>
++        ) : null}
++        {error ? <p className="memory-dialog-error">{error}</p> : null}
++      </section>
++    </div>
++  );
++}
++
++function DeleteMemoryDialog({ label, deleting, error, onCancel, onConfirm }) {
++  return (
++    <div className="memory-dialog-backdrop" role="presentation" onMouseDown={(event) => {
++      if (event.target === event.currentTarget) onCancel();
++    }}>
++      <section className="memory-dialog" role="dialog" aria-modal="true" aria-labelledby="memory-dialog-title">
++        <button type="button" className="memory-dialog-close" aria-label="关闭" disabled={deleting} onClick={onCancel}>
++          <Cross1Icon />
++        </button>
++        <span className="memory-dialog-icon"><TrashIcon /></span>
++        <h2 id="memory-dialog-title">删除这条记忆？</h2>
++        <p>“{label}”将不会再参与记忆召回。</p>
++        <small>系统会保留一份可恢复记录，避免误删后无法找回。</small>
++        {error ? <p className="memory-dialog-error">{error}</p> : null}
++        <div className="memory-dialog-actions">
++          <button type="button" disabled={deleting} onClick={onCancel}>取消</button>
++          <button type="button" className="danger" disabled={deleting} onClick={onConfirm}>
++            {deleting ? "正在删除……" : "确认删除"}
++          </button>
++        </div>
++      </section>
++    </div>
++  );
++}
++
++function PersonalPageHeader({ title, script }) {
++  return (
++    <header className="personal-page-header" aria-label={title}>
++      <p>{script}</p>
++    </header>
++  );
++}
++
++function PageMessage({ children }) {
++  return <div className="personal-page-message">{children}</div>;
++}
++
++function useHashRoute() {
++  const readRoute = () => {
++    const value = window.location.hash.replace(/^#\/?/, "").trim().toLowerCase();
++    return ROUTES.has(value) ? value : "timeline";
++  };
++  const [route, setRoute] = useState(readRoute);
++  useEffect(() => {
++    const onHashChange = () => setRoute(readRoute());
++    window.addEventListener("hashchange", onHashChange);
++    return () => window.removeEventListener("hashchange", onHashChange);
++  }, []);
++  const navigate = (nextRoute) => {
++    const normalized = ROUTES.has(nextRoute) ? nextRoute : "timeline";
++    if (normalized === "timeline") {
++      window.history.pushState(null, "", `${window.location.pathname}${window.location.search}`);
++      setRoute("timeline");
++      window.scrollTo({ top: 0, behavior: "smooth" });
++      return;
++    }
++    window.location.hash = normalized;
++  };
++  return [route, navigate];
++}
++
++function parseDiaryMarkdown(source) {
++  const lines = String(source || "").replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "").split(/\r?\n/);
++  const blocks = [];
++  let paragraph = [];
++  let list = [];
++  const flushParagraph = () => {
++    if (paragraph.length) blocks.push({ kind: "paragraph", text: paragraph.join(" ").trim() });
++    paragraph = [];
++  };
++  const flushList = () => {
++    if (list.length) blocks.push({ kind: "list", items: list });
++    list = [];
++  };
++  for (const line of lines) {
++    const heading = line.match(/^#{1,6}\s+(.+)$/);
++    const listItem = line.match(/^\s*[-*+]\s+(.+)$/);
++    if (heading) {
++      flushParagraph();
++      flushList();
++      blocks.push({ kind: "heading", text: cleanMarkdownText(heading[1]) });
++    } else if (listItem) {
++      flushParagraph();
++      list.push(cleanMarkdownText(listItem[1]));
++    } else if (!line.trim()) {
++      flushParagraph();
++      flushList();
++    } else {
++      flushList();
++      paragraph.push(cleanMarkdownText(line));
++    }
++  }
++  flushParagraph();
++  flushList();
++  return blocks;
++}
++
++function cleanMarkdownText(value) {
++  return String(value || "")
++    .replace(/\*\*(.*?)\*\*/g, "$1")
++    .replace(/_(.*?)_/g, "$1")
++    .replace(/`(.*?)`/g, "$1")
++    .trim();
++}
++
++function memoryTitle(item, tab) {
++  if (tab !== "recent") return item.name || item.description || "未命名记忆";
++  const name = String(item.name || "").trim();
++  if (name) return name;
++  const description = String(item.description || "").trim();
++  if (description && description !== String(item.content || "").trim()) return description;
++  const content = String(item.content || "").trim();
++  return content.length > 24 ? `${content.slice(0, 24)}…` : content || "近期记忆";
++}
++
++function memoryContent(item, tab) {
++  if (tab === "longTerm") return item.content || item.description || "";
++  if (tab === "review") return item.content || item.description || "";
++  return item.content || "";
++}
++
++function translateMemoryType(value) {
++  const labels = {
++    preference: "偏好",
++    feedback: "反馈",
++    profile: "资料",
++    project: "项目",
++    reference: "参考",
++    state: "状态",
++    event: "事件",
++    topic: "话题",
++    plan: "计划",
++  };
++  return labels[String(value || "").toLowerCase()] || "记忆";
++}
++
++function compareMemories(left, right, order) {
++  if (order === "name") {
++    return memoryTitle(left, "longTerm").localeCompare(memoryTitle(right, "longTerm"), "zh-CN");
++  }
++  const leftTime = Date.parse(left.updatedAt || left.createdAt || left.expiresAt || "") || 0;
++  const rightTime = Date.parse(right.updatedAt || right.createdAt || right.expiresAt || "") || 0;
++  return order === "oldest" ? leftTime - rightTime : rightTime - leftTime;
++}
++
++function formatCompactDate(value) {
++  const date = new Date(value);
++  if (Number.isNaN(date.getTime())) return "";
++  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
++}
++
++function formatChineseDate(value, { weekday = false } = {}) {
++  const date = new Date(`${value}T12:00:00`);
++  if (Number.isNaN(date.getTime())) return value;
++  return new Intl.DateTimeFormat("zh-CN", {
++    year: "numeric",
++    month: "long",
++    day: "numeric",
++    ...(weekday ? { weekday: "long" } : {}),
++  }).format(date);
++}
++
++function formatShortDate(value) {
++  const date = new Date(`${value}T12:00:00`);
++  if (Number.isNaN(date.getTime())) return value;
++  return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date);
++}
++
++async function fetchJson(url, options = {}) {
++  const response = await fetch(url, {
++    credentials: "same-origin",
++    cache: "no-store",
++    ...options,
++  });
++  if (!response.ok) {
++    throw new Error(`request failed: ${response.status}`);
++  }
++  return response.json();
++}
++
++export { PersonalDashboardApp };
 diff --git a/node_modules/timeline-for-agent/src/timeline/css/dashboard.css b/node_modules/timeline-for-agent/src/timeline/css/dashboard.css
-index bde9cc1..e9a808e 100644
+index 460449c..59ef57c 100644
 --- a/node_modules/timeline-for-agent/src/timeline/css/dashboard.css
 +++ b/node_modules/timeline-for-agent/src/timeline/css/dashboard.css
-@@ -468,10 +468,9 @@ input {
- 
- .timeline-tooltip-meta {
-   display: flex;
--  flex-wrap: nowrap;
-+  flex-wrap: wrap;
-   gap: 10px;
-   align-items: center;
--  overflow: hidden;
+@@ -48,6 +48,14 @@
+   --cat-travel-ink: #6d3a1e;
+   --cat-rest: #FDECDF;
+   --cat-rest-ink: #7a5a40;
++  --cat-daily: #D8D5EC;
++  --cat-daily-ink: #4F4A68;
++  --cat-intimacy: #E8D8E2;
++  --cat-intimacy-ink: #654C5D;
++  --cat-nsfw: #D7E6E2;
++  --cat-nsfw-ink: #465F59;
++  --cat-troubleshooting: #F1DDCE;
++  --cat-troubleshooting-ink: #6A5140;
+   --font-sans: "Avenir Next", "PingFang SC", "Helvetica Neue", sans-serif;
+   --font-serif: "Iowan Old Style", "Songti SC", serif;
+   --text-xs: 12px;
+@@ -436,6 +444,7 @@ input {
+ .mobile-day-column.compact .mobile-day-event {
+   left: 2px;
+   right: 2px;
++  min-height: 8px;
+   border-radius: 999px;
  }
- 
- .timeline-tooltip-meta span {
-@@ -629,9 +628,8 @@ input {
-   font-size: 11px;
-   line-height: var(--leading-snug);
-   font-weight: 500;
--  white-space: nowrap;
--  overflow: hidden;
--  text-overflow: ellipsis;
-+  white-space: normal;
-+  word-break: break-word;
+
+@@ -1444,3 +1453,1163 @@ input {
+     margin-bottom: 12px;
+   }
  }
- 
- .event-block-title-row {
-@@ -648,7 +646,7 @@ input {
-   line-height: 1.45;
-   color: var(--text);
-   display: -webkit-box;
--  -webkit-line-clamp: 2;
-+  -webkit-line-clamp: 3;
-   -webkit-box-orient: vertical;
-   overflow: hidden;
-   font-weight: 600;
-@@ -670,10 +668,8 @@ input {
-   font-size: 11px;
-   line-height: 1.4;
-   color: rgba(49, 64, 90, 0.7);
--  display: -webkit-box;
--  -webkit-line-clamp: 2;
--  -webkit-box-orient: vertical;
--  overflow: hidden;
++
++/* Cyberboss personal archive shell --------------------------------------- */
++
++.personal-app .page {
++  padding-bottom: 128px;
++}
++
++.personal-page {
++  position: relative;
++  z-index: 1;
++  width: min(760px, calc(100vw - 24px));
++  min-height: 100vh;
++  margin: 0 auto;
++  padding: 34px 0 136px;
++}
++
++.personal-page-header {
++  display: grid;
++  justify-items: center;
++  gap: 4px;
++  margin: 0 0 26px;
++  text-align: center;
++}
++
++.personal-page-header h1 {
++  margin: 0;
++  color: var(--ink);
++  font-family: var(--font-serif);
++  font-size: clamp(38px, 8vw, 58px);
++  font-weight: 500;
++  line-height: 1.05;
++  letter-spacing: 0.04em;
++}
++
++.personal-page-header p {
++  margin: 0;
++  color: var(--ink-2);
++  font-family: "Snell Roundhand", "Apple Chancery", "URW Chancery L", "Iowan Old Style", serif;
++  font-size: clamp(23px, 6vw, 34px);
++  line-height: 1.1;
++}
++
++.personal-bottom-nav {
++  position: fixed;
++  z-index: 100;
++  left: 50%;
++  bottom: max(14px, env(safe-area-inset-bottom));
++  display: grid;
++  grid-template-columns: repeat(3, minmax(0, 1fr));
++  width: min(440px, calc(100vw - 28px));
++  padding: 7px;
++  border: 1px solid color-mix(in oklch, var(--rule) 66%, transparent);
++  border-radius: 24px;
++  background: color-mix(in oklch, var(--paper-2) 90%, transparent);
++  box-shadow: 0 12px 34px oklch(0.3 0.02 55 / 0.13), 0 2px 8px oklch(0.3 0.02 55 / 0.05);
++  backdrop-filter: blur(18px);
++  transform: translateX(-50%);
++}
++
++.personal-nav-item {
++  display: grid;
++  justify-items: center;
++  gap: 3px;
++  padding: 8px 10px 7px;
++  border: 0;
++  border-radius: 18px;
++  color: var(--ink-2);
++  background: transparent;
++  cursor: pointer;
++  transition: color 160ms ease, background 160ms ease, box-shadow 160ms ease;
++}
++
++.personal-nav-item svg {
++  width: 20px;
++  height: 20px;
++}
++
++.personal-nav-item span {
++  font-size: 12px;
++  line-height: 1;
++}
++
++.personal-nav-item[data-active="true"] {
++  color: var(--accent);
++  background: color-mix(in oklch, var(--paper-2) 90%, white 10%);
++  box-shadow: 0 4px 14px oklch(0.3 0.02 55 / 0.08);
++}
++
++.personal-page-message {
++  display: grid;
++  min-height: 220px;
++  place-items: center;
++  border: 1px solid var(--rule-soft);
++  border-radius: 20px;
++  color: var(--ink-3);
++  background-color: var(--paper-2);
++  background-image: var(--paper-grain);
++  background-size: var(--paper-grain-size);
++}
++
++.sr-only {
++  position: absolute;
++  width: 1px;
++  height: 1px;
++  padding: 0;
++  margin: -1px;
++  overflow: hidden;
++  clip: rect(0, 0, 0, 0);
++  white-space: nowrap;
++  border: 0;
++}
++
++/* Diary ------------------------------------------------------------------ */
++
++.diary-date-controls {
++  display: grid;
++  grid-template-columns: minmax(100px, 1fr) minmax(200px, 1.35fr) minmax(100px, 1fr);
++  gap: 10px;
++  margin-bottom: 18px;
++}
++
++.diary-date-controls button,
++.diary-date-select {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 8px;
++  min-height: 44px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: color-mix(in oklch, var(--paper-2) 88%, transparent);
++  box-shadow: 0 3px 10px oklch(0.3 0.02 55 / 0.04);
++}
++
++.diary-date-controls button {
++  cursor: pointer;
++}
++
++.diary-date-controls button:disabled {
++  color: var(--ink-4);
++  cursor: default;
++  box-shadow: none;
++}
++
++.diary-date-select select {
++  min-width: 0;
++  border: 0;
++  outline: 0;
++  color: var(--ink);
++  background: transparent;
++  cursor: pointer;
++}
++
++.diary-paper {
++  position: relative;
++  overflow: hidden;
++  padding: clamp(28px, 6vw, 54px);
++  border: 1px solid var(--rule-soft);
++  border-radius: 24px;
++  background-color: var(--paper-2);
++  background-image: var(--paper-grain);
++  background-size: var(--paper-grain-size);
++  box-shadow: var(--shadow);
++}
++
++.diary-paper::before {
++  position: absolute;
++  inset: 0;
++  content: "";
++  pointer-events: none;
++  background: linear-gradient(135deg, oklch(1 0 0 / 0.2), transparent 44%);
++}
++
++.diary-paper-header,
++.diary-body {
++  position: relative;
++  z-index: 1;
++}
++
++.diary-paper-header {
++  display: grid;
++  justify-items: center;
++  gap: 12px;
++  margin-bottom: 30px;
++  text-align: center;
++}
++
++.diary-paper-header p {
++  margin: 0;
++  color: var(--ink-2);
++  font-size: 13px;
++  letter-spacing: 0.06em;
++}
++
++.diary-paper-header h1 {
++  margin: 0;
++  color: var(--ink);
++  font-family: var(--font-serif);
++  font-size: clamp(26px, 6vw, 38px);
++  font-weight: 500;
++  line-height: 1.3;
++}
++
++.diary-flourish {
++  color: color-mix(in oklch, var(--accent) 46%, var(--ink-4));
++  font-size: 26px;
++}
++
++.diary-body {
++  color: var(--ink);
++  font-family: var(--font-serif);
++  font-size: 16px;
++  line-height: 1.95;
++}
++
++.diary-body h2 {
++  margin: 32px 0 12px;
++  color: var(--ink);
++  font-size: 21px;
++  font-weight: 600;
++}
++
++.diary-body h2:first-child {
++  margin-top: 0;
++}
++
++.diary-body p {
++  margin: 0 0 20px;
++  white-space: pre-wrap;
++}
++
++.diary-body ul {
++  margin: 0 0 20px;
++  padding-left: 1.35em;
++}
++
++/* Memory ----------------------------------------------------------------- */
++
++.memory-tab-group {
++  display: grid;
++  grid-template-columns: repeat(3, minmax(0, 1fr));
++  gap: 2px;
++  margin-bottom: 16px;
++  padding: 5px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  background: var(--paper-edge);
++}
++
++.memory-tab-group button {
++  min-height: 42px;
++  border: 0;
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: transparent;
++  cursor: pointer;
++  font-size: 14px;
++  letter-spacing: 0.01em;
++  transition: color 160ms ease, background 160ms ease, box-shadow 160ms ease;
++}
++
++.memory-tab-group button[data-active="true"] {
++  color: var(--ink);
++  background: var(--paper-2);
++  box-shadow: 0 3px 12px oklch(0.3 0.02 55 / 0.08);
++}
++
++.memory-toolbar {
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) auto;
++  gap: 10px;
++}
++
++.memory-search,
++.memory-sort {
++  display: flex;
++  align-items: center;
++  min-height: 46px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 16px;
++  color: var(--ink-3);
++  background: color-mix(in oklch, var(--paper-2) 88%, transparent);
++}
++
++.memory-search {
++  gap: 10px;
++  padding: 0 15px;
++}
++
++.memory-search svg {
++  width: 19px;
++  height: 19px;
++  flex: none;
++}
++
++.memory-search input,
++.memory-sort select {
++  min-width: 0;
++  border: 0;
++  outline: 0;
++  color: var(--ink);
++  background: transparent;
++}
++
++.memory-search input {
++  width: 100%;
++}
++
++.memory-search input::placeholder {
++  color: var(--ink-3);
++}
++
++.memory-sort {
++  padding: 0 12px;
++}
++
++.memory-sort select {
++  cursor: pointer;
++}
++
++.memory-count-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 14px;
++  min-height: 54px;
++  padding: 0 4px;
++  color: var(--ink-2);
++  font-size: 13px;
++}
++
++.memory-count-row span {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++}
++
++.memory-card-list {
++  display: grid;
++  gap: 14px;
++}
++
++.memory-load-more {
++  display: block;
++  min-width: 150px;
++  min-height: 42px;
++  margin: 20px auto 0;
++  padding: 0 24px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: color-mix(in oklch, var(--paper-2) 88%, transparent);
++  box-shadow: 0 4px 14px oklch(0.3 0.02 55 / 0.05);
++  cursor: pointer;
++}
++
++.memory-card {
++  --memory-card-tint: var(--cat-work);
++  position: relative;
++  padding: 19px 20px 18px;
++  border: 1px solid color-mix(in oklch, var(--memory-card-tint) 46%, var(--rule-soft));
++  border-radius: 18px;
++  background-color: color-mix(in oklch, var(--paper-2) 91%, var(--memory-card-tint) 9%);
++  background-image: var(--paper-grain);
++  background-size: var(--paper-grain-size);
++  box-shadow: 0 7px 18px oklch(0.3 0.02 55 / 0.05);
++}
++
++.memory-card[data-tone="1"] { --memory-card-tint: var(--cat-study); }
++.memory-card[data-tone="2"] { --memory-card-tint: var(--cat-care); }
++.memory-card[data-tone="3"] { --memory-card-tint: var(--cat-social); }
++.memory-card[data-tone="4"] { --memory-card-tint: var(--cat-rest); }
++
++.memory-card-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++}
++
++.memory-type-chip,
++.memory-private-chip {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  width: fit-content;
++  padding: 4px 10px;
++  border: 1px solid color-mix(in oklch, var(--memory-card-tint) 62%, var(--rule-soft));
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: color-mix(in oklch, var(--paper-2) 74%, var(--memory-card-tint) 26%);
++  font-size: 12px;
++  line-height: 1;
++}
++
++.memory-delete-button {
++  display: grid;
++  width: 34px;
++  height: 34px;
++  flex: none;
++  place-items: center;
++  border: 1px solid var(--rule-soft);
++  border-radius: 11px;
++  color: var(--ink-3);
++  background: color-mix(in oklch, var(--paper-2) 84%, transparent);
++  cursor: pointer;
++  transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
++}
++
++.memory-delete-button:hover {
++  border-color: color-mix(in oklch, #b95e57 42%, var(--rule-soft));
++  color: #9e4b45;
++  background: color-mix(in oklch, var(--paper-2) 88%, #f2d3cf 12%);
++}
++
++.memory-card h2 {
++  margin: 8px 0 2px;
++  color: var(--ink);
++  font-family: var(--font-serif);
++  font-size: 20px;
++  font-weight: 600;
++  line-height: 1.45;
++}
++
++.memory-card time {
++  display: block;
++  color: var(--ink-3);
++  font-size: 12px;
++}
++
++.memory-card > p {
++  display: -webkit-box;
++  margin: 10px 0 0;
++  overflow: hidden;
++  color: var(--ink-2);
++  font-size: 14px;
++  line-height: 1.7;
 +  white-space: pre-wrap;
 +  word-break: break-word;
-   margin-top: 2px;
- }
- 
-@@ -802,12 +798,13 @@ input {
-   border-width: 0;
-   border-radius: 10px;
-   color: var(--item-text) !important;
--  padding: 2px 5px;
-+  padding: 4px 8px;
-   font-family: var(--font-sans);
-   font-size: 12px;
--  line-height: 1.25;
++  -webkit-box-orient: vertical;
++  -webkit-line-clamp: 5;
++}
++
++.memory-private-chip {
++  margin-top: 12px;
++  border-color: color-mix(in oklch, var(--cat-social) 75%, var(--rule-soft));
++  color: var(--cat-social-ink);
++  background: color-mix(in oklch, var(--paper-2) 65%, var(--cat-social) 35%);
++}
++
++.memory-card footer {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 7px 14px;
++  margin-top: 12px;
++  color: var(--ink-3);
++  font-size: 11px;
++}
++
++.memory-card blockquote {
++  margin: 14px 0 0;
++  padding: 10px 12px;
++  border-left: 2px solid color-mix(in oklch, var(--memory-card-tint) 72%, var(--rule));
++  color: var(--ink-2);
++  background: color-mix(in oklch, var(--paper-2) 72%, transparent);
++  font-family: var(--font-serif);
++  font-size: 13px;
++  line-height: 1.65;
++}
++
++.memory-dialog-backdrop {
++  position: fixed;
++  z-index: 140;
++  inset: 0;
++  display: grid;
++  place-items: center;
++  padding: 20px;
++  background: oklch(0.2 0.01 45 / 0.24);
++  backdrop-filter: blur(5px);
++}
++
++.memory-dialog {
++  position: relative;
++  width: min(390px, 100%);
++  padding: 28px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 22px;
++  text-align: center;
++  background-color: var(--paper-2);
++  background-image: var(--paper-grain);
++  background-size: var(--paper-grain-size);
++  box-shadow: 0 26px 70px oklch(0.2 0.02 45 / 0.2);
++}
++
++.memory-dialog-close {
++  position: absolute;
++  top: 14px;
++  right: 14px;
++  display: grid;
++  width: 32px;
++  height: 32px;
++  place-items: center;
++  border: 0;
++  border-radius: 50%;
++  color: var(--ink-3);
++  background: transparent;
++  cursor: pointer;
++}
++
++.memory-dialog-icon {
++  display: grid;
++  width: 48px;
++  height: 48px;
++  margin: 0 auto 14px;
++  place-items: center;
++  border-radius: 50%;
++  color: #9e4b45;
++  background: color-mix(in oklch, var(--paper-2) 72%, #f2d3cf 28%);
++}
++
++.memory-dialog h2 {
++  margin: 0;
++  font-family: var(--font-serif);
++  font-size: 23px;
++  font-weight: 600;
++}
++
++.memory-dialog p {
++  margin: 12px 0 0;
++  color: var(--ink-2);
++}
++
++.memory-dialog small {
++  display: block;
++  margin-top: 8px;
++  color: var(--ink-3);
++  line-height: 1.5;
++}
++
++.memory-dialog .memory-dialog-error {
++  color: #9e4b45;
++  font-size: 13px;
++}
++
++.memory-dialog-actions {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  gap: 10px;
++  margin-top: 22px;
++}
++
++.memory-dialog-actions button {
++  min-height: 42px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: var(--paper-2);
++  cursor: pointer;
++}
++
++.memory-dialog-actions button.danger {
++  border-color: color-mix(in oklch, #b95e57 38%, var(--rule-soft));
++  color: #8f433e;
++  background: color-mix(in oklch, var(--paper-2) 82%, #f2d3cf 18%);
++}
++
++.memory-dialog-actions button:disabled,
++.memory-dialog-close:disabled {
++  opacity: 0.55;
++  cursor: default;
++}
++
++@media (max-width: 720px) {
++  .personal-page {
++    padding-top: 20px;
++  }
++
++  .personal-page-header {
++    margin-bottom: 20px;
++  }
++
++  .diary-date-controls {
++    grid-template-columns: 1fr 1.3fr 1fr;
++    gap: 7px;
++  }
++
++  .diary-date-controls button,
++  .diary-date-select {
++    min-height: 42px;
++    font-size: 12px;
++  }
++
++  .diary-date-controls button {
++    gap: 3px;
++    padding: 0 7px;
++  }
++
++  .diary-date-select {
++    padding: 0 8px;
++  }
++
++  .diary-date-select svg {
++    display: none;
++  }
++
++  .diary-date-select select {
++    width: 100%;
++    font-size: 12px;
++    text-align: center;
++  }
++
++  .diary-paper {
++    padding: 28px 22px 34px;
++    border-radius: 20px;
++  }
++
++  .diary-body {
++    font-size: 15px;
++    line-height: 1.9;
++  }
++
++  .memory-toolbar {
++    grid-template-columns: 1fr;
++  }
++
++  .memory-sort {
++    justify-content: flex-end;
++    min-height: 34px;
++    border: 0;
++    background: transparent;
++  }
++
++  .memory-card {
++    padding: 17px 17px 16px;
++  }
++
++  .memory-card h2 {
++    font-size: 18px;
++  }
++}
++
++/* Personal archive refinement -------------------------------------------- */
++
++.personal-page-header {
++  gap: 6px;
++  margin-bottom: 22px;
++}
++
++.personal-page-header h1 {
++  font-size: clamp(34px, 8vw, 48px);
++  font-weight: 400;
++  letter-spacing: 0.08em;
++}
++
++.personal-page-header p {
++  color: var(--ink-2);
++  font-family: "Snell Roundhand", "Apple Chancery", "STKaiti", "KaiTi", "Iowan Old Style", cursive;
++  font-size: clamp(21px, 5vw, 29px);
++  font-style: italic;
++  letter-spacing: 0.025em;
++}
++
++.personal-bottom-nav {
++  width: min(196px, calc(100vw - 34px));
++  padding: 5px;
++  border-radius: 20px;
++  background: color-mix(in oklch, var(--paper-2) 84%, transparent);
++  box-shadow: 0 9px 24px oklch(0.3 0.02 55 / 0.11), 0 1px 5px oklch(0.3 0.02 55 / 0.04);
++}
++
++.personal-nav-item {
++  position: relative;
++  gap: 0;
++  padding: 8px 9px;
++  border-radius: 14px;
++  transition: color 160ms ease;
++}
++
++.personal-nav-item span {
++  display: none;
++}
++
++.personal-nav-item svg {
++  width: 19px;
++  height: 19px;
++}
++
++.personal-nav-item:hover,
++.personal-nav-item:active,
++.personal-nav-item[data-active="true"] {
++  background: transparent;
++  box-shadow: none;
++  transform: none;
++}
++
++.personal-nav-item[data-active="true"] {
++  color: var(--accent);
++}
++
++.personal-nav-item[data-active="true"]::after {
++  position: absolute;
++  bottom: 3px;
++  left: 50%;
++  width: 4px;
++  height: 4px;
++  border-radius: 50%;
++  content: "";
++  background: currentColor;
++  transform: translateX(-50%);
++}
++
++.diary-date-controls button,
++.diary-date-select {
++  min-height: 40px;
++  font-size: 13px;
++}
++
++.diary-date-select select {
++  font-size: 13px;
++}
++
++.diary-paper-header {
++  gap: 9px;
++  margin-bottom: 24px;
++}
++
++.diary-paper-header h1 {
++  font-size: clamp(24px, 5.5vw, 34px);
++  font-weight: 400;
++}
++
++.diary-body {
++  color: var(--ink-2);
++  font-size: 14px;
++  font-weight: 400;
++  line-height: 1.78;
++}
++
++.diary-body h2 {
++  margin: 25px 0 9px;
++  color: var(--ink);
++  font-size: 18px;
++  font-weight: 500;
++}
++
++.diary-body p {
++  margin-bottom: 16px;
++}
++
++.memory-tab-group button {
++  min-height: 38px;
++  font-size: 13px;
++}
++
++.memory-search,
++.memory-sort {
++  min-height: 42px;
++}
++
++.memory-search input,
++.memory-sort select {
++  font-size: 13px;
++}
++
++.memory-count-row {
++  min-height: 48px;
++  font-size: 12px;
++}
++
++.memory-card {
++  padding: 16px 17px 15px;
++  border-color: color-mix(in oklch, var(--memory-card-tint) 62%, var(--rule-soft));
++  background-color: color-mix(in oklch, var(--memory-card-tint) 18%, var(--paper-2));
++}
++
++.memory-card[data-tone="0"] { --memory-card-tint: var(--cat-work); }
++.memory-card[data-tone="1"] { --memory-card-tint: var(--cat-study); }
++.memory-card[data-tone="2"] { --memory-card-tint: var(--cat-entertainment); }
++.memory-card[data-tone="3"] { --memory-card-tint: var(--cat-social); }
++.memory-card[data-tone="4"] { --memory-card-tint: var(--cat-exercise); }
++
++.memory-type-chip,
++.memory-private-chip {
++  padding: 3px 9px;
++  font-size: 11px;
++}
++
++.memory-card h2 {
++  margin-top: 7px;
++  font-size: 18px;
++  font-weight: 500;
 +  line-height: 1.35;
-   font-weight: 500;
-   box-shadow: none;
-+  height: auto !important;
- }
- 
- .timeline-canvas .vis-item.cat-life,
-@@ -865,6 +862,8 @@ input {
- .timeline-canvas .vis-item .vis-item-overflow {
-   color: var(--item-text) !important;
-   padding: 0;
-+  white-space: normal;
-+  word-break: break-word;
- }
- 
- .trend-bar-label {
++}
++
++.memory-card > p {
++  margin-top: 8px;
++  color: var(--ink-2);
++  font-size: 13px;
++  line-height: 1.6;
++}
++
++.memory-delete-button {
++  width: 31px;
++  height: 31px;
++  border-radius: 10px;
++}
++
++@media (max-width: 720px) {
++  .personal-page-header {
++    margin-bottom: 17px;
++  }
++
++  .diary-date-controls button,
++  .diary-date-select {
++    min-height: 38px;
++  }
++
++  .diary-body {
++    font-size: 14px;
++    line-height: 1.76;
++  }
++
++  .diary-paper {
++    padding: 25px 20px 30px;
++  }
++}
++
++/* Final touch: quiet mobile interactions and tighter archive rhythm. */
++.personal-app button,
++.personal-app select,
++.personal-app input,
++.personal-nav-item {
++  -webkit-tap-highlight-color: transparent;
++}
++
++.personal-app button:focus,
++.personal-app select:focus,
++.personal-app input:focus {
++  outline: none;
++}
++
++.personal-app button:focus:not(:focus-visible) {
++  background: transparent;
++}
++
++.personal-page-header h1 {
++  font-size: clamp(30px, 7vw, 42px);
++}
++
++.personal-page-header p {
++  font-size: clamp(18px, 4.5vw, 25px);
++}
++
++.personal-nav-item[data-active="true"] {
++  color: #c77d90;
++}
++
++.diary-body {
++  font-size: 13px;
++  line-height: 1.72;
++}
++
++.diary-body h2 {
++  margin: 21px 0 7px;
++  font-size: 16px;
++  line-height: 1.35;
++}
++
++.memory-card {
++  padding: 13px 14px 12px;
++}
++
++.memory-card h2 {
++  font-size: 16px;
++  line-height: 1.3;
++}
++
++.memory-card > p {
++  margin-top: 6px;
++  font-size: 12px;
++  line-height: 1.52;
++}
++
++.memory-type-chip,
++.memory-private-chip {
++  padding: 3px 8px;
++  font-size: 10px;
++}
++
++.memory-delete-button {
++  width: 29px;
++  height: 29px;
++}
++
++@media (max-width: 720px) {
++  .diary-body {
++    font-size: 13px;
++    line-height: 1.7;
++  }
++}
++
++.memory-card {
++  cursor: pointer;
++  transition: transform 160ms ease, box-shadow 160ms ease;
++}
++
++.memory-card:hover,
++.memory-card:focus-visible {
++  transform: translateY(-1px);
++  box-shadow: 0 8px 22px oklch(0.3 0.02 55 / 0.08);
++  outline: none;
++}
++
++.memory-detail-backdrop {
++  position: fixed;
++  z-index: 145;
++  inset: 0;
++  display: flex;
++  align-items: flex-end;
++  justify-content: center;
++  padding: 0;
++  background: oklch(0.2 0.01 45 / 0.18);
++  backdrop-filter: blur(4px);
++}
++
++.memory-detail-sheet {
++  position: relative;
++  width: min(620px, 100%);
++  max-height: min(78vh, 680px);
++  overflow: auto;
++  padding: 14px 22px 26px;
++  border: 1px solid var(--rule-soft);
++  border-bottom: 0;
++  border-radius: 24px 24px 0 0;
++  background-color: var(--paper-2);
++  background-image: var(--paper-grain);
++  background-size: var(--paper-grain-size);
++  box-shadow: 0 -16px 48px oklch(0.2 0.02 45 / 0.16);
++  animation: memory-sheet-rise 220ms ease-out;
++}
++
++.memory-detail-grabber {
++  width: 38px;
++  height: 4px;
++  margin: 0 auto 18px;
++  border-radius: 999px;
++  background: color-mix(in oklch, var(--ink-3) 35%, transparent);
++}
++
++.memory-detail-sheet .memory-dialog-close {
++  top: 12px;
++  right: 16px;
++}
++
++.memory-detail-sheet > .memory-type-chip {
++  display: inline-flex;
++}
++
++.memory-detail-sheet h2 {
++  margin: 12px 40px 0 0;
++  color: var(--ink);
++  font-family: var(--font-serif);
++  font-size: 22px;
++  font-weight: 500;
++  line-height: 1.35;
++}
++
++.memory-detail-sheet time {
++  display: block;
++  margin-top: 7px;
++  color: var(--ink-3);
++  font-size: 12px;
++}
++
++.memory-detail-description {
++  margin: 14px 0 0;
++  color: var(--ink-2);
++  font-size: 13px;
++  line-height: 1.65;
++}
++
++.memory-detail-content {
++  margin-top: 16px;
++  color: var(--ink-2);
++  white-space: pre-wrap;
++  font-size: 14px;
++  line-height: 1.8;
++}
++
++.memory-detail-sheet blockquote {
++  margin: 16px 0 0;
++  padding: 10px 12px;
++  border-left: 2px solid var(--accent-soft);
++  color: var(--ink-2);
++  font-family: var(--font-serif);
++  font-size: 13px;
++  line-height: 1.65;
++}
++
++.memory-review-actions {
++  display: grid;
++  grid-template-columns: 1fr 1.4fr;
++  gap: 10px;
++  margin-top: 22px;
++}
++
++.memory-review-actions button {
++  min-height: 40px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: var(--paper-2);
++  cursor: pointer;
++}
++
++.memory-review-actions button.approve {
++  border-color: color-mix(in oklch, #c77d90 42%, var(--rule-soft));
++  color: #9b5268;
++  background: color-mix(in oklch, var(--paper-2) 80%, #f1d4dc 20%);
++}
++
++.memory-review-actions button:disabled {
++  opacity: 0.55;
++  cursor: default;
++}
++
++@keyframes memory-sheet-rise {
++  from { transform: translateY(18px); opacity: 0.7; }
++  to { transform: translateY(0); opacity: 1; }
++}
++
++/* Keep archive navigation fixed while reserving room beneath every page. */
++.personal-app {
++  min-height: 100vh;
++  padding-bottom: 0;
++}
++
++.personal-app .page {
++  padding-bottom: calc(80px + env(safe-area-inset-bottom));
++}
++
++.personal-page {
++  min-height: auto;
++  padding-bottom: calc(86px + env(safe-area-inset-bottom));
++}
++
++.personal-bottom-nav {
++  position: fixed;
++  z-index: 100;
++  left: 0;
++  bottom: 0;
++  width: 100%;
++  height: calc(58px + env(safe-area-inset-bottom));
++  min-height: calc(58px + env(safe-area-inset-bottom));
++  margin: 0;
++  padding: 6px max(12px, calc((100vw - 220px) / 2)) calc(6px + env(safe-area-inset-bottom));
++  border: 0;
++  border-top: 1px solid color-mix(in oklch, var(--rule) 66%, transparent);
++  border-radius: 0;
++  background: color-mix(in oklch, var(--paper-2) 94%, transparent);
++  box-shadow: 0 -8px 24px oklch(0.3 0.02 55 / 0.08);
++  transform: none;
++}
++
++.personal-nav-item {
++  height: auto;
++  min-height: 0;
++}
++
++.memory-detail-backdrop,
++.memory-dialog-backdrop {
++  bottom: calc(58px + env(safe-area-inset-bottom));
++}
++
++body[data-personal-route="timeline"] #personal-root,
++.personal-app.personal-route-timeline {
++  height: 0;
++  min-height: 0;
++}
++
++body[data-personal-route="timeline"] #root .page-mobile {
++  padding-bottom: calc(80px + env(safe-area-inset-bottom));
++}
++
++body[data-personal-route="timeline"] .mobile-event-dialog-backdrop {
++  bottom: calc(58px + env(safe-area-inset-bottom));
++}
++
++/* Remove browser-native blue interaction highlights across every route. */
++html,
++body,
++body * {
++  -webkit-tap-highlight-color: transparent;
++}
++
++button,
++a,
++input,
++select,
++[role="button"],
++[tabindex] {
++  outline: none;
++}
++
++button:focus,
++a:focus,
++input:focus,
++select:focus,
++[role="button"]:focus,
++[tabindex]:focus {
++  outline: none;
++  box-shadow: none;
++}
++
++::selection {
++  color: inherit;
++  background: transparent;
++}
++
++/* Match archive titles to the mobile timeline and simplify diary date paging. */
++.personal-page-header p {
++  color: var(--ink);
++  font-family: "Snell Roundhand", "Apple Chancery", "URW Chancery L", "Iowan Old Style", serif;
++  font-size: 24px;
++  font-style: normal;
++  font-weight: 500;
++  line-height: 1;
++  letter-spacing: 0;
++  white-space: nowrap;
++}
++
++.diary-date-controls {
++  grid-template-columns: 1fr 0.9fr 1fr;
++  gap: 2px;
++  padding: 3px;
++  border: 1px solid var(--rule-soft);
++  border-radius: 999px;
++  background: var(--paper-edge);
++}
++
++.diary-date-controls button,
++.diary-date-select {
++  min-height: 38px;
++  border: 0;
++  border-radius: 999px;
++  background: transparent;
++  box-shadow: none;
++}
++
++.diary-date-select {
++  background: var(--paper-2);
++  box-shadow: 0 3px 12px oklch(0.3 0.02 55 / 0.08);
++}
++
++.diary-date-select select {
++  width: 100%;
++  text-align: center;
++  text-align-last: center;
++}
+diff --git a/node_modules/timeline-for-agent/src/timeline/personal-dashboard-app.jsx b/node_modules/timeline-for-agent/src/timeline/personal-dashboard-app.jsx
+new file mode 100644
+index 0000000..0c8466e
+--- /dev/null
++++ b/node_modules/timeline-for-agent/src/timeline/personal-dashboard-app.jsx
+@@ -0,0 +1,11 @@
++import "./css/dashboard.css";
++
++import React from "react";
++import { createRoot } from "react-dom/client";
++
++import { PersonalDashboardApp } from "./components/personal/PersonalDashboardApp.jsx";
++
++const mountNode = document.getElementById("personal-root");
++if (mountNode) {
++  createRoot(mountNode).render(<PersonalDashboardApp />);
++}

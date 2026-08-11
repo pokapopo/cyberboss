@@ -178,6 +178,9 @@ function createHost() {
             pendingObservations: [{ id: "obs-1" }],
           };
         },
+        async patchEvent(args) {
+          return { date: args.date, event: { id: args.eventId, ...args.patch } };
+        },
         async read(args) {
           return {
             data: {
@@ -318,6 +321,19 @@ test("tool host captures incomplete observations and reconciles through the auth
   assert.match(inspected.text, /1 pending observations/);
 });
 
+test("tool host exposes a verified fast path for one stable timeline event", async () => {
+  const host = createHost();
+  const result = await host.invokeTool("cyberboss_timeline_patch_event", {
+    date: "2026-08-08",
+    eventId: "evt-code",
+    patch: { startAt: "2026-08-08T13:00:00.000Z" },
+  }, {});
+
+  assert.match(result.text, /corrected, verified, and dashboard rebuilt/);
+  assert.equal(result.data.event.id, "evt-code");
+  assert.equal(result.data.event.startAt, "2026-08-08T13:00:00.000Z");
+});
+
 test("low-level timeline write automatically rebuilds the Chinese dashboard", async () => {
   const host = createHost();
   const result = await host.invokeTool("cyberboss_timeline_write", {
@@ -451,6 +467,7 @@ test("tool host descriptions include schema summary for models that only surface
   const timelineWrite = host.listTools().find((tool) => tool.name === "cyberboss_timeline_write");
   const timelineCapture = host.listTools().find((tool) => tool.name === "cyberboss_timeline_capture");
   const timelineReconcile = host.listTools().find((tool) => tool.name === "cyberboss_timeline_reconcile");
+  const timelinePatch = host.listTools().find((tool) => tool.name === "cyberboss_timeline_patch_event");
   const diaryAppend = host.listTools().find((tool) => tool.name === "cyberboss_diary_append");
   assert.match(timelineWrite.description, /Input:/);
   assert.match(timelineWrite.description, /date: string/);
@@ -461,10 +478,12 @@ test("tool host descriptions include schema summary for models that only surface
   assert.match(timelineReconcile.description, /authoritative conversational timeline maintenance path/);
   assert.match(timelineReconcile.description, /observationIds/);
   assert.match(timelineReconcile.description, /automatically rebuild the Chinese dashboard/);
+  assert.match(timelinePatch.description, /Fast path/);
   assert.match(diaryAppend.description, /raw timestamped fragment/i);
   assert.match(diaryAppend.description, /at most four natural time-period sections/i);
   assert.match(diaryAppend.description, /exact standalone `## CC 的想法` section/);
   assert.match(diaryAppend.description, /Do not depend on recalled memory/);
+  assert.match(diaryAppend.description, /hard end-of-day marker/);
   const diaryFinalize = host.listTools().find((tool) => tool.name === "cyberboss_diary_finalize");
   assert.match(diaryFinalize.description, /validate/i);
   assert.match(diaryFinalize.description, /does not send/i);

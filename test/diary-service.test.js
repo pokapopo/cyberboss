@@ -35,7 +35,7 @@ test("final diary validation enforces the canonical structural gate", () => {
   }
 });
 
-test("style, short sections, and reflection ordering produce warnings without blocking", () => {
+test("style and short sections produce warnings without blocking", () => {
   const markdown = [
     "## 晚上",
     "",
@@ -44,18 +44,37 @@ test("style, short sections, and reflection ordering produce warnings without bl
     "## CC 的想法",
     "",
     "我在。",
-    "",
-    "## 夜里",
-    "",
-    "晚安。",
   ].join("\n");
 
   const result = validateFinalDiaryMarkdown(markdown);
   assert.equal(result.markdown, `${markdown}\n`);
-  assert.equal(result.warnings.length, 4);
+  assert.equal(result.warnings.length, 2);
   assert.match(result.warnings.join(" "), /不是…而是/);
-  assert.match(result.warnings.join(" "), /Prefer placing/);
   assert.match(result.warnings.join(" "), /very short/);
+});
+
+test("final diary validation rejects any section after CC's reflection", () => {
+  const markdown = `${VALID_FINAL}\n\n## 又写了一段\n\n这段不该接在收尾后面。`;
+  assert.throws(() => validateFinalDiaryMarkdown(markdown), /must be the final section/);
+});
+
+test("append rolls forward instead of writing after a finalized reflection", async () => {
+  const diaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-diary-rollover-"));
+  const closedPath = path.join(diaryDir, "2026-08-08.md");
+  const nextPath = path.join(diaryDir, "2026-08-09.md");
+  fs.writeFileSync(closedPath, `${VALID_FINAL}\n`, "utf8");
+  const service = new DiaryService({ config: { diaryDir } });
+
+  const result = await service.append({
+    date: "2026-08-08",
+    time: "00:20",
+    text: "收尾后的新内容应该属于下一天。",
+  });
+
+  assert.equal(result.date, "2026-08-09");
+  assert.equal(result.rolledOverFrom, "2026-08-08");
+  assert.equal(fs.readFileSync(closedPath, "utf8"), `${VALID_FINAL}\n`);
+  assert.match(fs.readFileSync(nextPath, "utf8"), /^## 00:20\n\n收尾后的新内容/);
 });
 
 test("finalize rejects invalid input without changing the diary file", async () => {

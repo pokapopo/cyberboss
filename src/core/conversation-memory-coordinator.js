@@ -43,6 +43,12 @@ class ConversationMemoryCoordinator {
     }
     const state = this.getScope(normalizedScope);
     state.userTurnNumber += 1;
+    let recent = [];
+    try {
+      recent = this.memoryService.searchRecent?.(normalizedText, { topK: 3 }) || [];
+    } catch (error) {
+      this.logError("recent recall", error);
+    }
     const decision = decideTopicRecall(state, normalizedText, {
       recallEveryTurns: this.recallEveryTurns,
     });
@@ -51,7 +57,7 @@ class ConversationMemoryCoordinator {
     state.lastUserText = normalizedText;
 
     if (!decision.shouldRecall) {
-      return takeNotices(state);
+      return { ...takeNotices(state), recent };
     }
     state.userTurnsSinceRecall = 0;
     try {
@@ -62,12 +68,13 @@ class ConversationMemoryCoordinator {
       });
       return {
         recalled: selectMemoriesForInjection(matches, state, decision.reason),
+        recent,
         notices: takeNotices(state).notices,
         reason: decision.reason,
       };
     } catch (error) {
       this.logError("recall", error);
-      return takeNotices(state);
+      return { ...takeNotices(state), recent };
     }
   }
 
@@ -282,13 +289,14 @@ function takeNotices(state) {
   const notices = state.notices.splice(0, 5);
   return {
     recalled: [],
+    recent: [],
     notices,
     reason: "",
   };
 }
 
 function emptyMemoryContext() {
-  return { recalled: [], notices: [], reason: "" };
+  return { recalled: [], recent: [], notices: [], reason: "" };
 }
 
 function clampInteger(value, min, max, fallback) {
