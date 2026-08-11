@@ -1,131 +1,29 @@
 # cyberboss-app
 
-## 进程架构
+## 多 Agent 协作入口
 
-```
-shared-start.js (守护进程)
-  └─ spawn → bin/cyberboss.js start (主进程)
-       └─ spawn → claude.exe (运行时子进程)
+开始任何项目任务前，先阅读 `.agent-coordination/README.md`、`STATUS.md`、`DECISIONS.md`、双方的 `handoffs/` 文件以及相关 `tasks/` 文件。CC 维护 `handoffs/claude.md`；完成、暂停或阻塞时同步更新任务文件、自己的 handoff 和 `STATUS.md`。共享目录不得记录密码、Token、Cookie 或 `.env` 内容。
 
-WeChat LongPoll
-  → ChannelAdapter (src/adapters/channel/weixin/)
-    → CyberbossApp (src/core/app.js)
-      → TurnGateStore (src/core/turn-gate-store.js)
-        → process-client.js → claude.exe
-```
+## 架构
 
-- `shared-start.js`：看门狗，主进程退出后自动重启。只在启动时调 `ensureBridgeNotRunning()` 清理孤儿进程。
-- 主进程：写 PID 到 `~/.cyberboss/cyberboss.pid`，**仅用于外部查询，不做自动杀旧进程**。
-- claude 子进程：由 `process-client.js` 管理生命周期。
+详细架构见 memory: `project-architecture`。要点：`shared-start.js` 守护主进程，主进程写 PID 仅用于外部查询不杀旧进程，claude 子进程由 `process-client.js` 管理。
 
----
+## 调试
 
-## 调试须知
-
-> 以下规则来自 MCP 自杀 bug 的实际排查教训（详见 memory: `bug-mcp-suicide-pid-kill`）：
-> MCP 子进程通过 `killStalePidIfSafe` 读出主进程 PID，`taskkill /F /T` 反杀。所有 JS error hook 跳过、crash.log 无记录、退出码 1。
-> 排查走了弯路——先花大量时间在 JS 层埋 checkpoint，但根因在系统进程层。以下规则就是为了避免重蹈覆辙。
-
-### Force-kill 特征识别（先于一切）
-
-看到这三个信号同时出现 → **进程被外部 force-kill，不是 JS bug**：
-1. 退出码 1
-2. crash handler 没触发（`uncaughtException` / `unhandledRejection` / `beforeExit` 全跳过）
-3. `setTimeout` / 异步回调没执行
-
-Windows 上 `taskkill /F /T /PID` 硬杀进程，所有异步回调、error hook、flush 操作全部跳过，进程直接消失。
-确认 force-kill 后 → 找谁发了 `taskkill`（查其他 Node 进程、`killStalePidIfSafe`、`killPidTree` 调用点）。
-
-### PID 文件只写不杀
-
-`src/index.js` 启动时不读旧 PID、不调 `killPidTree`。PID 文件（`~/.cyberboss/cyberboss.pid`）**仅用于外部查询**。
-
-历史上这里会杀旧进程，导致调试时两个实例互相 kill——一个实例的启动流程触发对另一个的 `taskkill /F /T`，被 kill 方静默消失。
-
-### 排查顺序（不可跳层）
-
-```
-1. 系统层（先查这里）
-   tasklist | findstr node
-   tasklist | findstr claude
-   type %USERPROFILE%\.cyberboss\cyberboss.pid
-
-2. 数据层
-   type %USERPROFILE%\.cyberboss\sessions.json
-
-3. JS层（最后查这里）
-   加同步 checkpoint 日志缩小范围（见下方）
-```
-
-### 同步 checkpoint 定位法
-
-crash 绕过所有 error hook 时，用 `fs.appendFileSync` 打点定位死亡窗口：
-
-```js
-const ck = (msg) => { try { require("fs").appendFileSync("D:/cyberboss-app/crash-ck.txt", `${Date.now()} ${msg}\n`); } catch {} };
-ck("checkpoint-label");
-```
-
-最后一个出现的 checkpoint 和下一个未出现的 checkpoint 之间的代码就是死亡区间。**必须同步写**——异步写在进程被杀前来不及 flush，日志为空。
-
-### Windows 注意事项
-
-- 杀进程只用 `taskkill /F /T /PID`，SIGTERM 无效
-- 调试时手动启动主进程，确认不会和 `shared-start.js` 冲突
-
----
-
-## 死循环规则
-
-**同一文件改了 3 次问题还在 → 立刻停，不许继续改代码。** 大概率根因不在这一层。
-
-停下来回答这三个问题：
-1. 我假设的根因是什么？有没有直接证据？
-2. 这个问题在哪一层？`[ ] JS逻辑层` `[ ] 系统进程层` `[ ] IPC通信层` `[ ] 配置/数据层`
-3. 我还没检查过什么？
-
-回答完再决定下一步。
-
----
+调试方法论已迁移至经验库（`cyberboss_experience_search`），遇到问题时先检索：
+- `force-kill-pattern-recognition` — 退出码1+无crash handler → 被外部强杀
+- `investigation-order` — 系统层→数据层→JS层，不可跳
+- `sync-checkpoint-method` — fs.appendFileSync 打点定位死亡区间
+- `dead-loop-rule` — 同文件改3次立刻停
+- `pid-file-read-only` — PID 文件只写不杀
+- `experience-record-workflow` — bug 修复后写入经验库的流程
 
 ## VS Code Remote ExtHost Watchdog
 
-```
-/root/scripts/claude-code-watchdog.sh
-```
-
-VS Code Remote-SSH 的第一个 Extension Host 可能因 workspace lock 竞争卡死——日志只有一行 "started"，连 `Lock acquired` 都没拿到。Watchdog 检测到 ExtHost 启动 90 秒后仍未获取 workspace lock 时，SIGKILL 触发 VS Code Server 重建，新进程通常能正常拿锁。
-
-### 运行方式
-
-`.bashrc` 中 `nohup` 启动，每次开 VS Code Remote 终端时自动拉起。脚本自带 PID 锁（`/tmp/claude-code-watchdog.lock`），保证只有一个实例。
-
-### 安全检查
-
-| 机制 | 说明 |
-|---|---|
-| PID 锁 | `LOCK_FILE` → 旧 PID 存活则静默退出，僵死则清理 |
-| `trap EXIT` | 退出时自动清锁文件 |
-| 宽限期 | 90s，给 VS Code 足够时间初始化 |
-| 冷却期 | 每次 kill 后 180s 冷却，等替换 ExtHost 启动 |
-| 上限 | 每个 watchdog 生命周期最多 kill 3 次 |
-| 去重 | 同一 PID 不重复 kill |
-| 目标范围 | 匹配 `bootstrap-fork.*extensionHost`，覆盖所有 VS Code Server ExtHost |
-| 健康判断 | 检查 `Lock acquired`（毫秒级拿锁），不用 `_doActivateExtension`（不点扩展图标激活数就是 0，但 ExtHost 完全正常）|
-
-### 常见问题
-
-**开了 18 个 watchdog 实例**（已修复）：
-- 根因：`.bashrc` 每次开 shell 都 `&` spawn，无防重复机制
-- 修法：脚本加 PID 锁 → 只有第一个实例存活，后续全部静默退出
-
-**ExtHost 崩溃 ≠ watchdog 干的**：
-- 先看 ExtHost 日志：`/root/.vscode-server/data/logs/<date>/exthostN/remoteexthost.log`
-- 搜 `Lock acquired` 看是否拿锁（健康 ExtHost 毫秒级拿锁，卡死的只有一行 `started`）
-- 搜 `Error` 看扩展自身报错
-- 如果日志里没有 `signal 9`/`SIGKILL`，就不是 watchdog 杀的
-
-### 手动管理
+`/root/scripts/claude-code-watchdog.sh` 守护 VS Code Remote-SSH ExtHost，卡死在 workspace lock 竞争时 90s 超时 SIGKILL 触发重建。故障排查与设计机制已入库（`cyberboss_experience_search`）：
+- `watchdog-design-mechanisms` — PID 锁、宽限期、冷却期、kill 上限、去重、目标范围、健康判断
+- `watchdog-18-instances-bashrc-spawn` — 重复 spawn 根因与修复
+- `exthost-crash-not-watchdog` — 判断 ExtHost 崩溃是否 watchdog 所致
 
 ```bash
 # 查看是否在跑
@@ -137,3 +35,31 @@ kill $(cat /tmp/claude-code-watchdog.lock)
 # 手动启动
 nohup /root/scripts/claude-code-watchdog.sh &>/dev/null &
 ```
+
+---
+
+## 浏览器自动化
+
+2026-08-10 安装了 `ai-social-browser`，并让 `@playwright/mcp`（v0.0.79）通过 CDP 连接它的常驻 headed Chromium。可通过 MCP 工具操作任意网站，不需写脚本；浏览器登录态保存在独立的持久 profile 中。配置在 `.mcp.json` 的 `playwright` 块。
+
+### 可用工具（重启后生效）
+
+- `browser_navigate` — 导航到 URL
+- `browser_click` — 点击页面元素
+- `browser_snapshot` — 读取页面无障碍树（结构文本）
+- `browser_evaluate` — 在页面执行 JS
+- `browser_type` / `browser_fill` — 输入文本
+- `browser_screenshot` — 截图
+- `browser_drag` — 拖拽
+
+### 使用原则
+
+- 浏览器操作优先使用 MCP 工具，不要写 Playwright 脚本
+- 浏览器由 `browser-core.service` 常驻后台，页面和登录态在工具调用及 Cyberboss 重启后保留
+- 通用浏览器 MCP 连接 `http://127.0.0.1:9333`；CDP、手机控制台和动作服务均只监听 localhost，不得改成公网监听
+- 通用浏览器 MCP 每次开始网页任务时，必须先用 `browser_tabs` 创建一个自己的新标签页，再在该页导航；如需固定桌面尺寸，只能对这个新建页使用 `browser_resize`（默认 1100x1300）。不得导航、缩放、关闭首次连接时已经存在的人工标签页。手机控制台会为后建的 AI 标签创建独立的手机尺寸伴随页并跟随其网址；AI 原标签保持桌面 viewport，AI 不得操作或关闭伴随页
+- 人工登录、验证码或风控接管使用 `https://browser.uuhalo.xyz` 的手机触屏控制台；公网先经过现有 Nginx Basic Auth，再使用控制台第二层密码。登录凭据只在浏览器中输入，不导出 cookie，不把账号密码交给 Agent
+- `browser-mobile-console.service` 仅监听 `127.0.0.1:8274`，提供二进制低延迟画面、直接触摸、键盘和标签页控制；noVNC、VNC 与旧 relay 服务已移除
+- X 专用动作服务为 `http://127.0.0.1:8272/twitter`，小红书只读动作服务为 `http://127.0.0.1:8273/xiaohongshu`；优先使用这些结构化动作处理对应平台
+- 社交写动作返回 `uncertain` 时禁止自动重试，避免重复发布；遵守服务端频率闸并只使用专门小号
+- 复杂交互（排序、上传、弹窗）通过 `evaluate` 跑 js 处理

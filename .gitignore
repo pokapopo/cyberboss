@@ -11,6 +11,7 @@ firmware/
 crash-ck.txt
 temp/
 .vscode/
+.playwright-mcp/
 cheatsheet-gaoshu.txt
 tmp-cdn-probe.js
 CLAUDE.local.md
