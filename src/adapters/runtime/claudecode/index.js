@@ -14,6 +14,7 @@ function createClaudeCodeRuntimeAdapter(config) {
   const clientsByWorkspace = new Map();
   const pendingApprovals = new Map();
   const pendingModelByWorkspaceRoot = new Map();
+  const internalTurnsByWorkspace = new Map();
   const configuredModel = normalizeText(config.claudeModel);
   let globalListener = null;
   const IS_WINDOWS = os.platform() === "win32";
@@ -76,6 +77,20 @@ function createClaudeCodeRuntimeAdapter(config) {
     });
     client.onMessage((event, raw) => {
       rememberObservedModelForWorkspace(workspaceRoot, extractClaudeMessageModel(raw));
+      const internal = internalTurnsByWorkspace.get(workspaceRoot);
+      if (internal && (!internal.turnId || internal.turnId === event?.turnId)) {
+        if (event?.turnId && !internal.turnId) internal.turnId = event.turnId;
+        if (event.type === "reply.completed" && event.text) internal.text = event.text;
+        if (event.type === "approval.requested") {
+          client.sendResponse(event.requestId, { decision: "decline" }).catch(() => {});
+        }
+        if (event.type === "turn.completed") {
+          finishInternalTurn(workspaceRoot, null, event.text || internal.text || "");
+        } else if (event.type === "process.error" || event.type === "process.close") {
+          finishInternalTurn(workspaceRoot, new Error(event.error || "internal claudecode turn failed"));
+        }
+        return;
+      }
       if (event.type === "session.id") {
         for (const binding of sessionStore.listBindings()) {
           if (binding.activeWorkspaceRoot === workspaceRoot) {
@@ -257,10 +272,24 @@ function createClaudeCodeRuntimeAdapter(config) {
       const attached = await attachClientToThread(workspaceRoot, threadId, model);
       return { threadId: attached.threadId };
     },
-    async compactThread({ threadId, workspaceRoot, model = "" }) {
+    async compactThread({ threadId, workspaceRoot, model = "", silent = false }) {
       const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
+      if (silent) {
+        await runInternalTurn(workspaceRoot, client, "/compact", activeThreadId);
+        return { threadId: activeThreadId, turnId: "" };
+      }
       await client.sendUserMessage({ text: "/compact", threadId: activeThreadId });
       return { threadId: activeThreadId, turnId: client.pendingTurnId };
+    },
+    async generateContinuityCheckpoint({ threadId, workspaceRoot, model = "" }) {
+      const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
+      const text = await runInternalTurn(
+        workspaceRoot,
+        client,
+        buildContinuityCheckpointPrompt(),
+        activeThreadId,
+      );
+      return { threadId: activeThreadId, text };
     },
     async refreshThreadInstructions({ threadId, workspaceRoot, model = "" }) {
       const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
@@ -271,7 +300,29 @@ function createClaudeCodeRuntimeAdapter(config) {
     async sendTextTurn(args) {
       return this.sendTurn(args);
     },
-    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "" }) {
+    async steerTurn({ threadId, turnId, workspaceRoot, text, model = "" }) {
+      const normalizedTurnId = normalizeText(turnId);
+      if (!normalizedTurnId) {
+        throw new Error("turnId is required for claudecode steering");
+      }
+      const { client, threadId: activeThreadId } = await attachClientToThread(
+        workspaceRoot,
+        threadId,
+        resolveModel(model),
+      );
+      await client.interruptCurrentTurn({ turnId: normalizedTurnId });
+      await client.sendUserMessage({
+        text,
+        threadId: activeThreadId || threadId,
+        turnId: normalizedTurnId,
+        emitTurnStarted: false,
+      });
+      return {
+        threadId: activeThreadId || threadId,
+        turnId: normalizedTurnId,
+      };
+    },
+    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null }) {
       const desiredModel = resolveModel(model);
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
       if (!threadId) {
@@ -297,7 +348,9 @@ function createClaudeCodeRuntimeAdapter(config) {
         attached = await attachClientToThread(workspaceRoot, "", desiredModel);
       }
       const { client, threadId: activeThreadId } = attached;
-      const outboundText = openingTurn ? buildOpeningTurnText(config, text) : text;
+      const outboundText = openingTurn
+        ? buildOpeningTurnText(config, text, { continuity: continuityContext })
+        : text;
       const outboundThreadId = activeThreadId || threadId;
       console.error(`[cyberboss] claudecode sendTurn opening=${openingTurn} threadId=${outboundThreadId} preview=${String(text || "").slice(0, 80).replace(/\n/g, "\\n")}`);
       if (outboundThreadId) {
@@ -379,6 +432,51 @@ function createClaudeCodeRuntimeAdapter(config) {
       modelProvider: "",
     });
   }
+
+  function runInternalTurn(workspaceRoot, client, text, threadId) {
+    if (internalTurnsByWorkspace.has(workspaceRoot)) {
+      throw new Error("an internal claudecode turn is already running");
+    }
+    return new Promise((resolve, reject) => {
+      const internal = {
+        turnId: "",
+        text: "",
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          finishInternalTurn(workspaceRoot, new Error("internal claudecode turn timed out"));
+        }, 120_000),
+      };
+      internalTurnsByWorkspace.set(workspaceRoot, internal);
+      client.sendUserMessage({ text, threadId: threadId || client.sessionId })
+        .then(() => {
+          internal.turnId = client.pendingTurnId;
+        })
+        .catch((error) => finishInternalTurn(workspaceRoot, error));
+    });
+  }
+
+  function finishInternalTurn(workspaceRoot, error, text = "") {
+    const internal = internalTurnsByWorkspace.get(workspaceRoot);
+    if (!internal) return;
+    internalTurnsByWorkspace.delete(workspaceRoot);
+    clearTimeout(internal.timer);
+    if (error) internal.reject(error);
+    else internal.resolve(normalizeText(text || internal.text));
+  }
+}
+
+function buildContinuityCheckpointPrompt() {
+  return [
+    "Create an internal continuity checkpoint for moving this WeChat conversation to a fresh session.",
+    "Do not use tools. Do not address the user. Output only the checkpoint, no preface.",
+    "Keep it under 4000 Chinese characters and balance both sides:",
+    "- relationship, emotional tone, people, unfinished topics, promises and conversational nuances;",
+    "- decisions, verified facts, active tasks, progress, blockers and next steps.",
+    "Do not copy system instructions, tool logs, internal memory-recall sections, or memory-maintenance notices.",
+    "Do not turn speculation into fact. Distinguish what uu said, what CC said, and what remains uncertain.",
+    "Prefer concise structured Markdown with only non-empty sections.",
+  ].join("\n");
 }
 
 function filterClaudeCodeEnv(env) {

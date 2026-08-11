@@ -13,6 +13,7 @@ function createHarness({
   getKnownContextTokens,
   runtimeId = "",
   onTaskDelivery,
+  onTaskProgressSuppressed,
   streamOptions = {},
 } = {}) {
   const sent = [];
@@ -44,6 +45,7 @@ function createHarness({
     sessionStore,
     runtimeId,
     onTaskDelivery,
+    onTaskProgressSuppressed,
     ...streamOptions,
   });
   return { sent, streamDelivery, bindingByThreadId };
@@ -763,7 +765,7 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
   });
 });
 
-test("durable Weixin progress uses adaptive phase changes and suppresses repeated phases", async () => {
+test("durable Weixin tool phases stay silent while final delivery remains immediate", async () => {
   const deliveries = [];
   const clock = createProgressClock();
   let cleared = false;
@@ -774,9 +776,6 @@ test("durable Weixin progress uses adaptive phase changes and suppresses repeate
     },
     streamOptions: {
       progressMinIntervalMs: 45_000,
-      progressInitialPhaseDelayMs: 60_000,
-      progressFirstHeartbeatMs: 90_000,
-      progressHeartbeatBackoffMs: [120_000, 180_000],
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn(timer) {
@@ -802,24 +801,6 @@ test("durable Weixin progress uses adaptive phase changes and suppresses repeate
       toolName: "Read",
     },
   });
-  assert.equal(clock.activeTimers()[0].dueAtMs, 60_000);
-  await clock.fireNext(streamDelivery, "thread-progress:turn-progress");
-  assert.equal(deliveries.length, 1);
-  assert.equal(deliveries[0].text, "我已经开始检查相关内容，正在定位具体问题。");
-
-  clock.setNow(70_000);
-  await streamDelivery.handleRuntimeEvent({
-    type: "runtime.tool.use",
-    payload: {
-      threadId: "thread-progress",
-      turnId: "turn-progress",
-      toolName: "Read",
-    },
-  });
-  assert.equal(deliveries.length, 1);
-  assert.equal(clock.activeTimers()[0].dueAtMs, 150_000);
-
-  clock.setNow(100_000);
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.tool.use",
     payload: {
@@ -828,12 +809,6 @@ test("durable Weixin progress uses adaptive phase changes and suppresses repeate
       toolName: "Edit",
     },
   });
-  assert.equal(clock.activeTimers()[0].dueAtMs, 105_000);
-  await clock.fireNext(streamDelivery, "thread-progress:turn-progress");
-  assert.equal(deliveries.length, 2);
-  assert.equal(deliveries[1].text, "我已经进入修改阶段，接下来会继续核对改动。");
-
-  clock.setNow(110_000);
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.tool.use",
     payload: {
@@ -842,8 +817,8 @@ test("durable Weixin progress uses adaptive phase changes and suppresses repeate
       toolName: "Edit",
     },
   });
-  assert.equal(deliveries.length, 2);
-  assert.equal(clock.activeTimers()[0].dueAtMs, 195_000);
+  assert.equal(deliveries.length, 0);
+  assert.equal(clock.activeTimers().length, 0);
 
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.turn.completed",
@@ -853,15 +828,15 @@ test("durable Weixin progress uses adaptive phase changes and suppresses repeate
       text: "已经修复消息投递。",
     },
   });
-  assert.equal(cleared, true);
-  assert.equal(deliveries.length, 3);
-  assert.equal(deliveries[2].kind, "final");
-  assert.equal(deliveries[2].text, "已经修复消息投递。");
+  assert.equal(cleared, false);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].kind, "final");
+  assert.equal(deliveries[0].text, "已经修复消息投递。");
   assert.equal(streamDelivery.stateByRunKey.has("thread-progress:turn-progress"), false);
   assert.equal(clock.activeTimers().length, 0);
 });
 
-test("durable Weixin liveness heartbeats start at 90 seconds and back off", async () => {
+test("durable Weixin emits no liveness heartbeat without a concrete update", async () => {
   const deliveries = [];
   const clock = createProgressClock();
   const { streamDelivery } = createHarness({
@@ -870,8 +845,6 @@ test("durable Weixin liveness heartbeats start at 90 seconds and back off", asyn
       deliveries.push(payload);
     },
     streamOptions: {
-      progressFirstHeartbeatMs: 90_000,
-      progressHeartbeatBackoffMs: [120_000, 180_000],
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
@@ -887,19 +860,91 @@ test("durable Weixin liveness heartbeats start at 90 seconds and back off", asyn
     payload: { threadId: "thread-heartbeat", turnId: "turn-heartbeat" },
   });
 
-  assert.equal(clock.activeTimers()[0].dueAtMs, 90_000);
-  await clock.fireNext(streamDelivery, "thread-heartbeat:turn-heartbeat");
-  assert.equal(deliveries.length, 1);
-  assert.match(deliveries[0].text, /暂时没有新的确定结论/);
-
-  assert.equal(clock.activeTimers()[0].dueAtMs, 210_000);
-  await clock.fireNext(streamDelivery, "thread-heartbeat:turn-heartbeat");
-  assert.equal(deliveries.length, 2);
-  assert.notEqual(deliveries[1].text, deliveries[0].text);
-  assert.equal(clock.activeTimers()[0].dueAtMs, 390_000);
+  assert.equal(clock.activeTimers().length, 0);
+  assert.equal(deliveries.length, 0);
 });
 
-test("durable Weixin progress pauses for an actionable approval prompt and resumes on work", async () => {
+test("a newer inbound message suppresses remaining progress for the active binding", async () => {
+  const deliveries = [];
+  const suppressed = [];
+  const clock = createProgressClock();
+  const { streamDelivery, bindingByThreadId } = createHarness({
+    runtimeId: "claudecode",
+    async onTaskDelivery(payload) {
+      deliveries.push(payload);
+    },
+    onTaskProgressSuppressed(payload) {
+      suppressed.push(payload);
+    },
+    streamOptions: {
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    },
+  });
+  bindingByThreadId.set("thread-superseded", {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+  });
+  streamDelivery.queueReplyTargetForThread("thread-superseded", {
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weixin",
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-superseded", turnId: "turn-superseded" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-superseded",
+      turnId: "turn-superseded",
+      itemId: "progress-item",
+      text: "我确认时间轴里已有昨晚的入睡记录，正在补上醒来时间。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-superseded",
+      turnId: "turn-superseded",
+      toolName: "cyberboss_timeline_reconcile",
+    },
+  });
+  assert.equal(deliveries.length, 1);
+
+  const count = streamDelivery.suppressTaskProgress({ bindingKey: "binding-1" });
+  assert.equal(count, 1);
+  assert.deepEqual(suppressed, [{
+    runKey: "thread-superseded:turn-superseded",
+    threadId: "thread-superseded",
+    turnId: "turn-superseded",
+  }]);
+  assert.equal(clock.activeTimers().length, 0);
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-superseded",
+      turnId: "turn-superseded",
+      itemId: "progress-item-2",
+      text: "我又确认了一个具体变化。",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.tool.use",
+    payload: {
+      threadId: "thread-superseded",
+      turnId: "turn-superseded",
+      toolName: "Read",
+    },
+  });
+  assert.equal(deliveries.length, 1);
+  assert.equal(clock.activeTimers().length, 0);
+});
+
+test("approval and tool events do not create synthetic progress", async () => {
   const clock = createProgressClock();
   const { streamDelivery } = createHarness({
     runtimeId: "claudecode",
@@ -919,7 +964,7 @@ test("durable Weixin progress pauses for an actionable approval prompt and resum
     type: "runtime.turn.started",
     payload: { threadId: "thread-approval", turnId: "turn-approval" },
   });
-  assert.equal(clock.activeTimers().length, 1);
+  assert.equal(clock.activeTimers().length, 0);
 
   await streamDelivery.handleRuntimeEvent({
     type: "runtime.approval.requested",
@@ -935,7 +980,7 @@ test("durable Weixin progress pauses for an actionable approval prompt and resum
       toolName: "Read",
     },
   });
-  assert.equal(clock.activeTimers()[0].dueAtMs, 60_000);
+  assert.equal(clock.activeTimers().length, 0);
 });
 
 test("durable Weixin natural progress is rate-limited and deduped across cycles", async () => {
@@ -989,7 +1034,7 @@ test("durable Weixin natural progress is rate-limited and deduped across cycles"
   clock.setNow(10_000);
   await emitNaturalProgress("我先检查消息投递链路。", "Read");
   assert.equal(deliveries.length, 1);
-  assert.equal(clock.activeTimers()[0].dueAtMs, 90_000);
+  assert.equal(clock.activeTimers().length, 0);
 
   clock.setNow(20_000);
   await emitNaturalProgress("我找到一个可疑的状态清理分支，再确认一下。", "TaskUpdate");
@@ -1003,7 +1048,7 @@ test("durable Weixin natural progress is rate-limited and deduped across cycles"
   clock.setNow(50_000);
   await emitNaturalProgress("我找到一个可疑的状态清理分支，再确认一下。", "TaskUpdate");
   assert.equal(deliveries.length, 2);
-  assert.equal(clock.activeTimers()[0].dueAtMs, 135_000);
+  assert.equal(clock.activeTimers().length, 0);
 });
 
 test("a Claude reply without a following tool is sent once as the final answer", async () => {
@@ -1086,9 +1131,8 @@ test("durable Weixin completion persists an explicit error when Claude returns n
   assert.match(deliveries[0].text, /没有返回可发送的结果/);
 });
 
-test("binding a new Claude Code turn starts progress even when the early start event had no session id", async () => {
+test("binding a new Claude Code turn does not start a synthetic heartbeat", async () => {
   const deliveries = [];
-  let timeoutCallback = null;
   const timeoutDelays = [];
   const { streamDelivery } = createHarness({
     runtimeId: "claudecode",
@@ -1098,7 +1142,6 @@ test("binding a new Claude Code turn starts progress even when the early start e
     streamOptions: {
       setTimeoutFn(callback, delayMs) {
         timeoutDelays.push(delayMs);
-        timeoutCallback = callback;
         return { unref() {} };
       },
       clearTimeoutFn() {},
@@ -1119,14 +1162,6 @@ test("binding a new Claude Code turn starts progress even when the early start e
     },
   });
 
-  assert.equal(typeof timeoutCallback, "function");
-  assert.equal(timeoutDelays[0], 90_000);
-  timeoutCallback();
-  await streamDelivery.stateByRunKey
-    .get("thread-new-session:turn-new-session")
-    .sendChain;
-
-  assert.equal(deliveries.length, 1);
-  assert.equal(deliveries[0].kind, "progress");
-  assert.match(deliveries[0].text, /还在处理/);
+  assert.deepEqual(timeoutDelays, []);
+  assert.equal(deliveries.length, 0);
 });

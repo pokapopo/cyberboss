@@ -53,11 +53,13 @@ class SystemMessageQueueStore {
     return withFileLockSync(this.filePath, () => {
       this.load();
       const normalizedAccountId = normalizeText(accountId);
+      const nowMs = Date.now();
       const drained = [];
       const pending = [];
 
       for (const message of this.state.messages) {
-        if (message.accountId === normalizedAccountId) {
+        const notBeforeMs = Date.parse(message.notBefore || "") || 0;
+        if (message.accountId === normalizedAccountId && notBeforeMs <= nowMs) {
           drained.push(message);
         } else {
           pending.push(message);
@@ -78,6 +80,27 @@ class SystemMessageQueueStore {
     const normalizedAccountId = normalizeText(accountId);
     return this.state.messages.some((message) => message.accountId === normalizedAccountId);
   }
+
+  hasDueForAccount(accountId, nowMs = Date.now()) {
+    this.load();
+    const normalizedAccountId = normalizeText(accountId);
+    return this.state.messages.some((message) => {
+      if (message.accountId !== normalizedAccountId) return false;
+      return (Date.parse(message.notBefore || "") || 0) <= nowMs;
+    });
+  }
+
+  peekNextDueAtMs(accountId) {
+    this.load();
+    const normalizedAccountId = normalizeText(accountId);
+    let next = 0;
+    for (const message of this.state.messages) {
+      if (message.accountId !== normalizedAccountId) continue;
+      const candidate = Date.parse(message.notBefore || "") || Date.parse(message.createdAt || "") || Date.now();
+      if (!next || candidate < next) next = candidate;
+    }
+    return next;
+  }
 }
 
 function normalizeSystemMessage(message) {
@@ -91,6 +114,7 @@ function normalizeSystemMessage(message) {
   const workspaceRoot = normalizeText(message.workspaceRoot);
   const text = normalizeText(message.text);
   const createdAt = normalizeIsoTime(message.createdAt);
+  const notBefore = normalizeIsoTime(message.notBefore);
 
   if (!id || !accountId || !senderId || !workspaceRoot || !text) {
     return null;
@@ -104,6 +128,7 @@ function normalizeSystemMessage(message) {
     text,
     triggerKind: normalizeText(message.triggerKind),
     createdAt: createdAt || new Date().toISOString(),
+    notBefore,
   };
 }
 
@@ -120,6 +145,11 @@ function normalizeIsoTime(value) {
 }
 
 function compareSystemMessages(left, right) {
+  const leftDue = Date.parse(left?.notBefore || "") || 0;
+  const rightDue = Date.parse(right?.notBefore || "") || 0;
+  if (leftDue !== rightDue) {
+    return leftDue - rightDue;
+  }
   const leftTime = Date.parse(left?.createdAt || "") || 0;
   const rightTime = Date.parse(right?.createdAt || "") || 0;
   if (leftTime !== rightTime) {

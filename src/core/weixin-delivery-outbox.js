@@ -241,6 +241,17 @@ class WeixinDeliveryOutboxStore {
     });
   }
 
+  removeProgressForRun(runKey) {
+    return this.updateLocked(() => {
+      const normalizedRunKey = normalizeText(runKey);
+      const before = this.state.deliveries.length;
+      this.state.deliveries = this.state.deliveries.filter(
+        (delivery) => !(delivery.runKey === normalizedRunKey && delivery.kind === "progress")
+      );
+      return before - this.state.deliveries.length;
+    });
+  }
+
   snapshot() {
     this.load();
     return clone(this.state);
@@ -322,6 +333,10 @@ class WeixinDeliveryService {
       return null;
     }
     return this.enqueue(payload);
+  }
+
+  suppressRunProgress(runKey) {
+    return this.store.removeProgressForRun(runKey);
   }
 
   async enqueue({

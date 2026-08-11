@@ -144,6 +144,7 @@ CYBERBOSS_CODEX_MODEL_PROVIDER=
 CYBERBOSS_CLAUDE_COMMAND=claude
 CYBERBOSS_CLAUDE_MODEL=
 CYBERBOSS_CLAUDE_CONTEXT_WINDOW=
+CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT=85
 CYBERBOSS_CLAUDE_PERMISSION_MODE=default
 CYBERBOSS_CLAUDE_DISABLE_VERBOSE=false
 CYBERBOSS_CLAUDE_EXTRA_ARGS=
@@ -182,6 +183,8 @@ What these do:
   Set the default Claude model.
 - `CYBERBOSS_CLAUDE_CONTEXT_WINDOW`
   Set Claude's effective context window so `/status` can show an approximate context usage line.
+- `CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT`
+  Set the WeChat Claude Code continuity-rollover threshold; defaults to `85`.
 - `CYBERBOSS_CLAUDE_PERMISSION_MODE`
   Set Claude's permission mode before the bridge starts.
 - `CYBERBOSS_CLAUDE_DISABLE_VERBOSE`

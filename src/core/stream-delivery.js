@@ -2,9 +2,6 @@ const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 const TASK_PROGRESS_MIN_INTERVAL_MS = 45_000;
-const TASK_PROGRESS_INITIAL_PHASE_DELAY_MS = 60_000;
-const TASK_PROGRESS_FIRST_HEARTBEAT_MS = 90_000;
-const TASK_PROGRESS_HEARTBEAT_BACKOFF_MS = [120_000, 180_000];
 
 function stripAnsi(text) {
   return String(text || "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
@@ -28,10 +25,8 @@ class StreamDelivery {
     runtimeId = "",
     onDeferredSystemReply,
     onTaskDelivery,
+    onTaskProgressSuppressed,
     progressMinIntervalMs = TASK_PROGRESS_MIN_INTERVAL_MS,
-    progressInitialPhaseDelayMs = TASK_PROGRESS_INITIAL_PHASE_DELAY_MS,
-    progressFirstHeartbeatMs = TASK_PROGRESS_FIRST_HEARTBEAT_MS,
-    progressHeartbeatBackoffMs = TASK_PROGRESS_HEARTBEAT_BACKOFF_MS,
     now = () => Date.now(),
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
@@ -44,19 +39,10 @@ class StreamDelivery {
     this.systemReplyPolicy = createSystemReplyPolicy(this.runtimeId);
     this.onDeferredSystemReply = typeof onDeferredSystemReply === "function" ? onDeferredSystemReply : null;
     this.onTaskDelivery = typeof onTaskDelivery === "function" ? onTaskDelivery : null;
+    this.onTaskProgressSuppressed = typeof onTaskProgressSuppressed === "function"
+      ? onTaskProgressSuppressed
+      : null;
     this.progressMinIntervalMs = positiveDelay(progressMinIntervalMs, TASK_PROGRESS_MIN_INTERVAL_MS);
-    this.progressInitialPhaseDelayMs = positiveDelay(
-      progressInitialPhaseDelayMs,
-      TASK_PROGRESS_INITIAL_PHASE_DELAY_MS,
-    );
-    this.progressFirstHeartbeatMs = positiveDelay(
-      progressFirstHeartbeatMs,
-      TASK_PROGRESS_FIRST_HEARTBEAT_MS,
-    );
-    this.progressHeartbeatBackoffMs = normalizeDelaySchedule(
-      progressHeartbeatBackoffMs,
-      TASK_PROGRESS_HEARTBEAT_BACKOFF_MS,
-    );
     this.now = now;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
@@ -112,6 +98,36 @@ class StreamDelivery {
     state.turnStarted = true;
     state.startedAtMs ||= this.now();
     this.applyThreadReplyTarget(state, normalizedTarget);
+  }
+
+  suppressTaskProgress({ bindingKey = "", userId = "" } = {}) {
+    const normalizedBindingKey = normalizeText(bindingKey);
+    const normalizedUserId = normalizeText(userId);
+    let suppressed = 0;
+    for (const state of this.stateByRunKey.values()) {
+      const matchesBinding = normalizedBindingKey && state.bindingKey === normalizedBindingKey;
+      const matchesUser = normalizedUserId && state.replyTarget?.userId === normalizedUserId;
+      if ((!matchesBinding && !matchesUser) || !this.isDurableWeixinRun(state) || state.progressSuppressed) {
+        continue;
+      }
+      state.progressSuppressed = true;
+      state.pendingNaturalProgress = "";
+      state.confirmedNaturalProgress = [];
+      this.clearTaskProgressTimer(state);
+      try {
+        this.onTaskProgressSuppressed?.({
+          runKey: state.runKey,
+          threadId: state.threadId,
+          turnId: state.turnId,
+        });
+      } catch (error) {
+        console.error(
+          `[cyberboss] failed to remove queued task progress run=${state.runKey}: ${error.message}`
+        );
+      }
+      suppressed += 1;
+    }
+    return suppressed;
   }
 
   setDeferredReplyPrefix(bindingKey, text) {
@@ -196,13 +212,7 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         if (this.isDurableWeixinRun(state)) {
-          const hasNaturalProgress = await this.confirmNaturalProgressBeforeTool(state);
-          this.addTaskToolSignal(
-            state,
-            event.payload.toolName,
-            event.payload.input,
-            { suppressPhaseUpdate: hasNaturalProgress },
-          );
+          await this.confirmNaturalProgressBeforeTool(state);
           this.ensureTaskProgressTimer(state);
         }
         return;
@@ -298,16 +308,13 @@ class StreamDelivery {
       startedAtMs: 0,
       pendingNaturalProgress: "",
       confirmedNaturalProgress: [],
-      pendingProgressPhase: "",
-      highestProgressPhaseRank: 0,
-      lastProgressPhase: "",
       lastProgressText: "",
       lastProgressSentAtMs: null,
       kickoffSent: false,
+      progressSuppressed: false,
       progressTimer: null,
       progressTimerDueAtMs: 0,
       progressTick: 0,
-      heartbeatCount: 0,
     };
     this.stateByRunKey.set(runKey, created);
     this.attachReplyTarget(created);
@@ -419,7 +426,11 @@ class StreamDelivery {
   }
 
   ensureTaskProgressTimer(state) {
-    if (!state?.turnStarted || !this.isDurableWeixinRun(state)) {
+    if (!state?.turnStarted || !this.isDurableWeixinRun(state) || state.progressSuppressed) {
+      return;
+    }
+    if (!state.confirmedNaturalProgress.length) {
+      this.clearTaskProgressTimer(state);
       return;
     }
     state.startedAtMs ||= this.now();
@@ -457,28 +468,17 @@ class StreamDelivery {
   resolveNextTaskProgressDueAt(state) {
     const nowMs = this.now();
     const hasLastProgress = Number.isFinite(state.lastProgressSentAtMs);
-    if (state.confirmedNaturalProgress.length || state.pendingProgressPhase) {
-      const earliestAtMs = hasLastProgress
-        ? state.lastProgressSentAtMs + this.progressMinIntervalMs
-        : state.startedAtMs + this.progressInitialPhaseDelayMs;
-      return Math.max(nowMs, earliestAtMs);
-    }
-    const anchorMs = hasLastProgress ? state.lastProgressSentAtMs : state.startedAtMs;
-    return Math.max(nowMs, anchorMs + this.resolveHeartbeatDelayMs(state.heartbeatCount));
-  }
-
-  resolveHeartbeatDelayMs(heartbeatCount) {
-    if (heartbeatCount <= 0) {
-      return this.progressFirstHeartbeatMs;
-    }
-    const index = Math.min(
-      heartbeatCount - 1,
-      this.progressHeartbeatBackoffMs.length - 1,
-    );
-    return this.progressHeartbeatBackoffMs[index];
+    const earliestAtMs = hasLastProgress
+      ? state.lastProgressSentAtMs + this.progressMinIntervalMs
+      : nowMs;
+    return Math.max(nowMs, earliestAtMs);
   }
 
   async confirmNaturalProgressBeforeTool(state) {
+    if (state.progressSuppressed) {
+      state.pendingNaturalProgress = "";
+      return false;
+    }
     const natural = state.pendingNaturalProgress;
     state.pendingNaturalProgress = "";
     if (!natural) {
@@ -496,7 +496,6 @@ class StreamDelivery {
       });
       this.rememberTaskProgress(state, {
         text: natural,
-        meaningful: true,
       });
       this.ensureTaskProgressTimer(state);
       return true;
@@ -511,58 +510,29 @@ class StreamDelivery {
     return true;
   }
 
-  addTaskToolSignal(state, toolName, input = null, { suppressPhaseUpdate = false } = {}) {
-    const kind = classifyTaskToolProgress(toolName, input);
-    const rank = progressPhaseRank(kind);
-    if (!rank || rank <= state.highestProgressPhaseRank) {
-      return;
-    }
-    state.highestProgressPhaseRank = rank;
-    if (!suppressPhaseUpdate && kind !== state.lastProgressPhase) {
-      state.pendingProgressPhase = kind;
-    }
-  }
-
   async emitTaskProgress(state) {
-    if (!this.isDurableWeixinRun(state)) {
+    if (!this.isDurableWeixinRun(state) || state.progressSuppressed) {
       return;
     }
     const natural = state.confirmedNaturalProgress.at(-1) || "";
-    const phase = state.pendingProgressPhase;
-    const meaningful = Boolean(natural || phase);
-    const text = natural
-      || buildTaskPhaseProgressText(phase)
-      || buildTaskHeartbeatText(
-        Math.max(0, this.now() - state.startedAtMs),
-        state.heartbeatCount,
-      );
     state.confirmedNaturalProgress = [];
-    state.pendingProgressPhase = "";
-    if (sameProgressText(text, state.lastProgressText)) {
+    if (!natural || sameProgressText(natural, state.lastProgressText)) {
       return;
     }
     state.progressTick += 1;
     await this.enqueueTaskDelivery(state, {
       kind: "progress",
-      text,
+      text: natural,
       idempotencyKey: `progress:${state.runKey}:${state.progressTick}`,
     });
     this.rememberTaskProgress(state, {
-      text,
-      phase: meaningful ? phase : "",
-      meaningful,
+      text: natural,
     });
   }
 
-  rememberTaskProgress(state, { text, phase = "", meaningful = false }) {
+  rememberTaskProgress(state, { text }) {
     state.lastProgressText = normalizeProgressFingerprint(text);
     state.lastProgressSentAtMs = this.now();
-    if (phase) {
-      state.lastProgressPhase = phase;
-    }
-    state.heartbeatCount = meaningful
-      ? 0
-      : state.heartbeatCount + 1;
   }
 
   async enqueueTaskDelivery(state, { kind, text, idempotencyKey = "" }) {
@@ -969,78 +939,6 @@ function normalizeNaturalProgress(value) {
   return /[一-鿿㐀-䶿]/.test(compact) ? compact : "";
 }
 
-function classifyTaskToolProgress(toolName, input = null) {
-  const raw = String(toolName || "").trim();
-  const name = raw.startsWith("mcp__")
-    ? raw.split("__").slice(2).join("__")
-    : raw;
-  const normalized = name.toLowerCase();
-  if (!normalized) {
-    return "";
-  }
-  const command = typeof input?.command === "string"
-    ? input.command.toLowerCase()
-    : "";
-  if (command && /(?:^|\s)(?:npm\s+(?:run\s+)?test|node\s+--test|pytest|cargo\s+test|go\s+test|check:syntax|lint)(?:\s|$)/.test(command)) {
-    return "verify";
-  }
-  if (/taskupdate|todowrite|enterplanmode|exitplanmode/.test(normalized)) {
-    return "internal";
-  }
-  if (/approval|askuserquestion/.test(normalized)) {
-    return "approval";
-  }
-  if (/write|edit|patch|delete|create|save|append|update/.test(normalized)) {
-    return "modify";
-  }
-  if (/read|grep|glob|search|find|fetch|summary|snapshot|recent|current/.test(normalized)) {
-    return "inspect";
-  }
-  if (/test|verify|check|browser|screenshot/.test(normalized)) {
-    return "verify";
-  }
-  return "work";
-}
-
-function progressPhaseRank(kind) {
-  if (kind === "inspect") {
-    return 1;
-  }
-  if (kind === "modify") {
-    return 2;
-  }
-  if (kind === "verify") {
-    return 3;
-  }
-  return 0;
-}
-
-function buildTaskPhaseProgressText(phase) {
-  if (phase === "inspect") {
-    return "我已经开始检查相关内容，正在定位具体问题。";
-  }
-  if (phase === "modify") {
-    return "我已经进入修改阶段，接下来会继续核对改动。";
-  }
-  if (phase === "verify") {
-    return "修改已经进入验证阶段，我正在核对结果。";
-  }
-  return "";
-}
-
-function buildTaskHeartbeatText(elapsedMs, heartbeatCount = 0) {
-  const seconds = Math.max(90, Math.round(elapsedMs / 1_000));
-  const elapsed = seconds < 60
-    ? `约 ${seconds} 秒`
-    : `约 ${Math.max(1, Math.round(seconds / 60))} 分钟`;
-  const heartbeats = [
-    "我还在处理这件事，暂时没有新的确定结论。有结果后我直接告诉你。",
-    `任务还在继续，已经进行了${elapsed}。我正在等下一条确定结果。`,
-    `我还在处理，任务已进行了${elapsed}。有明确变化我马上告诉你。`,
-  ];
-  return heartbeats[Math.min(Math.max(0, heartbeatCount), heartbeats.length - 1)];
-}
-
 function normalizeProgressFingerprint(value) {
   return String(value || "")
     .normalize("NFKC")
@@ -1061,15 +959,6 @@ function positiveDelay(value, fallback) {
   return Number.isFinite(numeric) && numeric >= 10
     ? numeric
     : fallback;
-}
-
-function normalizeDelaySchedule(value, fallback) {
-  const normalized = Array.isArray(value)
-    ? value
-      .map((item) => Number(item))
-      .filter((item) => Number.isFinite(item) && item >= 10)
-    : [];
-  return normalized.length ? normalized : [...fallback];
 }
 
 function collectPendingReplyDeliveries(state, { force }) {
@@ -1366,6 +1255,9 @@ function classifyReplyItemSourceText(replyText) {
     return null;
   }
   if (candidate !== stripped) {
+    // Allow action JSON embedded in narrative text — resolve the action, discard the narration
+    const action = resolveSystemReplyAction(candidate);
+    if (action) return action;
     return null;
   }
   return resolveSystemReplyAction(candidate);

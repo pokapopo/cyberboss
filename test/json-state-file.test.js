@@ -82,6 +82,27 @@ test("concurrent queue writers preserve every message", async () => {
   assert.equal(new Set(store.state.messages.map((message) => message.id)).size, 40);
 });
 
+test("system message queue leaves not-before maintenance pending until due", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-system-due-"));
+  const filePath = path.join(dir, "queue.json");
+  const store = new SystemMessageQueueStore({ filePath });
+  const futureMs = Date.now() + 60_000;
+  const base = {
+    accountId: "a",
+    senderId: "u",
+    workspaceRoot: "/w",
+    createdAt: new Date().toISOString(),
+  };
+  store.enqueue({ ...base, id: "now", text: "now" });
+  store.enqueue({ ...base, id: "later", text: "later", notBefore: new Date(futureMs).toISOString() });
+
+  assert.equal(store.hasDueForAccount("a"), true);
+  assert.deepEqual(store.drainForAccount("a").map((message) => message.id), ["now"]);
+  assert.equal(store.hasPendingForAccount("a"), true);
+  assert.equal(store.hasDueForAccount("a"), false);
+  assert.ok(store.peekNextDueAtMs("a") >= futureMs);
+});
+
 test("runtime-scoped session updates from stale store instances are merged", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-session-concurrent-"));
   const filePath = path.join(dir, "sessions.json");

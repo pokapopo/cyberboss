@@ -9,6 +9,14 @@ class SystemMessageDispatcher {
     return this.queueStore.hasPendingForAccount(this.accountId);
   }
 
+  hasDuePending() {
+    return this.queueStore.hasDueForAccount(this.accountId);
+  }
+
+  peekNextDueAtMs() {
+    return this.queueStore.peekNextDueAtMs(this.accountId);
+  }
+
   drainPending() {
     return this.queueStore.drainForAccount(this.accountId);
   }
@@ -77,6 +85,8 @@ function buildDiaryIncrementalPrompt(timeHeader) {
     "These are raw building blocks — the 23:00 summary will merge them into a polished entry.",
     "Use cyberboss_diary_append for these timestamped draft fragments; do not try to",
     "turn each fragment into a complete formatted diary or add CC's final reflection.",
+    "`## CC 的想法` closes a diary day. Never append anything after it; the append tool",
+    "automatically rolls later material into the next non-finalized calendar file.",
     "Do NOT judge whether something is \"worth writing.\" If it comes to mind after reading,",
     "write it. A short note is better than a blank page.",
     "",
@@ -86,6 +96,10 @@ function buildDiaryIncrementalPrompt(timeHeader) {
     "Then call cyberboss_timeline_reconcile with today's date to load pending observations,",
     "the current day, and taxonomy. Apply only completed events with defensible exact or",
     "approximate ranges. Leave unknown-time or ongoing observations pending for a later turn.",
+    "Treat a transition as a boundary for the preceding state: waking closes a known sleep",
+    "start, arriving closes a known trip, and finishing closes the matching ongoing task.",
+    "Combine complementary start/end observations into one meaningful interval instead of",
+    "recording only the few minutes of follow-up chat. Never guess a missing start boundary.",
     "",
     "STEP 4 — Send a short natural message briefly reflecting what you added.",
     "Example: \"记了点今天的事情～\" or \"补了一条时间轴。\"",
@@ -161,7 +175,8 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     "   header and `— with uu` signature, so do not put either in the Markdown body.",
     "4. The final Markdown MUST contain the exact standalone heading `## CC 的想法`,",
     "   followed by a substantive first-person reflection from CC. It must not be empty,",
-    "   folded into another section, or replaced by an event summary.",
+    "   folded into another section, or replaced by an event summary. It MUST be the final",
+    "   section: it closes that diary day, and nothing may be written after it.",
     "5. Call cyberboss_diary_finalize with the COMPLETE final Markdown. This is the only",
     "   allowed final write/render path. If validation rejects it, revise the Markdown and",
     "   call finalize again. The tool saves atomically and returns a local screenshotPath.",

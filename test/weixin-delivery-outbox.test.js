@@ -237,6 +237,47 @@ test("new progress replaces stale progress and final removes all pending progres
   await service.close();
 });
 
+test("suppressRunProgress removes queued progress without ending the run", async () => {
+  const filePath = createTempFile();
+  const service = new WeixinDeliveryService({
+    filePath,
+    now: () => new Date("2026-07-28T00:00:00.000Z"),
+    channelAdapter: {
+      prepareTextDelivery({ text }) {
+        return [text];
+      },
+      getKnownContextTokens() {
+        return {};
+      },
+      async sendTextChunk() {
+        const error = new Error("sendMessage ret=-2 errcode= errmsg=");
+        error.ret = -2;
+        throw error;
+      },
+    },
+  });
+  service.registerRun({
+    runKey: "thread-quiet:turn-quiet",
+    threadId: "thread-quiet",
+    turnId: "turn-quiet",
+    target: createTarget(),
+  });
+  await service.enqueue({
+    runKey: "thread-quiet:turn-quiet",
+    target: { ...createTarget(), contextToken: "" },
+    kind: "progress",
+    text: "旧任务进度",
+  });
+  await service.drain();
+
+  assert.equal(service.store.snapshot().deliveries.length, 1);
+  assert.equal(service.suppressRunProgress("thread-quiet:turn-quiet"), 1);
+  const snapshot = service.store.snapshot();
+  assert.equal(snapshot.deliveries.length, 0);
+  assert.equal(snapshot.runs[0].status, "running");
+  await service.close();
+});
+
 test("startup converts a run owned by an old process into one durable error", async () => {
   const filePath = createTempFile();
   const oldStore = new WeixinDeliveryOutboxStore({ filePath });

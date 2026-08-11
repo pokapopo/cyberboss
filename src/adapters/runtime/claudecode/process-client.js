@@ -23,6 +23,7 @@ class ClaudeCodeProcessClient {
     this.alive = false;
     this.sessionWaiters = new Set();
     this.suppressNextCloseEvent = false;
+    this.pendingInterrupt = null;
   }
 
   onMessage(listener) {
@@ -119,6 +120,7 @@ class ClaudeCodeProcessClient {
 
     child.on("error", (err) => {
       this.rejectSessionWaiters(err);
+      this.rejectPendingInterrupt(err);
       this.alive = false;
       this.child = null;
       this.stdin = null;
@@ -126,7 +128,9 @@ class ClaudeCodeProcessClient {
     });
 
     child.on("close", (code) => {
-      this.rejectSessionWaiters(new Error(`claudecode process closed with code ${code ?? "unknown"}`));
+      const closeError = new Error(`claudecode process closed with code ${code ?? "unknown"}`);
+      this.rejectSessionWaiters(closeError);
+      this.rejectPendingInterrupt(closeError);
       this.alive = false;
       this.child = null;
       this.stdin = null;
@@ -165,6 +169,9 @@ class ClaudeCodeProcessClient {
         break;
       case "result":
         this.handleResult(raw);
+        break;
+      case "control_response":
+        this.handleControlResponse(raw);
         break;
       case "control_request":
         this.handleControlRequest(raw);
@@ -254,6 +261,26 @@ class ClaudeCodeProcessClient {
         return;
       }
     }
+    const interrupted = this.pendingInterrupt;
+    if (interrupted) {
+      this.pendingInterrupt = null;
+      clearTimeout(interrupted.timer);
+      this.pendingTurnId = "";
+      this.activeThreadId = "";
+      if (raw?.is_error || raw?.subtype === "error_during_execution") {
+        this.emit({
+          type: "turn.interrupted",
+          turnId: interrupted.turnId,
+          sessionId: this.sessionId,
+        }, raw);
+        interrupted.resolve({
+          threadId: this.sessionId,
+          turnId: interrupted.turnId,
+        });
+        return;
+      }
+      interrupted.reject(new Error("claudecode turn completed before steering interrupt took effect"));
+    }
     this.emit({
       type: "turn.completed",
       turnId: this.pendingTurnId,
@@ -262,6 +289,18 @@ class ClaudeCodeProcessClient {
     }, raw);
     this.pendingTurnId = "";
     this.activeThreadId = "";
+  }
+
+  handleControlResponse(raw) {
+    const interrupted = this.pendingInterrupt;
+    if (!interrupted || raw?.response?.request_id !== interrupted.requestId) {
+      return;
+    }
+    if (raw?.response?.subtype && raw.response.subtype !== "success") {
+      this.pendingInterrupt = null;
+      clearTimeout(interrupted.timer);
+      interrupted.reject(new Error(`claudecode interrupt failed: ${raw.response.subtype}`));
+    }
   }
 
   acceptReportedSessionId(sessionId, raw) {
@@ -318,11 +357,11 @@ class ClaudeCodeProcessClient {
     }, raw);
   }
 
-  async sendUserMessage({ text, threadId }) {
+  async sendUserMessage({ text, threadId, turnId = "", emitTurnStarted = true }) {
     if (!this.alive || !this.stdin) {
       throw new Error("claudecode process not running");
     }
-    this.pendingTurnId = `turn-${Date.now()}`;
+    this.pendingTurnId = normalizeTurnId(turnId) || `turn-${Date.now()}`;
     this.activeThreadId = threadId || this.sessionId;
     if (this.ipcServer) {
       try {
@@ -348,11 +387,65 @@ class ClaudeCodeProcessClient {
         `claudecode stdin write failed: ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    this.emit({
-      type: "turn.started",
-      turnId: this.pendingTurnId,
-      sessionId: this.activeThreadId,
-    }, null);
+    if (emitTurnStarted) {
+      this.emit({
+        type: "turn.started",
+        turnId: this.pendingTurnId,
+        sessionId: this.activeThreadId,
+      }, null);
+    }
+  }
+
+  async interruptCurrentTurn({ turnId, timeoutMs = 5000 } = {}) {
+    if (!this.alive || !this.stdin) {
+      throw new Error("claudecode process not running");
+    }
+    const normalizedTurnId = normalizeTurnId(turnId);
+    if (!normalizedTurnId || normalizedTurnId !== this.pendingTurnId) {
+      throw new Error("claudecode active turn does not match steering target");
+    }
+    if (this.pendingInterrupt) {
+      throw new Error("claudecode steering interrupt already in progress");
+    }
+    const requestId = `interrupt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const timeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Number(timeoutMs)
+      : 5000;
+    const completion = new Promise((resolve, reject) => {
+      const entry = {
+        requestId,
+        turnId: normalizedTurnId,
+        resolve,
+        reject,
+        timer: null,
+      };
+      entry.timer = setTimeout(() => {
+        if (this.pendingInterrupt === entry) {
+          this.pendingInterrupt = null;
+        }
+        reject(new Error("claudecode steering interrupt timed out"));
+      }, timeout);
+      this.pendingInterrupt = entry;
+    });
+    try {
+      const payload = JSON.stringify({
+        type: "control_request",
+        request_id: requestId,
+        request: { subtype: "interrupt" },
+      });
+      const ok = this.stdin.write(payload + "\n");
+      if (!ok) {
+        await new Promise((resolve) => this.stdin.once("drain", resolve));
+      }
+    } catch (error) {
+      const interrupted = this.pendingInterrupt;
+      this.pendingInterrupt = null;
+      if (interrupted) {
+        clearTimeout(interrupted.timer);
+        interrupted.reject(error);
+      }
+    }
+    return completion;
   }
 
   async sendResponse(requestId, { decision }) {
@@ -442,7 +535,16 @@ class ClaudeCodeProcessClient {
     this.resumeSessionId = "";
     this.activeThreadId = "";
     this.pendingTurnId = "";
+    this.rejectPendingInterrupt(new Error("claudecode process closed"));
     this.rejectSessionWaiters(new Error("claudecode process closed"));
+  }
+
+  rejectPendingInterrupt(error) {
+    const interrupted = this.pendingInterrupt;
+    if (!interrupted) return;
+    this.pendingInterrupt = null;
+    clearTimeout(interrupted.timer);
+    interrupted.reject(error);
   }
 
   resolveSessionWaiters(sessionId) {
@@ -510,6 +612,10 @@ function isValidSessionId(value) {
 
 function normalizeSessionId(value) {
   return typeof value === "string" ? value.replace(/\s+/g, "").trim() : "";
+}
+
+function normalizeTurnId(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 const SENSITIVE_KEYWORDS = /\b(?:key|token|secret|password|credential|api[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key)\b/i;

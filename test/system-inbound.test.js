@@ -227,6 +227,13 @@ test("text-only runtimes receive vision API captions as visual context", async (
     assert.equal(String(url), "https://dashscope.example.com/compatible-mode/v1/chat/completions");
     const body = JSON.parse(options.body);
     assert.equal(body.model, "qwen-vl-demo");
+    const visionPrompt = body.messages[0].content[0].text;
+    assert.match(visionPrompt, /用户随图提出的问题：\s*这条帖子里大家说了什么？/);
+    assert.match(visionPrompt, /聊天记录、社交媒体帖子/);
+    assert.match(visionPrompt, /必须按可见顺序逐字转录全部文字/);
+    assert.match(visionPrompt, /评论及回复/);
+    assert.match(visionPrompt, /不要仅因裸露、性话题、成人用语、粗俗表达或私人聊天而省略、改写、打码或放弃整张图片/);
+    assert.match(visionPrompt, /不得因局部受限而拒绝其余内容/);
     assert.equal(body.messages[0].content[1].type, "image_url");
     assert.match(body.messages[0].content[1].image_url.url, /^data:image\/jpeg;base64,/);
     return {
@@ -259,8 +266,8 @@ test("text-only runtimes receive vision API captions as visual context", async (
     }, {
       prepared: {
         provider: "weixin",
-        originalText: "",
-        text: "",
+        originalText: "这条帖子里大家说了什么？",
+        text: "这条帖子里大家说了什么？",
         attachments: [{
           kind: "image",
           contentType: "image/jpeg",

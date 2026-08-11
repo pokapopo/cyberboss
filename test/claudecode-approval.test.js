@@ -375,6 +375,60 @@ test("claudecode process client delivers assistant text items and supports dual 
   assert.equal(resultMapped.payload.text, "done");
 });
 
+test("claudecode process client interrupts and resumes steering under one logical turn", async () => {
+  const client = new ClaudeCodeProcessClient({
+    command: "claude",
+    cwd: "/workspace",
+    env: {},
+  });
+  const writes = [];
+  const events = [];
+  client.alive = true;
+  client.stdin = {
+    write(value) {
+      writes.push(JSON.parse(String(value).trim()));
+      return true;
+    },
+  };
+  client.pendingTurnId = "turn-live";
+  client.sessionId = "11111111-1111-4111-8111-111111111111";
+  client.activeThreadId = client.sessionId;
+  client.onMessage((event) => events.push(event));
+
+  const interrupted = client.interruptCurrentTurn({ turnId: "turn-live" });
+  const request = writes[0];
+  assert.equal(request.type, "control_request");
+  assert.equal(request.request.subtype, "interrupt");
+  client.handleLine(JSON.stringify({
+    type: "control_response",
+    response: {
+      subtype: "success",
+      request_id: request.request_id,
+      response: { still_queued: [] },
+    },
+  }));
+  client.handleLine(JSON.stringify({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    session_id: client.sessionId,
+    result: "",
+  }));
+  await interrupted;
+
+  await client.sendUserMessage({
+    text: "新的引导",
+    threadId: client.sessionId,
+    turnId: "turn-live",
+    emitTurnStarted: false,
+  });
+
+  assert.equal(client.pendingTurnId, "turn-live");
+  assert.equal(writes[1].type, "user");
+  assert.equal(writes[1].message.content, "新的引导");
+  assert.deepEqual(events.map((event) => event.type), ["turn.interrupted"]);
+});
+
 test("claudecode runtime params are isolated from codex model selections", () => {
   const sessionsFile = path.join(
     os.tmpdir(),

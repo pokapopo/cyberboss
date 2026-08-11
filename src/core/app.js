@@ -37,6 +37,7 @@ const { TurnGateStore } = require("./turn-gate-store");
 const { createMessageDebouncer } = require("./message-debounce");
 const { WeixinDeliveryService } = require("./weixin-delivery-outbox");
 const { ConversationMemoryCoordinator } = require("./conversation-memory-coordinator");
+const { ConversationContinuityStore } = require("./conversation-continuity-store");
 const { ReminderQueueStore } = require("../adapters/channel/weixin/reminder-queue-store");
 const {
   matchesCommandPrefix,
@@ -101,6 +102,10 @@ class CyberbossApp {
     this.systemMessageDispatcher = null;
     this.pendingUserContexts = new Map();
     this.pendingMemoryTurns = new Map();
+    this.lastWeixinActivityAtBySender = new Map();
+    this.conversationContinuityStore = new ConversationContinuityStore({
+      filePath: config.conversationContinuityFile || path.join(config.stateDir, "conversation-continuity.json"),
+    });
     this.memoryCoordinator = new ConversationMemoryCoordinator({
       memoryService: this.projectServices.memory,
       recallEveryTurns: config.memoryRecallEveryTurns,
@@ -117,6 +122,7 @@ class CyberbossApp {
       runtimeId: this.runtimeAdapter.describe().id,
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
       onTaskDelivery: (payload) => this.weixinDeliveryService.enqueueTaskDelivery(payload),
+      onTaskProgressSuppressed: (payload) => this.weixinDeliveryService.suppressRunProgress(payload.runKey),
     });
     this.pendingOperationByRunKey = new Map();
     this.runtimeEventChain = Promise.resolve();
@@ -403,6 +409,7 @@ class CyberbossApp {
       return;
     }
 
+    this.lastWeixinActivityAtBySender.set(normalized.senderId, Date.now());
     this.primeDeferredRepliesForSender(normalized);
 
     const result = await this.messageDebouncer.enqueue(normalized.senderId, normalized);
@@ -615,18 +622,27 @@ class CyberbossApp {
       const sendTurn = typeof this.runtimeAdapter.sendTurn === "function"
         ? this.runtimeAdapter.sendTurn.bind(this.runtimeAdapter)
         : this.runtimeAdapter.sendTextTurn.bind(this.runtimeAdapter);
+      const runtimeSessionStore = this.runtimeAdapter.getSessionStore();
+      const existingThreadId = runtimeSessionStore.getThreadIdForWorkspace?.(bindingKey, workspaceRoot) || "";
+      const continuityContext = existingThreadId
+        ? null
+        : this.conversationContinuityStore?.getPending?.(pendingScopeKey) || null;
       const turn = await sendTurn({
         bindingKey,
         workspaceRoot,
         text: runtimeTurn.text,
         attachments: runtimeTurn.attachments,
         model,
+        continuityContext,
         metadata: {
           workspaceId: prepared.workspaceId,
           accountId: prepared.accountId,
           senderId: prepared.senderId,
         },
       });
+      if (continuityContext) {
+        this.conversationContinuityStore?.markConsumed?.(pendingScopeKey, turn.threadId);
+      }
       const runKey = buildRunKey(turn.threadId, turn.turnId);
       if (workLog?.id) {
         safeWorkLogCall(this, "bindRuntime", workLog.id, {
@@ -751,6 +767,15 @@ class CyberbossApp {
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
+      const steered = typeof this.trySteerPreparedTurn === "function"
+        ? await this.trySteerPreparedTurn({ bindingKey, workspaceRoot, prepared })
+        : false;
+      if (steered) {
+        return true;
+      }
+      if (!this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
+        return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+      }
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
       return false;
     }
@@ -759,6 +784,78 @@ class CyberbossApp {
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
     }
     return dispatched;
+  }
+
+  async trySteerPreparedTurn({ bindingKey, workspaceRoot, prepared }) {
+    if (prepared?.provider !== "weixin" || typeof this.runtimeAdapter.steerTurn !== "function") {
+      return false;
+    }
+    if (this.hasPendingInboundMessage?.(bindingKey, workspaceRoot)) {
+      return false;
+    }
+    const sessionStore = this.runtimeAdapter.getSessionStore();
+    const threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+    const threadState = threadId ? this.threadStateStore.getThreadState(threadId) : null;
+    const memoryTurn = threadId ? this.pendingMemoryTurns?.get?.(threadId) : null;
+    if (!threadId || !threadState?.turnId || threadState.status !== "running" || !memoryTurn) {
+      return false;
+    }
+
+    const model = sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
+    const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext: null });
+    const steeringText = [
+      "LIVE WECHAT STEERING — this message arrived while you were working on the current task.",
+      "Treat it as the user's latest direction for the same task. Adjust immediately; do not finish the obsolete path first.",
+      "",
+      runtimeTurn.text,
+    ].join("\n");
+
+    try {
+      await this.runtimeAdapter.steerTurn({
+        threadId,
+        turnId: threadState.turnId,
+        workspaceRoot,
+        text: steeringText,
+        model,
+      });
+    } catch (error) {
+      console.error(`[cyberboss] live steering failed thread=${threadId}: ${error.message}`);
+      return false;
+    }
+
+    const userText = String(prepared.originalText || prepared.text || "").trim();
+    if (userText) {
+      this.pendingUserContexts.set(
+        threadId,
+        [this.pendingUserContexts.get(threadId), userText].filter(Boolean).join("\n\n"),
+      );
+      memoryTurn.userText = [memoryTurn.userText, userText].filter(Boolean).join("\n\n");
+      this.pendingMemoryTurns.set(threadId, memoryTurn);
+    }
+    const replyTarget = {
+      userId: prepared.senderId,
+      contextToken: prepared.contextToken,
+      provider: prepared.provider,
+    };
+    this.streamDelivery.bindReplyTargetForTurn({
+      threadId,
+      turnId: threadState.turnId,
+      target: replyTarget,
+    });
+    this.weixinDeliveryService?.registerRun?.({
+      runKey: buildRunKey(threadId, threadState.turnId),
+      threadId,
+      turnId: threadState.turnId,
+      target: replyTarget,
+    });
+    this.scheduleTurnTimeout({
+      bindingKey,
+      workspaceRoot,
+      threadId,
+      turnId: threadState.turnId,
+    });
+    console.log(`[cyberboss] live steering delivered thread=${threadId} turn=${threadState.turnId}`);
+    return true;
   }
 
   hasPendingImageInbound(bindingKey, workspaceRoot) {
@@ -904,6 +1001,10 @@ class CyberbossApp {
       retryCount: (Number(prepared.retryCount) || 0) + 1,
     });
     this.pendingInboundByScope.set(scopeKey, current);
+    this.streamDelivery?.suppressTaskProgress?.({
+      bindingKey,
+      userId: prepared.senderId,
+    });
     void this.channelAdapter.sendTyping({
       userId: prepared.senderId,
       status: 1,
@@ -1095,6 +1196,11 @@ class CyberbossApp {
     const pendingMessages = this.systemMessageDispatcher?.drainPending() || [];
     for (const message of pendingMessages) {
       try {
+        const deferred = this.deferIncrementalMaintenanceUntilIdle(message);
+        if (deferred) {
+          this.systemMessageDispatcher.requeue(deferred);
+          continue;
+        }
         const dispatched = await this.dispatchSystemMessage(message);
         if (!dispatched) {
           this.systemMessageDispatcher.requeue(message);
@@ -1103,6 +1209,23 @@ class CyberbossApp {
         this.systemMessageDispatcher?.requeue(message);
       }
     }
+  }
+
+  deferIncrementalMaintenanceUntilIdle(message) {
+    if (normalizeCommandArgument(message?.triggerKind) !== "diary_incremental") {
+      return null;
+    }
+    const idleMs = Math.max(0, Number(this.config.timelineIdleMs) || 0);
+    const lastActivityAt = this.lastWeixinActivityAtBySender.get(message.senderId) || 0;
+    const notBeforeMs = lastActivityAt + idleMs;
+    if (!lastActivityAt || Date.now() >= notBeforeMs) {
+      return null;
+    }
+    const currentNotBeforeMs = Date.parse(message.notBefore || "") || 0;
+    return {
+      ...message,
+      notBefore: new Date(Math.max(currentNotBeforeMs, notBeforeMs)).toISOString(),
+    };
   }
 
   async flushPendingTimelineScreenshots(account) {
@@ -1144,14 +1267,17 @@ class CyberbossApp {
   }
 
   resolveLongPollTimeoutMs() {
-    if (this.systemMessageDispatcher?.hasPending()) {
+    if (this.systemMessageDispatcher?.hasDuePending()) {
       return MIN_LONG_POLL_TIMEOUT_MS;
     }
     if (this.activeAccountId && this.timelineScreenshotQueue.hasPendingForAccount(this.activeAccountId)) {
       return MIN_LONG_POLL_TIMEOUT_MS;
     }
 
-    const nextDueAtMs = this.reminderQueue.peekNextDueAtMs();
+    const nextDueAtMs = [
+      this.reminderQueue.peekNextDueAtMs(),
+      this.systemMessageDispatcher?.peekNextDueAtMs?.() || 0,
+    ].filter((value) => Number(value) > 0).sort((left, right) => left - right)[0] || 0;
     if (!nextDueAtMs) {
       return DEFAULT_LONG_POLL_TIMEOUT_MS;
     }
@@ -1434,6 +1560,7 @@ class CyberbossApp {
       senderId: normalized.senderId,
     });
     const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    this.conversationContinuityStore?.clearPending?.(buildScopeKey(bindingKey, workspaceRoot));
     if (typeof this.runtimeAdapter.startFreshThreadDraft === "function") {
       await this.runtimeAdapter.startFreshThreadDraft({ bindingKey, workspaceRoot });
     }
@@ -1544,6 +1671,8 @@ class CyberbossApp {
     if (this.turnGateStore.isPending(linked.bindingKey, linked.workspaceRoot)) return;
     if (this.hasPendingInboundMessage(linked.bindingKey, linked.workspaceRoot)) return;
 
+    if (this.runtimeAdapter.describe().id !== "claudecode") return;
+    if (typeof this.runtimeAdapter.generateContinuityCheckpoint !== "function") return;
     const contextWindow = Number(this.config.claudeContextWindow) || 200000;
     const reservedOutput = Math.max(0, Number(this.config.claudeMaxOutputTokens) || 0);
     const availableWindow = contextWindow - reservedOutput;
@@ -1552,19 +1681,57 @@ class CyberbossApp {
     const currentTokens = threadState?.context?.currentTokens;
     if (!Number.isFinite(currentTokens)) return;
     const usageRatio = currentTokens / availableWindow;
-    if (usageRatio < 0.70) return;
+    const configuredPercent = Number(this.config.autoCompactThresholdPercent) || 85;
+    const threshold = Math.max(70, Math.min(95, configuredPercent)) / 100;
+    if (usageRatio < threshold) return;
     if (!this._lastAutoCompactAt) this._lastAutoCompactAt = new Map();
-    const lastCompact = this._lastAutoCompactAt.get(threadId) || 0;
-    if (Date.now() - lastCompact < 600000) return; // 10 min cooldown
-    this._lastAutoCompactAt.set(threadId, Date.now());
+    const lastAttempt = this._lastAutoCompactAt.get(threadId) || 0;
+    const retryCoolingDown = Date.now() - lastAttempt < 30 * 60_000;
     const sessionStore = this.runtimeAdapter.getSessionStore();
     const runtimeParams = sessionStore.getRuntimeParamsForWorkspace(linked.bindingKey, linked.workspaceRoot);
-    console.error(`[cyberboss] auto-compact triggered thread=${threadId} usage=${Math.round(usageRatio * 100)}% tokens=${currentTokens}/${availableWindow}`);
-    this.runtimeAdapter.compactThread({
-      threadId,
-      workspaceRoot: linked.workspaceRoot,
-      model: runtimeParams.model,
-    }).catch(err => console.error('[cyberboss] auto-compact failed:', err.message));
+    if (!retryCoolingDown) {
+      this._lastAutoCompactAt.set(threadId, Date.now());
+      console.error(`[cyberboss] continuity rollover triggered thread=${threadId} usage=${Math.round(usageRatio * 100)}% tokens=${currentTokens}/${availableWindow}`);
+      let stagedScopeKey = "";
+      try {
+        const result = await this.runtimeAdapter.generateContinuityCheckpoint({
+          threadId,
+          workspaceRoot: linked.workspaceRoot,
+          model: runtimeParams.model,
+        });
+        if (!normalizeCommandArgument(result?.text)) {
+          throw new Error("continuity checkpoint was empty");
+        }
+        stagedScopeKey = buildScopeKey(linked.bindingKey, linked.workspaceRoot);
+        this.conversationContinuityStore.stageCheckpoint(stagedScopeKey, {
+          text: result.text,
+          oldThreadId: threadId,
+        });
+        await this.runtimeAdapter.startFreshThreadDraft({
+          bindingKey: linked.bindingKey,
+          workspaceRoot: linked.workspaceRoot,
+        });
+        sessionStore.clearThreadIdForWorkspace(linked.bindingKey, linked.workspaceRoot);
+        console.error(`[cyberboss] continuity rollover staged oldThread=${threadId}`);
+        return;
+      } catch (error) {
+        if (stagedScopeKey) this.conversationContinuityStore.clearPending(stagedScopeKey);
+        console.error(`[cyberboss] continuity rollover failed thread=${threadId}: ${error.message}`);
+      }
+    }
+    if (usageRatio >= 0.92) {
+      if (!this._lastFallbackCompactAt) this._lastFallbackCompactAt = new Map();
+      const lastFallback = this._lastFallbackCompactAt.get(threadId) || 0;
+      if (Date.now() - lastFallback < 30 * 60_000) return;
+      this._lastFallbackCompactAt.set(threadId, Date.now());
+      console.error(`[cyberboss] continuity fallback compact thread=${threadId} usage=${Math.round(usageRatio * 100)}%`);
+      await this.runtimeAdapter.compactThread({
+        threadId,
+        workspaceRoot: linked.workspaceRoot,
+        model: runtimeParams.model,
+        silent: true,
+      }).catch((error) => console.error(`[cyberboss] continuity fallback compact failed: ${error.message}`));
+    }
   }
 
   async handleSwitchCommand(normalized, command) {
@@ -1853,6 +2020,10 @@ class CyberbossApp {
       const memoryTurn = this.pendingMemoryTurns?.get?.(event.payload.threadId);
       if (memoryTurn) {
         this.pendingMemoryTurns.delete(event.payload.threadId);
+        this.conversationContinuityStore?.recordTurn?.(memoryTurn.scopeKey, {
+          userText: memoryTurn.userText,
+          assistantText: event.payload?.text || "",
+        });
         this.memoryCoordinator?.completeTurn?.({
           scopeKey: memoryTurn.scopeKey,
           userText: memoryTurn.userText,

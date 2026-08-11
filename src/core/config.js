@@ -40,6 +40,8 @@ function readConfig() {
       || path.join(stateDir, "memory-search", "embeddings.json"),
     memoryCandidatesFile: readTextEnv("CYBERBOSS_MEMORY_CANDIDATES_FILE")
       || path.join(stateDir, "memory-candidates.json"),
+    recentMemoryFile: readTextEnv("CYBERBOSS_RECENT_MEMORY_FILE")
+      || path.join(stateDir, "recent-memory.json"),
     memoryApiBaseUrl: readTextEnv("CYBERBOSS_MEMORY_API_BASE_URL") || visionApiBaseUrl,
     memoryApiKey: readTextEnv("CYBERBOSS_MEMORY_API_KEY") || visionApiKey,
     memoryEmbeddingModel: readTextEnv("CYBERBOSS_MEMORY_EMBEDDING_MODEL") || "text-embedding-v4",
@@ -50,6 +52,7 @@ function readConfig() {
     memoryTimeoutMs: readIntEnv("CYBERBOSS_MEMORY_TIMEOUT_MS") || 15_000,
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     timelineObservationFile: path.join(stateDir, "timeline-observations.json"),
+    timelineIdleMs: readIntEnv("CYBERBOSS_TIMELINE_IDLE_MS") || 10 * 60_000,
     timelineScreenshotQueueFile: path.join(stateDir, "timeline-screenshot-queue.json"),
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
     weixinInstructionsFile: path.join(stateDir, "weixin-instructions.md"),
@@ -98,11 +101,20 @@ function readConfig() {
     claudeModel: readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "",
     claudeContextWindow: readIntEnv("CYBERBOSS_CLAUDE_CONTEXT_WINDOW"),
     claudeMaxOutputTokens: readIntEnv("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+    autoCompactThresholdPercent: readIntEnv("CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT") || 85,
     claudePermissionMode: readTextEnv("CYBERBOSS_CLAUDE_PERMISSION_MODE") || "default",
     claudeDisableVerbose: readBoolEnv("CYBERBOSS_CLAUDE_DISABLE_VERBOSE"),
     claudeExtraArgs: readListEnv("CYBERBOSS_CLAUDE_EXTRA_ARGS"),
     sessionsFile: path.join(stateDir, "sessions.json"),
+    conversationContinuityFile: path.join(stateDir, "conversation-continuity.json"),
     startWithCheckin: (mode === "start" && hasArgFlag(argv, "--checkin")) || readBoolEnv("CYBERBOSS_ENABLE_CHECKIN"),
+    apiEnabled: mode === "start" ? (readOptionalBoolEnv("CYBERBOSS_API_ENABLED") === true) : (mode === "api"),
+    apiHost: readTextEnv("CYBERBOSS_API_HOST") || "127.0.0.1",
+    apiPort: readIntEnv("CYBERBOSS_API_PORT") || 3456,
+    apiKey: readTextEnv("CYBERBOSS_API_KEY") || "",
+    apiSessionIdleTimeoutMs: readIntEnv("CYBERBOSS_API_SESSION_IDLE_TIMEOUT_MS") || 600_000,
+    apiMaxSessions: readIntEnv("CYBERBOSS_API_MAX_SESSIONS") || 10,
+    apiSessionStateFile: path.join(stateDir, "api-session-continuity.json"),
   };
 }
 

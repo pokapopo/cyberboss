@@ -593,6 +593,160 @@ test("flushPendingInboundMessages batches queued messages from the same scope in
   assert.match(dispatched[0].prepared.text, /第一条[\s\S]*第二条/);
 });
 
+test("buffering a newer inbound message suppresses old-run progress", () => {
+  const calls = [];
+  const appLike = {
+    pendingInboundByScope: new Map(),
+    streamDelivery: {
+      suppressTaskProgress(payload) {
+        calls.push(payload);
+      },
+    },
+    channelAdapter: {
+      async sendTyping() {},
+    },
+  };
+
+  CyberbossApp.prototype.bufferPendingInboundMessage.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared: {
+      workspaceId: "default",
+      accountId: "acc-1",
+      senderId: "user-1",
+      messageId: "newer-message",
+      contextToken: "ctx-new",
+      provider: "weixin",
+      text: "新的消息",
+    },
+  });
+
+  assert.deepEqual(calls, [{ bindingKey: "binding-1", userId: "user-1" }]);
+});
+
+test("raw inbound records activity without suppressing steerable progress", async () => {
+  const calls = [];
+  const appLike = {
+    channelAdapter: {
+      normalizeIncomingMessage(message) {
+        return message;
+      },
+    },
+    lastWeixinActivityAtBySender: new Map(),
+    primeDeferredRepliesForSender() {
+      calls.push(["wake"]);
+    },
+    messageDebouncer: {
+      async enqueue() {
+        calls.push(["debounce"]);
+        return { enqueued: true };
+      },
+    },
+  };
+
+  await CyberbossApp.prototype.handleIncomingMessage.call(appLike, {
+    senderId: "user-1",
+    text: "新的消息",
+  });
+
+  assert.deepEqual(calls, [
+    ["wake"],
+    ["debounce"],
+  ]);
+  assert.equal(appLike.lastWeixinActivityAtBySender.has("user-1"), true);
+});
+
+test("a newer conversational message steers the active Claude turn", async () => {
+  const steered = [];
+  const rebound = [];
+  const appLike = {
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          getThreadIdForWorkspace() {
+            return "thread-1";
+          },
+          getRuntimeParamsForWorkspace() {
+            return { model: "deepseek-v4-pro" };
+          },
+        };
+      },
+      async steerTurn(payload) {
+        steered.push(payload);
+      },
+    },
+    threadStateStore: {
+      getThreadState() {
+        return { status: "running", turnId: "turn-1" };
+      },
+    },
+    pendingInboundByScope: new Map(),
+    pendingUserContexts: new Map([["thread-1", "原始任务"]]),
+    pendingMemoryTurns: new Map([["thread-1", { scopeKey: "scope-1", userText: "原始任务" }]]),
+    hasPendingInboundMessage() {
+      return false;
+    },
+    async buildRuntimeTurn() {
+      return { text: "[时间]\n\n改变方向" };
+    },
+    streamDelivery: {
+      bindReplyTargetForTurn(payload) {
+        rebound.push(payload);
+      },
+    },
+    weixinDeliveryService: {
+      registerRun(payload) {
+        rebound.push(payload);
+      },
+    },
+    scheduleTurnTimeout(payload) {
+      rebound.push(payload);
+    },
+  };
+
+  const result = await CyberbossApp.prototype.trySteerPreparedTurn.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared: {
+      provider: "weixin",
+      senderId: "user-1",
+      contextToken: "ctx-new",
+      originalText: "改变方向",
+      text: "改变方向",
+    },
+  });
+
+  assert.equal(result, true);
+  assert.equal(steered.length, 1);
+  assert.equal(steered[0].turnId, "turn-1");
+  assert.match(steered[0].text, /LIVE WECHAT STEERING/);
+  assert.match(steered[0].text, /改变方向/);
+  assert.equal(appLike.pendingMemoryTurns.get("thread-1").userText, "原始任务\n\n改变方向");
+  assert.equal(rebound[0].target.contextToken, "ctx-new");
+});
+
+test("incremental timeline maintenance waits for the Weixin quiet window", () => {
+  const lastActivity = Date.now() - 30_000;
+  const appLike = {
+    config: { timelineIdleMs: 10 * 60_000 },
+    lastWeixinActivityAtBySender: new Map([["user-1", lastActivity]]),
+  };
+
+  const deferred = CyberbossApp.prototype.deferIncrementalMaintenanceUntilIdle.call(appLike, {
+    id: "diary-1",
+    senderId: "user-1",
+    triggerKind: "diary_incremental",
+    createdAt: new Date().toISOString(),
+  });
+
+  assert.ok(Date.parse(deferred.notBefore) >= lastActivity + 10 * 60_000);
+  assert.equal(CyberbossApp.prototype.deferIncrementalMaintenanceUntilIdle.call(appLike, {
+    id: "final-1",
+    senderId: "user-1",
+    triggerKind: "diary_finalize",
+  }), null);
+});
+
 test("flushPendingInboundMessages falls back to messageId ordering when receivedAt ties", async () => {
   const dispatched = [];
   const appLike = {

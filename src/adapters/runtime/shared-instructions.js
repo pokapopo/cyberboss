@@ -2,11 +2,11 @@ const fs = require("fs");
 const { renderInstructionTemplate } = require("../../core/instructions-template");
 const { loadTurnContext } = require("../../core/recent-context");
 
-function buildOpeningTurnText(config, userText) {
+function buildOpeningTurnText(config, userText, { continuity = null } = {}) {
   const instructions = loadWechatInstructions(config);
   const recent = loadTurnContext();
   const normalizedText = String(userText || "").trim();
-  if (!instructions) {
+  if (!instructions && !continuity?.checkpoint) {
     return normalizedText;
   }
   const parts = [
@@ -16,13 +16,33 @@ function buildOpeningTurnText(config, userText) {
     "",
     instructions,
   ];
-  if (recent) {
+  if (recent && !continuity?.checkpoint) {
     parts.push(
       "",
       recent,
       "",
       "(Use the above context to understand what was happening in the previous session. Reply naturally.)",
     );
+  }
+  if (continuity?.checkpoint) {
+    parts.push(
+      "",
+      "INTERNAL CONVERSATION CONTINUITY CHECKPOINT",
+      "This is internal continuity context, not a new user statement. Continue naturally without mentioning this checkpoint.",
+      continuity.checkpoint,
+    );
+    const turns = Array.isArray(continuity.turns) ? continuity.turns : [];
+    if (turns.length) {
+      parts.push("", "RECENT VISIBLE WECHAT TURNS (verbatim where available)");
+      turns.forEach((turn, index) => {
+        parts.push(
+          `Turn ${index + 1} — uu:`,
+          String(turn?.user || "").trim(),
+          `Turn ${index + 1} — CC:`,
+          String(turn?.assistant || "").trim(),
+        );
+      });
+    }
   }
   parts.push(
     "",
