@@ -1,0 +1,142 @@
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+index e7a78de..c51ca1a 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+@@ -181,8 +181,20 @@ class ChatCompletionsAPI(
+                         val model = it["model"]?.jsonPrimitive?.contentOrNull ?: ""
+
+                         val choices = it["choices"]?.jsonArray ?: JsonArray(emptyList())
++                        val cyberbossMessage = parseCyberbossEvent(
++                            it["cyberboss_event"]?.jsonObjectOrNull
++                        )
+                         val choiceList = buildList {
+-                            if (choices.isNotEmpty()) {
++                            if (cyberbossMessage != null) {
++                                add(
++                                    UIMessageChoice(
++                                        index = 0,
++                                        delta = cyberbossMessage,
++                                        message = null,
++                                        finishReason = "unknown",
++                                    )
++                                )
++                            } else if (choices.isNotEmpty()) {
+                                 val choice = choices[0].jsonObject
+                                 val message =
+                                     choice["delta"]?.jsonObject ?: choice["message"]?.jsonObject
+@@ -777,6 +789,51 @@ class ChatCompletionsAPI(
+         )
+     }
+
++    /**
++     * Cyberboss is an Agent runtime, so its tools have already run on the server.
++     * Convert its optional SSE extension into the existing Tool part used by the
++     * native RikkaHub renderer. A completed event carries non-empty output, which
++     * also prevents GenerationHandler from executing the tool a second time.
++     */
++    private fun parseCyberbossEvent(event: JsonObject?): UIMessage? {
++        if (event?.get("protocol")?.jsonPrimitiveOrNull?.contentOrNull != "cyberboss.agent.v1") {
++            return null
++        }
++        val type = event["type"]?.jsonPrimitiveOrNull?.contentOrNull ?: return null
++        val toolCallId = event["tool_call_id"]?.jsonPrimitiveOrNull?.contentOrNull ?: return null
++        val toolName = event["name"]?.jsonPrimitiveOrNull?.contentOrNull ?: ""
++        val part = when (type) {
++            "tool.started" -> UIMessagePart.Tool(
++                toolCallId = toolCallId,
++                toolName = toolName,
++                input = event["arguments"]?.toString() ?: "{}",
++                output = emptyList(),
++            )
++
++            "tool.completed" -> {
++                val content = event["content"]?.jsonPrimitiveOrNull?.contentOrNull.orEmpty()
++                UIMessagePart.Tool(
++                    toolCallId = toolCallId,
++                    // Tool.merge appends streaming name/input fragments. The
++                    // started event already supplied both, so keep these empty.
++                    toolName = "",
++                    input = "",
++                    output = listOf(
++                        UIMessagePart.Text(
++                            content.ifEmpty { "(completed without textual output)" }
++                        )
++                    ),
++                )
++            }
++
++            else -> return null
++        }
++        return UIMessage(
++            role = MessageRole.ASSISTANT,
++            parts = listOf(part),
++        )
++    }
++
+     private fun parseAnnotations(jsonArray: JsonArray): List<UIMessageAnnotation> {
+         return jsonArray.map { element ->
+             val type =
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
+index 262efb3..dae64a5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
+@@ -20,6 +20,7 @@ import me.rerere.ai.core.ReasoningLevel
+ import me.rerere.ai.core.Tool
+ import me.rerere.ai.core.merge
+ import me.rerere.ai.provider.CustomBody
++import me.rerere.ai.provider.CustomHeader
+ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.Provider
+ import me.rerere.ai.provider.ProviderManager
+@@ -69,6 +70,7 @@ class GenerationHandler(
+     private val memoryRepo: MemoryRepository,
+ ) {
+     fun generateText(
++        conversationId: Uuid,
+         settings: Settings,
+         model: Model,
+         messages: List<UIMessage>,
+@@ -126,6 +128,7 @@ class GenerationHandler(
+             // Skip generation if we have approved/denied tool calls to handle
+             if (pendingTools.isEmpty()) {
+                 generateInternal(
++                    conversationId = conversationId,
+                     assistant = assistant,
+                     settings = settings,
+                     messages = messages,
+@@ -344,6 +347,7 @@ class GenerationHandler(
+     }.flowOn(Dispatchers.IO)
+
+     private suspend fun generateInternal(
++        conversationId: Uuid,
+         assistant: Assistant,
+         settings: Settings,
+         messages: List<UIMessage>,
+@@ -407,8 +411,13 @@ class GenerationHandler(
+             tools = tools,
+             reasoningLevel = assistant.reasoningLevel,
+             customHeaders = buildList {
+-                addAll(assistant.customHeaders)
+-                addAll(model.customHeaders)
++                addAll(assistant.customHeaders.filterNot {
++                    it.name.equals("X-Conversation-Id", ignoreCase = true)
++                })
++                addAll(model.customHeaders.filterNot {
++                    it.name.equals("X-Conversation-Id", ignoreCase = true)
++                })
++                add(CustomHeader("X-Conversation-Id", conversationId.toString()))
+             },
+             customBody = buildList {
+                 addAll(assistant.customBodies)
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+index 934b78a..30b5efd 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+@@ -503,6 +503,7 @@ class ChatService(
+             // start generating
+             val session = getOrCreateSession(conversationId)
+             generationHandler.generateText(
++                conversationId = conversationId,
+                 settings = settings,
+                 model = model,
+                 processingStatus = session.processingStatus,

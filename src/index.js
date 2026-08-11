@@ -11,6 +11,7 @@ const { buildTerminalHelpText } = require("./core/command-registry");
 const { ensureStickerCatalogFilesSync } = require("./services/sticker-service");
 const { createProjectTooling } = require("./tools/create-project-tooling");
 const { runToolMcpServer } = require("./tools/mcp-stdio-server");
+const { startApiServer } = require("./api");
 
 function ensureDefaultStateDirectory() {
   fs.mkdirSync(path.join(os.homedir(), ".cyberboss"), { recursive: true });
@@ -211,7 +212,19 @@ async function main() {
     process.on("exit", () => {
       try { fs.unlinkSync(pidFile); } catch {}
     });
+
+    if (config.apiEnabled) {
+      startApiServer(config).catch((err) => {
+        console.error(`[cyberboss] API server failed: ${err.message}`);
+      });
+    }
+
     await getApp().start();
+    return;
+  }
+
+  if (command === "api") {
+    await startApiServer(config);
     return;
   }
 

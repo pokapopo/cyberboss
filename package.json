@@ -13,6 +13,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "build:personal-dashboard": "node ./scripts/build-personal-dashboard.js",
     "postinstall": "patch-package",
     "start": "node ./bin/cyberboss.js start",
     "start:checkin": "node ./bin/cyberboss.js start --checkin",
@@ -24,12 +25,14 @@
     "shared:start": "node ./scripts/shared-start.js",
     "shared:open": "node ./scripts/shared-open.js",
     "shared:status": "node ./scripts/shared-status.js",
+    "agent:status": "node ./scripts/agent-status.js",
     "check:syntax": "node ./scripts/check-syntax.js",
     "test": "node --test",
     "check": "npm run check:syntax && npm test"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
+    "express": "^4.21.0",
     "patch-package": "^8.0.1",
     "playwright-core": "^1.59.1",
     "qrcode-terminal": "0.12.0",
