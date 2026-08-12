@@ -8,6 +8,7 @@ const {
   ensureClaudeProjectMcpConfig,
   buildClaudeProjectMcpServerConfig,
 } = require("../src/adapters/runtime/claudecode/project-settings");
+const { filterClaudeCodeEnv } = require("../src/adapters/runtime/claudecode");
 
 test("ensureClaudeProjectMcpConfig upserts cyberboss MCP server into workspace .mcp.json", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-claude-settings-"));
@@ -66,4 +67,16 @@ test("ensureClaudeProjectMcpConfig rewrites stale cyberboss MCP server config", 
     workspaceRoot,
     cyberbossHome,
   }));
+});
+
+test("Claude runtime disables its parallel project auto-memory", () => {
+  const env = filterClaudeCodeEnv({
+    HOME: "/root",
+    CLAUDECODE: "nested",
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: "0",
+  });
+
+  assert.equal(env.HOME, "/root");
+  assert.equal(env.CLAUDECODE, undefined);
+  assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
 });

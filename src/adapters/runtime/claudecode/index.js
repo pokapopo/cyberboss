@@ -486,10 +486,13 @@ function filterClaudeCodeEnv(env) {
       out[key] = value;
     }
   }
+  // Cyberboss owns long-term memory through its configured MCP memory runtime.
+  // Prevent Claude Code from silently loading or writing a second legacy store.
+  out.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   return out;
 }
 
-module.exports = { createClaudeCodeRuntimeAdapter };
+module.exports = { createClaudeCodeRuntimeAdapter, filterClaudeCodeEnv };
 
 function normalizeThreadId(value) {
   return typeof value === "string" ? value.replace(/\s+/g, "").trim() : "";
