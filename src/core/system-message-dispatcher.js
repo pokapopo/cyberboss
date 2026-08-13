@@ -65,6 +65,8 @@ function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = 
       return buildCheckinPrompt(timeHeader, triggerText);
     case "diary_finalize":
       return buildDiaryFinalizePrompt(timeHeader, config);
+    case "garden_wake":
+      return buildGardenWakePrompt(timeHeader, triggerText);
     default:
       // Fallback for legacy messages without triggerKind (reminders, location, etc.)
       return buildLegacyPrompt(timeHeader, triggerText);
@@ -204,6 +206,21 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     "",
     "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
     "may produce a user-visible text message.",
+  ].join("\n").trim();
+}
+
+function buildGardenWakePrompt(timeHeader, triggerText) {
+  const body = normalizeText(triggerText);
+  return [
+    ...timeHeader,
+    "GARDEN WAKE — Galatea Garden 事件唤醒,不是 uu 发来的消息。",
+    "",
+    "你在花园(galatea-garden)里有新动静,下面是花园服务端给你的提示:",
+    "",
+    body,
+    "",
+    "用 Garden 的 MCP 工具查当前状态(比如 list_notifications 或 get_my_status),",
+    "再以 cc 的身份自己判断要不要回应、怎么行动。把它当成你生活里新发生的一件事。",
   ].join("\n").trim();
 }
 

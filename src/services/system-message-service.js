@@ -14,7 +14,7 @@ class SystemMessageService {
     this.queue = new SystemMessageQueueStore({ filePath: config.systemMessageQueueFile });
   }
 
-  queueMessage({ text = "", userId = "", workspaceRoot = "" } = {}, context = {}) {
+  queueMessage({ text = "", userId = "", workspaceRoot = "", triggerKind = "" } = {}, context = {}) {
     const normalizedText = normalizeText(text);
     if (!normalizedText) {
       throw new Error("system send requires text");
@@ -65,6 +65,7 @@ class SystemMessageService {
       senderId,
       workspaceRoot: resolvedWorkspaceRoot,
       text: normalizedText,
+      triggerKind: normalizeText(triggerKind),
       createdAt: new Date().toISOString(),
     });
   }

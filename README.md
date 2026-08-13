@@ -144,6 +144,8 @@ CYBERBOSS_CODEX_MODEL_PROVIDER=
 CYBERBOSS_CODEX_NATIVE_IMAGE_INPUT=
 CYBERBOSS_CLAUDE_COMMAND=claude
 CYBERBOSS_CLAUDE_MODEL=
+CYBERBOSS_CLAUDE_EFFORT=high
+CYBERBOSS_CLAUDE_IDLE_TIMEOUT_MS=
 CYBERBOSS_CLAUDE_CONTEXT_WINDOW=
 CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT=85
 CYBERBOSS_CLAUDE_PERMISSION_MODE=default
@@ -190,6 +192,10 @@ What these do:
   Override the Claude launcher. Default is `claude`.
 - `CYBERBOSS_CLAUDE_MODEL`
   Set the default Claude model.
+- `CYBERBOSS_CLAUDE_EFFORT`
+  Set Claude's reasoning effort to `low`, `medium`, `high`, or `max`. Default is `high`.
+- `CYBERBOSS_CLAUDE_IDLE_TIMEOUT_MS`
+  Gracefully close an idle Claude/MCP process tree after this many milliseconds while preserving its resumable session ID. Empty or `0` disables hibernation.
 - `CYBERBOSS_CLAUDE_CONTEXT_WINDOW`
   Set Claude's effective context window so `/status` can show an approximate context usage line.
 - `CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT`

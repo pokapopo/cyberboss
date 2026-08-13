@@ -5,7 +5,10 @@ const { ClaudeCodeProcessClient } = require("./process-client");
 const { mapClaudeCodeMessageToRuntimeEvent } = require("./events");
 const { ensureClaudeProjectMcpConfig } = require("./project-settings");
 const { SessionStore } = require("../codex/session-store");
-const { buildOpeningTurnText, buildInstructionRefreshText } = require("../shared-instructions");
+const {
+  buildOpeningTurnText,
+  buildInstructionRefreshText,
+} = require("../shared-instructions");
 const { ClaudeCodeIpcServer } = require("./ipc-server");
 const CLAUDE_RESUME_SESSION_TIMEOUT_MS = 8000;
 
@@ -15,6 +18,8 @@ function createClaudeCodeRuntimeAdapter(config) {
   const pendingApprovals = new Map();
   const pendingModelByWorkspaceRoot = new Map();
   const internalTurnsByWorkspace = new Map();
+  const idleTimersByWorkspace = new Map();
+  const idleTimeoutMs = normalizeIdleTimeoutMs(config.claudeIdleTimeoutMs);
   const configuredModel = normalizeText(config.claudeModel);
   let globalListener = null;
   const IS_WINDOWS = os.platform() === "win32";
@@ -32,6 +37,7 @@ function createClaudeCodeRuntimeAdapter(config) {
     if (msg?.type === "sendUserMessage" && msg?.workspaceRoot) {
       const client = clientsByWorkspace.get(msg.workspaceRoot);
       if (client?.alive) {
+        cancelIdleTimer(msg.workspaceRoot);
         client.sendUserMessage({ text: msg.text || "" }).catch(() => {});
       }
     }
@@ -68,6 +74,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       cwd: workspaceRoot,
       env: filterClaudeCodeEnv(process.env),
       model: desiredModel,
+      effort: config.claudeEffort || "high",
       permissionMode: config.claudePermissionMode || "default",
       disableVerbose: Boolean(config.claudeDisableVerbose),
       extraArgs: config.claudeExtraArgs || [],
@@ -86,7 +93,9 @@ function createClaudeCodeRuntimeAdapter(config) {
         }
         if (event.type === "turn.completed") {
           finishInternalTurn(workspaceRoot, null, event.text || internal.text || "");
+          armIdleTimer(workspaceRoot, client);
         } else if (event.type === "process.error" || event.type === "process.close") {
+          cancelIdleTimer(workspaceRoot);
           finishInternalTurn(workspaceRoot, new Error(event.error || "internal claudecode turn failed"));
         }
         return;
@@ -111,6 +120,7 @@ function createClaudeCodeRuntimeAdapter(config) {
         pendingApprovals.set(mapped.payload.requestId, workspaceRoot);
       }
       if (mapped?.type === "runtime.turn.failed") {
+        cancelIdleTimer(workspaceRoot);
         clientsByWorkspace.delete(workspaceRoot);
         // Resume/startup failure (no active turn) — clear bad thread IDs so
         // restarts don't retry the same broken session.
@@ -123,6 +133,11 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       if (mapped && globalListener) {
         globalListener(mapped, raw);
+      }
+      if (event.type === "turn.completed" || event.type === "turn.interrupted") {
+        armIdleTimer(workspaceRoot, client);
+      } else if (event.type === "process.error" || event.type === "process.close") {
+        cancelIdleTimer(workspaceRoot);
       }
     });
     clientsByWorkspace.set(workspaceRoot, client);
@@ -170,13 +185,66 @@ function createClaudeCodeRuntimeAdapter(config) {
     if (!client) {
       return;
     }
-    await client.close();
+    cancelIdleTimer(normalizedWorkspaceRoot);
     clientsByWorkspace.delete(normalizedWorkspaceRoot);
+    await client.close();
     for (const [requestId, candidateWorkspaceRoot] of pendingApprovals.entries()) {
       if (candidateWorkspaceRoot === normalizedWorkspaceRoot) {
         pendingApprovals.delete(requestId);
       }
     }
+  }
+
+  function cancelIdleTimer(workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+    const timer = idleTimersByWorkspace.get(normalizedWorkspaceRoot);
+    if (timer) {
+      clearTimeout(timer);
+      idleTimersByWorkspace.delete(normalizedWorkspaceRoot);
+    }
+  }
+
+  function armIdleTimer(workspaceRoot, client) {
+    const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+    cancelIdleTimer(normalizedWorkspaceRoot);
+    if (!normalizedWorkspaceRoot || idleTimeoutMs <= 0 || !client?.alive) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      idleTimersByWorkspace.delete(normalizedWorkspaceRoot);
+      if (
+        clientsByWorkspace.get(normalizedWorkspaceRoot) !== client
+        || !client.alive
+        || client.pendingTurnId
+        || internalTurnsByWorkspace.has(normalizedWorkspaceRoot)
+      ) {
+        return;
+      }
+      closeWorkspaceClient(normalizedWorkspaceRoot)
+        .then(() => {
+          console.log(`[claudecode-runtime] hibernated idle workspace=${normalizedWorkspaceRoot} timeout_ms=${idleTimeoutMs}`);
+        })
+        .catch((error) => {
+          console.error(`[claudecode-runtime] idle hibernation failed workspace=${normalizedWorkspaceRoot}: ${error.message}`);
+        });
+    }, idleTimeoutMs);
+    timer.unref?.();
+    idleTimersByWorkspace.set(normalizedWorkspaceRoot, timer);
+  }
+
+  async function hibernateIdleClients({ reason = "manual" } = {}) {
+    let hibernated = 0;
+    let active = 0;
+    for (const [workspaceRoot, client] of [...clientsByWorkspace.entries()]) {
+      if (client?.pendingTurnId || internalTurnsByWorkspace.has(workspaceRoot)) {
+        active += 1;
+        continue;
+      }
+      await closeWorkspaceClient(workspaceRoot);
+      hibernated += 1;
+      console.log(`[claudecode-runtime] hibernated workspace=${workspaceRoot} reason=${normalizeText(reason) || "manual"}`);
+    }
+    return { hibernated, active };
   }
   return {
     describe() {
@@ -219,6 +287,10 @@ function createClaudeCodeRuntimeAdapter(config) {
       };
     },
     async close() {
+      for (const timer of idleTimersByWorkspace.values()) {
+        clearTimeout(timer);
+      }
+      idleTimersByWorkspace.clear();
       for (const client of clientsByWorkspace.values()) {
         await client.close();
       }
@@ -228,6 +300,9 @@ function createClaudeCodeRuntimeAdapter(config) {
     async startFreshThreadDraft({ workspaceRoot }) {
       await closeWorkspaceClient(workspaceRoot);
       return { workspaceRoot };
+    },
+    async hibernateIdleClients(options = {}) {
+      return hibernateIdleClients(options);
     },
     async respondApproval({ requestId, decision, result = null }) {
       const workspaceRoot = pendingApprovals.get(requestId);
@@ -258,8 +333,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       for (const [workspaceRoot, client] of clientsByWorkspace.entries()) {
         if (client.sessionId === threadId) {
-          await client.close();
-          clientsByWorkspace.delete(workspaceRoot);
+          await closeWorkspaceClient(workspaceRoot);
           return { threadId, turnId };
         }
       }
@@ -273,6 +347,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       return { threadId: attached.threadId };
     },
     async compactThread({ threadId, workspaceRoot, model = "", silent = false }) {
+      cancelIdleTimer(workspaceRoot);
       const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
       if (silent) {
         await runInternalTurn(workspaceRoot, client, "/compact", activeThreadId);
@@ -282,6 +357,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       return { threadId: activeThreadId, turnId: client.pendingTurnId };
     },
     async generateContinuityCheckpoint({ threadId, workspaceRoot, model = "" }) {
+      cancelIdleTimer(workspaceRoot);
       const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
       const text = await runInternalTurn(
         workspaceRoot,
@@ -292,6 +368,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       return { threadId: activeThreadId, text };
     },
     async refreshThreadInstructions({ threadId, workspaceRoot, model = "" }) {
+      cancelIdleTimer(workspaceRoot);
       const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
       const refreshText = buildInstructionRefreshText(config);
       await client.sendUserMessage({ text: refreshText, threadId: activeThreadId });
@@ -301,6 +378,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       return this.sendTurn(args);
     },
     async steerTurn({ threadId, turnId, workspaceRoot, text, model = "" }) {
+      cancelIdleTimer(workspaceRoot);
       const normalizedTurnId = normalizeText(turnId);
       if (!normalizedTurnId) {
         throw new Error("turnId is required for claudecode steering");
@@ -323,6 +401,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       };
     },
     async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null }) {
+      cancelIdleTimer(workspaceRoot);
       const desiredModel = resolveModel(model);
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
       if (!threadId) {
@@ -349,7 +428,10 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       const { client, threadId: activeThreadId } = attached;
       const outboundText = openingTurn
-        ? buildOpeningTurnText(config, text, { continuity: continuityContext })
+        ? buildOpeningTurnText(config, text, {
+          continuity: continuityContext,
+          includeInstructions: false,
+        })
         : text;
       const outboundThreadId = activeThreadId || threadId;
       console.error(`[cyberboss] claudecode sendTurn opening=${openingTurn} threadId=${outboundThreadId} preview=${String(text || "").slice(0, 80).replace(/\n/g, "\\n")}`);
@@ -434,6 +516,7 @@ function createClaudeCodeRuntimeAdapter(config) {
   }
 
   function runInternalTurn(workspaceRoot, client, text, threadId) {
+    cancelIdleTimer(workspaceRoot);
     if (internalTurnsByWorkspace.has(workspaceRoot)) {
       throw new Error("an internal claudecode turn is already running");
     }
@@ -500,6 +583,11 @@ function normalizeThreadId(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeIdleTimeoutMs(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
 }
 
 function extractClaudeMessageModel(raw) {

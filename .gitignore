@@ -15,4 +15,5 @@ temp/
 cheatsheet-gaoshu.txt
 tmp-cdn-probe.js
 CLAUDE.local.md
+.private-prompts/
 docs/superpowers/specs/

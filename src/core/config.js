@@ -57,7 +57,8 @@ function readConfig() {
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
     weixinInstructionsFile: path.join(stateDir, "weixin-instructions.md"),
     weixinContextFile: path.join(stateDir, "weixin-context.md"),
-    weixinOperationsFile: path.resolve(__dirname, "..", "..", "templates", "weixin-operations.md"),
+    weixinOperationsFile: readTextEnv("CYBERBOSS_WEIXIN_OPERATIONS_FILE")
+      || path.join(stateDir, "weixin-operations.md"),
     stickersDir: path.join(stateDir, "stickers"),
     stickerAssetsDir: path.join(stateDir, "stickers", "assets"),
     stickersIndexFile: path.join(stateDir, "stickers", "index.json"),
@@ -99,6 +100,8 @@ function readConfig() {
     visionTimeoutMs: readIntEnv("CYBERBOSS_VISION_TIMEOUT_MS") || 30_000,
     claudeCommand: readTextEnv("CYBERBOSS_CLAUDE_COMMAND") || "claude",
     claudeModel: readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "",
+    claudeEffort: readTextEnv("CYBERBOSS_CLAUDE_EFFORT") || "high",
+    claudeIdleTimeoutMs: readIntEnv("CYBERBOSS_CLAUDE_IDLE_TIMEOUT_MS"),
     claudeContextWindow: readIntEnv("CYBERBOSS_CLAUDE_CONTEXT_WINDOW"),
     claudeMaxOutputTokens: readIntEnv("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
     autoCompactThresholdPercent: readIntEnv("CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT") || 85,

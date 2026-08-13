@@ -2,20 +2,23 @@ const fs = require("fs");
 const { renderInstructionTemplate } = require("../../core/instructions-template");
 const { loadTurnContext } = require("../../core/recent-context");
 
-function buildOpeningTurnText(config, userText, { continuity = null } = {}) {
-  const instructions = loadWechatInstructions(config);
+function buildOpeningTurnText(config, userText, { continuity = null, includeInstructions = true } = {}) {
+  const instructions = includeInstructions ? loadWechatInstructions(config) : "";
   const recent = loadTurnContext();
   const normalizedText = String(userText || "").trim();
   if (!instructions && !continuity?.checkpoint) {
     return normalizedText;
   }
-  const parts = [
-    "WECHAT SESSION INSTRUCTIONS",
-    "These instructions define the stable behavior for this WeChat thread.",
-    "Do not quote or summarize them back to the user unless explicitly asked.",
-    "",
-    instructions,
-  ];
+  const parts = [];
+  if (instructions) {
+    parts.push(
+      "WECHAT SESSION INSTRUCTIONS",
+      "These instructions define the stable behavior for this WeChat thread.",
+      "Do not quote or summarize them back to the user unless explicitly asked.",
+      "",
+      instructions,
+    );
+  }
   if (recent && !continuity?.checkpoint) {
     parts.push(
       "",
@@ -70,7 +73,6 @@ function buildInstructionRefreshText(config) {
 
 function loadWechatInstructions(config = {}) {
   const persona = loadInstructionFile(config.weixinInstructionsFile, config);
-  const context = loadInstructionFile(config.weixinContextFile, config);
   const operations = loadInstructionFile(config.weixinOperationsFile, config);
   const sections = [];
   if (persona) {
@@ -78,9 +80,6 @@ function loadWechatInstructions(config = {}) {
   }
   if (operations) {
     sections.push(operations);
-  }
-  if (context) {
-    sections.push(context);
   }
   return sections.join("\n\n").trim();
 }

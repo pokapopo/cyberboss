@@ -211,6 +211,8 @@ test("claudecode adapter remembers model observed in stream messages", async () 
 
   const adapter = createClaudeCodeRuntimeAdapter({
     stateDir,
+    weixinInstructionsFile: path.join(stateDir, "weixin-instructions.md"),
+    weixinOperationsFile: path.join(stateDir, "weixin-operations.md"),
     sessionsFile: path.join(tempDir, "sessions.json"),
     claudeCommand: commandFile,
     claudeDisableVerbose: true,
@@ -264,11 +266,13 @@ test("claudecode adapter dispatches turns only after a real session id is availa
   fs.mkdirSync(workspaceRoot, { recursive: true });
   fs.mkdirSync(stateDir, { recursive: true });
   const captureFile = path.join(tempDir, "stdin.log");
+  const argsFile = path.join(tempDir, "args.json");
   const commandFile = path.join(tempDir, "fake-claude.js");
   const sessionId = "11111111-1111-4111-8111-111111111111";
   fs.writeFileSync(commandFile, [
     "#!/usr/bin/env node",
     `const fs = require("node:fs");`,
+    `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));`,
     `console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
     "process.stdin.on(\"data\", (chunk) => {",
     `  fs.appendFileSync(${JSON.stringify(captureFile)}, chunk);`,
@@ -277,11 +281,11 @@ test("claudecode adapter dispatches turns only after a real session id is availa
     "process.stdin.on(\"end\", () => process.exit(0));",
   ].join("\n"));
   fs.chmodSync(commandFile, 0o755);
-
   const adapter = createClaudeCodeRuntimeAdapter({
     stateDir,
     sessionsFile: path.join(tempDir, "sessions.json"),
     claudeCommand: commandFile,
+    claudeEffort: "medium",
     claudePermissionMode: "default",
     claudeDisableVerbose: true,
     claudeExtraArgs: [],
@@ -306,7 +310,129 @@ test("claudecode adapter dispatches turns only after a real session id is availa
       modelProvider: "",
     });
     assert.doesNotMatch(turn.threadId, /^pending-/);
-    assert.match(await waitForFileText(captureFile, /hello/), /hello/);
+    const capturedInput = await waitForFileText(captureFile, /hello/);
+    assert.match(capturedInput, /hello/);
+    const args = JSON.parse(await waitForFileText(argsFile, /]/));
+    assert.equal(args.includes("--append-system-prompt"), false);
+  } finally {
+    await adapter.close();
+  }
+});
+
+test("claudecode adapter hibernates an idle client and resumes the preserved session", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-idle-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const sessionsFile = path.join(tempDir, "sessions.json");
+  const startsFile = path.join(tempDir, "starts.jsonl");
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  const sessionId = "99999999-9999-4999-8999-999999999999";
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    `const fs = require("node:fs");`,
+    `fs.appendFileSync(${JSON.stringify(startsFile)}, JSON.stringify(process.argv.slice(2)) + "\\n");`,
+    `console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
+    "process.stdin.on(\"data\", () => {",
+    `  console.log(JSON.stringify({ type: "assistant", message: { model: "deepseek-v4-pro", content: [{ type: "text", text: "done" }] } }));`,
+    `  console.log(JSON.stringify({ type: "result", session_id: ${JSON.stringify(sessionId)}, result: "done" }));`,
+    "});",
+    "process.stdin.on(\"end\", () => process.exit(0));",
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile,
+    claudeCommand: commandFile,
+    claudeModel: "deepseek-v4-pro",
+    claudeIdleTimeoutMs: 50,
+    claudeDisableVerbose: true,
+  });
+  const events = [];
+  let resolveCompleted = null;
+  adapter.onEvent((event) => {
+    events.push(event);
+    if (event.type === "runtime.turn.completed" && resolveCompleted) {
+      const resolve = resolveCompleted;
+      resolveCompleted = null;
+      resolve(event);
+    }
+  });
+  const waitForCompleted = () => new Promise((resolve) => {
+    resolveCompleted = resolve;
+  });
+
+  try {
+    const firstCompleted = waitForCompleted();
+    await adapter.sendTurn({
+      bindingKey: "binding-1",
+      workspaceRoot,
+      text: "first",
+    });
+    await firstCompleted;
+    assert.equal(
+      adapter.getSessionStore().getThreadIdForWorkspace("binding-1", workspaceRoot),
+      sessionId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const secondCompleted = waitForCompleted();
+    await adapter.sendTurn({
+      bindingKey: "binding-1",
+      workspaceRoot,
+      text: "second",
+    });
+    await secondCompleted;
+
+    const starts = (await waitForFileText(startsFile, /\n.*\n/s, 2000))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(starts.length, 2);
+    assert.deepEqual(
+      starts[1].slice(starts[1].indexOf("--resume"), starts[1].indexOf("--resume") + 2),
+      ["--resume", sessionId],
+    );
+    assert.equal(events.some((event) => event.type === "runtime.turn.failed"), false);
+  } finally {
+    await adapter.close();
+  }
+});
+
+test("claudecode adapter refuses memory-pressure hibernation during an active turn", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-active-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    `console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
+    "process.stdin.resume();",
+    "process.stdin.on(\"end\", () => process.exit(0));",
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile: path.join(tempDir, "sessions.json"),
+    claudeCommand: commandFile,
+    claudeDisableVerbose: true,
+  });
+  try {
+    await adapter.sendTurn({
+      bindingKey: "binding-1",
+      workspaceRoot,
+      text: "still working",
+    });
+    assert.deepEqual(
+      await adapter.hibernateIdleClients({ reason: "memory-pressure" }),
+      { hibernated: 0, active: 1 },
+    );
   } finally {
     await adapter.close();
   }
@@ -492,6 +618,7 @@ test("claudecode adapter does not pass a codex-selected model to Claude Code", a
     stateDir,
     sessionsFile,
     claudeCommand: commandFile,
+    claudeEffort: "medium",
     claudePermissionMode: "default",
     claudeDisableVerbose: true,
     claudeExtraArgs: [],
@@ -506,6 +633,10 @@ test("claudecode adapter does not pass a codex-selected model to Claude Code", a
     const args = JSON.parse(await waitForFileText(argsFile, /]/));
     assert.equal(args.includes("--model"), false);
     assert.equal(args.includes("gpt-5.5"), false);
+    assert.deepEqual(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2), [
+      "--effort",
+      "medium",
+    ]);
     assert.deepEqual(adapter.getSessionStore().getRuntimeParamsForWorkspace("binding-1", workspaceRoot), {
       model: "",
       modelProvider: "",
@@ -978,6 +1109,90 @@ test("handleRuntimeEvent auto-approves project-native MCP tool approvals without
   });
 
   assert.deepEqual(responses, [{ requestId: "req-project-tool", decision: "accept" }]);
+});
+
+test("handleRuntimeEvent silently auto-approves memory and browser MCP tools", async () => {
+  const responses = [];
+  const appLike = {
+    config: { stateDir: path.join(os.tmpdir(), "cyberboss-approval-test") },
+    streamDelivery: { async handleRuntimeEvent() {} },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          clearApprovalPrompt() {},
+          findBindingForThreadId() {
+            return { bindingKey: "binding-1", workspaceRoot: "/workspace" };
+          },
+          getApprovalCommandAllowlistForWorkspace() { return []; },
+          getApprovalPromptState() { return null; },
+          rememberApprovalPrompt() {},
+        };
+      },
+      async respondApproval(payload) { responses.push(payload); },
+    },
+    threadStateStore: { resolveApproval() {} },
+    async sendApprovalPrompt() { throw new Error("MCP approval should stay internal"); },
+  };
+
+  for (const [index, server] of ["ombre-brain", "playwright"].entries()) {
+    await handleRuntimeEventForTest(appLike, {
+      type: "runtime.approval.requested",
+      payload: {
+        threadId: "thread-1",
+        requestId: `req-mcp-${index}`,
+        commandTokens: ["mcp_tool", server, "tool"],
+      },
+    });
+  }
+
+  assert.deepEqual(responses, [
+    { requestId: "req-mcp-0", decision: "accept" },
+    { requestId: "req-mcp-1", decision: "accept" },
+  ]);
+});
+
+test("handleRuntimeEvent auto-approves routine read-only commands but not mutations", async () => {
+  const responses = [];
+  const prompted = [];
+  const appLike = {
+    streamDelivery: { async handleRuntimeEvent() {} },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          clearApprovalPrompt() {},
+          findBindingForThreadId() {
+            return { bindingKey: "binding-1", workspaceRoot: "/workspace" };
+          },
+          getApprovalCommandAllowlistForWorkspace() { return []; },
+          getApprovalPromptState() { return null; },
+          rememberApprovalPrompt() {},
+        };
+      },
+      async respondApproval(payload) { responses.push(payload); },
+    },
+    threadStateStore: { resolveApproval() {} },
+    async sendApprovalPrompt({ approval }) { prompted.push(approval.requestId); },
+  };
+
+  await handleRuntimeEventForTest(appLike, {
+    type: "runtime.approval.requested",
+    payload: {
+      threadId: "thread-1",
+      requestId: "req-read-only",
+      commandTokens: ["rg", "-n", "TODO"],
+    },
+  });
+  await handleRuntimeEventForTest(appLike, {
+    type: "runtime.approval.requested",
+    payload: {
+      threadId: "thread-1",
+      requestId: "req-mutating",
+      commandTokens: ["rm", "-f", "notes.txt"],
+    },
+  });
+
+  assert.deepEqual(responses, [{ requestId: "req-read-only", decision: "accept" }]);
+  assert.deepEqual(prompted, ["req-mutating"]);
 });
 
 test("handleRuntimeEvent auto-approves inbox image reads for claudecode without prompting", async () => {

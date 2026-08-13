@@ -1,11 +1,12 @@
 const { spawn } = require("child_process");
 
 class ClaudeCodeProcessClient {
-  constructor({ command = "claude", cwd, env, model = "", permissionMode = "default", disableVerbose = false, extraArgs = [], mcpConfigPaths = [], ipcServer = null, workspaceRoot = "" }) {
+  constructor({ command = "claude", cwd, env, model = "", effort = "high", permissionMode = "default", disableVerbose = false, extraArgs = [], mcpConfigPaths = [], ipcServer = null, workspaceRoot = "" }) {
     this.command = command;
     this.cwd = cwd;
     this.env = env;
     this.model = model;
+    this.effort = effort;
     this.permissionMode = permissionMode;
     this.disableVerbose = disableVerbose;
     this.extraArgs = extraArgs;
@@ -56,6 +57,7 @@ class ClaudeCodeProcessClient {
     this.activeThreadId = "";
     const args = buildArgs({
       model: this.model,
+      effort: this.effort,
       permissionMode: this.permissionMode,
       disableVerbose: this.disableVerbose,
       extraArgs: this.extraArgs,
@@ -487,6 +489,10 @@ class ClaudeCodeProcessClient {
 
   async close() {
     if (!this.child) return;
+    // All calls to close() are intentional lifecycle actions (shutdown,
+    // cancellation, model switch, or idle hibernation). Do not translate the
+    // resulting child exit into a runtime failure that clears a resumable ID.
+    this.suppressNextCloseEvent = true;
     if (this.stdin && !this.stdin.destroyed) {
       this.stdin.end();
     }
@@ -570,7 +576,7 @@ class ClaudeCodeProcessClient {
   }
 }
 
-function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfigPaths, resumeSessionId }) {
+function buildArgs({ model, effort, permissionMode, disableVerbose, extraArgs, mcpConfigPaths, resumeSessionId }) {
   const args = [
     "--output-format", "stream-json",
     "--input-format", "stream-json",
@@ -580,7 +586,7 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
   if (!disableVerbose) {
     args.push("--verbose");
   }
-  args.push("--effort", "high");
+  args.push("--effort", normalizeEffort(effort));
   if (permissionMode && permissionMode !== "default") {
     args.push("--permission-mode", permissionMode);
   }
@@ -604,6 +610,11 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
     args.push(...safe);
   }
   return args;
+}
+
+function normalizeEffort(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return new Set(["low", "medium", "high", "max"]).has(normalized) ? normalized : "high";
 }
 
 function isValidSessionId(value) {

@@ -229,6 +229,18 @@ class CyberbossApp {
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
     });
+    const handleMemoryPressureSignal = () => {
+      Promise.resolve(this.runtimeAdapter.hibernateIdleClients?.({ reason: "memory-pressure" }))
+        .then((result) => {
+          if (result) {
+            console.log(`[cyberboss] memory-pressure hibernation hibernated=${result.hibernated} active=${result.active}`);
+          }
+        })
+        .catch((error) => {
+          console.error(`[cyberboss] memory-pressure hibernation failed: ${error.message}`);
+        });
+    };
+    process.on("SIGUSR2", handleMemoryPressureSignal);
 
     try {
       let consecutiveFailures = 0;
@@ -285,6 +297,7 @@ class CyberbossApp {
         }
       }
     } finally {
+      process.off("SIGUSR2", handleMemoryPressureSignal);
       shutdown.dispose();
       this.clearPendingImageInboundTimers();
       await this.weixinDeliveryService.close();
@@ -2640,11 +2653,40 @@ function matchesBuiltInCommandPrefix(commandTokens) {
     return true;
   }
 
-   if (normalized[0] === "mcp_tool" && normalized[1] === "cyberboss_tools") {
+  if (normalized[0] === "mcp_tool" && [
+    "cyberboss_tools",
+    "playwright",
+    "ombre-brain",
+  ].includes(normalized[1])) {
     return true;
   }
 
-  return false;
+  const safeCommandPrefixes = [
+    ["pwd"],
+    ["ls"],
+    ["find"],
+    ["rg"],
+    ["grep"],
+    ["sed"],
+    ["cat"],
+    ["head"],
+    ["tail"],
+    ["stat"],
+    ["file"],
+    ["wc"],
+    ["git", "status"],
+    ["git", "diff"],
+    ["git", "log"],
+    ["git", "show"],
+    ["npm", "run"],
+    ["node", "--check"],
+    ["node", "-c"],
+    ["systemctl", "is-active"],
+    ["systemctl", "status"],
+    ["journalctl"],
+  ];
+  return safeCommandPrefixes.some((prefix) =>
+    prefix.every((part, index) => part === normalized[index]));
 }
 
 function normalizeCommandTokensForMatching(commandTokens) {
