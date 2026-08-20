@@ -80,9 +80,9 @@ function listProjectToolNames() {
 const PROJECT_TOOLS = [
   {
     name: "cyberboss_ncp_read_batch",
-    description: "Run 1-4 independent read-only Garden or browser observations through the isolated NCP tool layer. Only allowlisted reads are accepted; scheduling, MCP management, code mode, clicks, form changes, posts, replies, likes, uploads, and filesystem output are rejected. Results are bounded and may be partial.",
-    shortHint: "Batch bounded read-only Garden/browser observations through isolated NCP.",
-    topics: ["browser", "garden", "read"],
+    description: "Run 1-4 bounded Garden or browser operations through NCP. Observation and navigation calls may run directly. Browser interaction calls such as click, type, key press, form fill, dialog handling, or close require an authorization object: the main model must decide either that the action is within the user's existing authority or that the user explicitly confirmed it, and explain the decision. If material outcome, target, publication, sending, purchase, deletion, credential use, or other consequential effect is unclear, tell the user what will happen and wait before calling. If NCP rejects or lacks a capability, do not silently bypass it with Bash, direct CDP/browser code, filesystem edits, or another tool: explain the proposed fallback to the user first. Scheduling remains unavailable and browser output may not be written to disk. Results are bounded and may be partial.",
+    shortHint: "Run bounded NCP observations/actions with main-model authorization for interactions and advance notice before fallback.",
+    topics: ["browser", "garden", "read", "action"],
     inputSchema: {
       type: "object",
       required: ["calls"],
@@ -96,6 +96,16 @@ const PROJECT_TOOLS = [
               server: { type: "string", enum: ["garden", "playwright"] },
               tool: { type: "string" },
               params: { type: "object" },
+              authorization: {
+                type: "object",
+                description: "Required for browser interaction tools. The main model records whether existing authority covers the action or the user just confirmed it.",
+                required: ["decision", "reason"],
+                properties: {
+                  decision: { type: "string", enum: ["within_existing_authority", "user_confirmed"] },
+                  reason: { type: "string", description: "Concise context-specific justification; do not use a generic boilerplate reason." },
+                },
+                additionalProperties: false,
+              },
             },
             additionalProperties: false,
           },

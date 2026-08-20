@@ -8,9 +8,27 @@ const ALLOWED_TOOLS = Object.freeze({
     "get_chat_messages", "list_activity", "review_drift_bottles",
   ]),
   playwright: new Set([
+    // read-only
     "browser_snapshot", "browser_console_messages", "browser_network_requests",
+    "browser_network_request", "browser_get_config",
+    // navigation / browsing
+    "browser_navigate", "browser_navigate_back", "browser_tabs",
+    "browser_take_screenshot", "browser_wait_for", "browser_find",
+    "browser_resize",
+    // interaction (login / posting flows)
+    "browser_click", "browser_type", "browser_press_key", "browser_hover",
+    "browser_select_option", "browser_fill_form", "browser_handle_dialog",
+    "browser_close",
   ]),
 });
+
+const INTERACTION_TOOLS = new Set([
+  "browser_click", "browser_type", "browser_press_key", "browser_hover",
+  "browser_select_option", "browser_fill_form", "browser_handle_dialog",
+  "browser_close",
+]);
+
+const AUTHORIZATION_DECISIONS = new Set(["within_existing_authority", "user_confirmed"]);
 
 class NcpReadOnlyAdapter {
   constructor({ command = "ncp", cwd = process.cwd(), timeoutMs = 25_000, maxCalls = 4, maxChars = 4_000, executor = executeNcp } = {}) {
@@ -49,7 +67,7 @@ class NcpReadOnlyAdapter {
       }
     }));
     return {
-      schema: "ncp.read-batch.v1",
+      schema: "ncp.action-batch.v1",
       status: results.every((item) => item.status === "completed") ? "completed" : "partial",
       calls: results,
       returnedChars: results.reduce((sum, item) => sum + item.returnedChars, 0),
@@ -60,12 +78,26 @@ class NcpReadOnlyAdapter {
 function validateReadCall(value = {}, index = 0) {
   const server = normalizeText(value.server);
   const tool = normalizeText(value.tool);
-  if (!ALLOWED_TOOLS[server]?.has(tool)) throw new Error(`NCP call ${index + 1} is not an allowed read: ${server}:${tool}`);
+  if (!ALLOWED_TOOLS[server]?.has(tool)) throw new Error(`NCP call ${index + 1} is not allowed: ${server}:${tool}`);
   const params = value.params && typeof value.params === "object" && !Array.isArray(value.params) ? value.params : {};
   if (server === "playwright" && ("filename" in params || "path" in params)) {
     throw new Error(`NCP call ${index + 1} may not write browser output to disk`);
   }
-  return { callId: normalizeText(value.callId) || `call-${index + 1}`, server, tool, params };
+  const authorization = normalizeAuthorization(value.authorization);
+  if (INTERACTION_TOOLS.has(tool)) {
+    if (!AUTHORIZATION_DECISIONS.has(authorization.decision) || !authorization.reason) {
+      throw new Error(
+        `NCP call ${index + 1} requires main-model authorization: classify it as within_existing_authority or user_confirmed and explain why`,
+      );
+    }
+  }
+  return {
+    callId: normalizeText(value.callId) || `call-${index + 1}`,
+    server,
+    tool,
+    params,
+    authorization: INTERACTION_TOOLS.has(tool) ? authorization : undefined,
+  };
 }
 
 function executeNcp({ command, cwd, timeoutMs, call, maxOutputChars = 64_000 }) {
@@ -75,11 +107,11 @@ function executeNcp({ command, cwd, timeoutMs, call, maxOutputChars = 64_000 }) 
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        NCP_ENABLE_CODE_MODE: "false",
-        NCP_ENABLE_SKILLS: "false",
-        NCP_ENABLE_PHOTON_RUNTIME: "false",
+        NCP_ENABLE_CODE_MODE: "true",
+        NCP_ENABLE_SKILLS: "true",
+        NCP_ENABLE_PHOTON_RUNTIME: "true",
         NCP_ENABLE_SCHEDULE_MCP: "false",
-        NCP_ENABLE_MCP_MANAGEMENT: "false",
+        NCP_ENABLE_MCP_MANAGEMENT: "true",
         NCP_DIRECT_RUN: "true",
       },
     });
@@ -115,10 +147,23 @@ function executeNcp({ command, cwd, timeoutMs, call, maxOutputChars = 64_000 }) 
 }
 
 function normalizeText(value) { return typeof value === "string" ? value.trim() : ""; }
+function normalizeAuthorization(value) {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    decision: normalizeText(input.decision),
+    reason: normalizeText(input.reason),
+  };
+}
 function appendBounded(current, next, limit) {
   const max = Math.max(1_000, Number(limit) || 64_000);
   if (current.length >= max) return current;
   return (current + next).slice(0, max);
 }
 
-module.exports = { NcpReadOnlyAdapter, ALLOWED_TOOLS, validateReadCall, executeNcp };
+module.exports = {
+  NcpReadOnlyAdapter,
+  ALLOWED_TOOLS,
+  INTERACTION_TOOLS,
+  validateReadCall,
+  executeNcp,
+};

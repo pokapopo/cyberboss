@@ -20,11 +20,61 @@ test("NCP adapter exposes bounded read batches and compresses independent result
   assert.equal(result.calls[1].returnedChars, 300);
 });
 
-test("NCP adapter rejects writes, unapproved discovery, and browser file output", async () => {
+test("NCP adapter rejects unapproved discovery and browser file output", async () => {
   const adapter = new NcpReadOnlyAdapter({ executor: async () => ({ text: "unused" }) });
-  await assert.rejects(() => adapter.readBatch([{ server: "garden", tool: "create_thread" }]), /not an allowed read/);
-  await assert.rejects(() => adapter.readBatch([{ server: "ncp", tool: "schedule:create" }]), /not an allowed read/);
+  await assert.rejects(() => adapter.readBatch([{ server: "garden", tool: "create_thread" }]), /not allowed/);
+  await assert.rejects(() => adapter.readBatch([{ server: "ncp", tool: "schedule:create" }]), /not allowed/);
   await assert.rejects(() => adapter.readBatch([{ server: "playwright", tool: "browser_snapshot", params: { filename: "x.md" } }]), /may not write/);
+});
+
+test("NCP browser interactions require an explicit main-model authorization decision", async () => {
+  const calls = [];
+  const adapter = new NcpReadOnlyAdapter({
+    executor: async ({ call }) => {
+      calls.push(call);
+      return { text: "clicked" };
+    },
+  });
+  await assert.rejects(
+    () => adapter.readBatch([{ server: "playwright", tool: "browser_click", params: { ref: "button" } }]),
+    /requires main-model authorization/,
+  );
+  await assert.rejects(
+    () => adapter.readBatch([{
+      server: "playwright",
+      tool: "browser_click",
+      params: { ref: "button" },
+      authorization: { decision: "within_existing_authority", reason: "" },
+    }]),
+    /requires main-model authorization/,
+  );
+  const result = await adapter.readBatch([{
+    server: "playwright",
+    tool: "browser_click",
+    params: { ref: "next-page" },
+    authorization: {
+      decision: "within_existing_authority",
+      reason: "The user asked to inspect the next public results page; this only advances that reversible browsing flow.",
+    },
+  }]);
+  assert.equal(result.status, "completed");
+  assert.equal(calls[0].authorization.decision, "within_existing_authority");
+});
+
+test("NCP observations and navigation stay low-friction without authorization metadata", async () => {
+  const calls = [];
+  const adapter = new NcpReadOnlyAdapter({
+    executor: async ({ call }) => {
+      calls.push(call);
+      return { text: "observed" };
+    },
+  });
+  await adapter.readBatch([
+    { server: "playwright", tool: "browser_navigate", params: { url: "https://example.com" } },
+    { server: "playwright", tool: "browser_snapshot", params: {} },
+  ]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].authorization, undefined);
 });
 
 test("NCP executor treats a completed tool result as final even when NCP cleanup lingers", async () => {

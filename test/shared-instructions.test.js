@@ -66,3 +66,16 @@ test("WeChat operations positively reinforce proactive action before promises", 
   assert.match(operations, /reminder、队列或后台任务/);
   assert.match(operations, /如实说明当前状态和下一个可行步骤/);
 });
+
+test("WeChat operations require main-model judgment and advance notice before NCP bypass", () => {
+  const operations = fs.readFileSync(
+    path.resolve(__dirname, "..", "templates", "weixin-operations.md"),
+    "utf8",
+  );
+
+  assert.match(operations, /NCP 与操作确认/);
+  assert.match(operations, /由主模型结合当前对话判断/);
+  assert.match(operations, /先用自然语言告诉 uu 将要做什么/);
+  assert.match(operations, /不得静默改用 Bash、直连 CDP\/浏览器脚本/);
+  assert.match(operations, /得到她同意后再绕开/);
+});
