@@ -15,6 +15,7 @@ const CLAUDE_RESUME_SESSION_TIMEOUT_MS = 8000;
 function createClaudeCodeRuntimeAdapter(config) {
   const sessionStore = new SessionStore({ filePath: config.sessionsFile, runtimeId: "claudecode" });
   const clientsByWorkspace = new Map();
+  const backgroundClientsByScope = new Map();
   const pendingApprovals = new Map();
   const pendingModelByWorkspaceRoot = new Map();
   const internalTurnsByWorkspace = new Map();
@@ -117,7 +118,7 @@ function createClaudeCodeRuntimeAdapter(config) {
           const firstKey = pendingApprovals.keys().next().value;
           pendingApprovals.delete(firstKey);
         }
-        pendingApprovals.set(mapped.payload.requestId, workspaceRoot);
+        pendingApprovals.set(mapped.payload.requestId, { workspaceRoot, client });
       }
       if (mapped?.type === "runtime.turn.failed") {
         cancelIdleTimer(workspaceRoot);
@@ -188,10 +189,93 @@ function createClaudeCodeRuntimeAdapter(config) {
     cancelIdleTimer(normalizedWorkspaceRoot);
     clientsByWorkspace.delete(normalizedWorkspaceRoot);
     await client.close();
-    for (const [requestId, candidateWorkspaceRoot] of pendingApprovals.entries()) {
-      if (candidateWorkspaceRoot === normalizedWorkspaceRoot) {
+    for (const [requestId, pending] of pendingApprovals.entries()) {
+      if (pending?.client === client) {
         pendingApprovals.delete(requestId);
       }
+    }
+  }
+
+  function isBackgroundBindingKey(bindingKey) {
+    return normalizeText(bindingKey).includes("::background:");
+  }
+
+  async function closeBackgroundClient(scopeKey) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const client = backgroundClientsByScope.get(normalizedScopeKey);
+    if (!client) return;
+    backgroundClientsByScope.delete(normalizedScopeKey);
+    for (const [requestId, pending] of pendingApprovals.entries()) {
+      if (pending?.client === client) pendingApprovals.delete(requestId);
+    }
+    await client.close().catch(() => {});
+  }
+
+  async function sendBackgroundTurn({ bindingKey, workspaceRoot, text, model = "", continuityContext = null }) {
+    const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+    const scopeKey = `${normalizeText(bindingKey)}::${normalizedWorkspaceRoot}`;
+    if (!normalizedWorkspaceRoot) throw new Error("workspaceRoot is required");
+    await closeBackgroundClient(scopeKey);
+
+    const desiredModel = resolveModel(model);
+    const projectSettings = ensureClaudeProjectMcpConfig({
+      workspaceRoot: normalizedWorkspaceRoot,
+      cyberbossHome: process.env.CYBERBOSS_HOME || path.resolve(__dirname, "..", "..", "..", ".."),
+    });
+    const client = new ClaudeCodeProcessClient({
+      command: config.claudeCommand || "claude",
+      cwd: normalizedWorkspaceRoot,
+      env: filterClaudeCodeEnv(process.env),
+      model: desiredModel,
+      effort: config.claudeEffort || "high",
+      permissionMode: config.claudePermissionMode || "default",
+      disableVerbose: Boolean(config.claudeDisableVerbose),
+      extraArgs: config.claudeExtraArgs || [],
+      mcpConfigPaths: [projectSettings.configPath],
+      ipcServer,
+      workspaceRoot: normalizedWorkspaceRoot,
+    });
+    backgroundClientsByScope.set(scopeKey, client);
+
+    client.onMessage((event, raw) => {
+      if (event.type === "session.id") return;
+      const mapped = mapClaudeCodeMessageToRuntimeEvent(event, raw);
+      if (mapped?.payload && !mapped.payload.workspaceRoot) {
+        mapped.payload.workspaceRoot = normalizedWorkspaceRoot;
+      }
+      if (mapped?.type === "runtime.approval.requested") {
+        if (pendingApprovals.size >= 100) pendingApprovals.delete(pendingApprovals.keys().next().value);
+        pendingApprovals.set(mapped.payload.requestId, {
+          workspaceRoot: normalizedWorkspaceRoot,
+          client,
+          backgroundScopeKey: scopeKey,
+        });
+      }
+      if (mapped && globalListener) globalListener(mapped, raw);
+      if (event.type === "turn.completed" || event.type === "turn.interrupted"
+          || event.type === "process.error" || event.type === "process.close") {
+        void closeBackgroundClient(scopeKey);
+      }
+    });
+
+    try {
+      await client.connect("");
+      const outboundText = buildOpeningTurnText(config, text, {
+        continuity: continuityContext,
+        includeInstructions: false,
+      });
+      await client.sendUserMessage({ text: outboundText });
+      const returnedThreadId = normalizeThreadId(
+        await client.waitForSessionId({ timeoutMs: CLAUDE_RESUME_SESSION_TIMEOUT_MS }),
+      );
+      if (!returnedThreadId) throw new Error("claudecode did not report a session id for background turn");
+      console.error(
+        `[cyberboss] claudecode sendBackgroundTurn opening=true threadId=${returnedThreadId} preview=${String(text || "").slice(0, 80).replace(/\n/g, "\\n")}`,
+      );
+      return { threadId: returnedThreadId, turnId: client.pendingTurnId };
+    } catch (error) {
+      await closeBackgroundClient(scopeKey);
+      throw error;
     }
   }
 
@@ -234,7 +318,7 @@ function createClaudeCodeRuntimeAdapter(config) {
 
   async function hibernateIdleClients({ reason = "manual" } = {}) {
     let hibernated = 0;
-    let active = 0;
+    let active = backgroundClientsByScope.size;
     for (const [workspaceRoot, client] of [...clientsByWorkspace.entries()]) {
       if (client?.pendingTurnId || internalTurnsByWorkspace.has(workspaceRoot)) {
         active += 1;
@@ -295,6 +379,9 @@ function createClaudeCodeRuntimeAdapter(config) {
         await client.close();
       }
       clientsByWorkspace.clear();
+      for (const scopeKey of [...backgroundClientsByScope.keys()]) {
+        await closeBackgroundClient(scopeKey);
+      }
       await ipcServer.close();
     },
     async startFreshThreadDraft({ workspaceRoot }) {
@@ -305,10 +392,10 @@ function createClaudeCodeRuntimeAdapter(config) {
       return hibernateIdleClients(options);
     },
     async respondApproval({ requestId, decision, result = null }) {
-      const workspaceRoot = pendingApprovals.get(requestId);
-      const candidates = workspaceRoot
-        ? [clientsByWorkspace.get(workspaceRoot)]
-        : [...clientsByWorkspace.values()];
+      const pending = pendingApprovals.get(requestId);
+      const candidates = pending?.client
+        ? [pending.client]
+        : [...clientsByWorkspace.values(), ...backgroundClientsByScope.values()];
       for (const client of candidates) {
         if (client?.alive) {
           const responsePayload = result && typeof result === "object"
@@ -327,6 +414,12 @@ function createClaudeCodeRuntimeAdapter(config) {
       throw new Error("no active claudecode session to respond to approval");
     },
     async cancelTurn({ threadId, turnId, workspaceRoot }) {
+      for (const [scopeKey, client] of backgroundClientsByScope.entries()) {
+        if (clientMatchesThread(client, threadId)) {
+          await closeBackgroundClient(scopeKey);
+          return { threadId, turnId };
+        }
+      }
       if (workspaceRoot) {
         await closeWorkspaceClient(workspaceRoot);
         return { threadId, turnId };
@@ -401,6 +494,9 @@ function createClaudeCodeRuntimeAdapter(config) {
       };
     },
     async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null }) {
+      if (isBackgroundBindingKey(bindingKey)) {
+        return sendBackgroundTurn({ bindingKey, workspaceRoot, text, model, continuityContext });
+      }
       cancelIdleTimer(workspaceRoot);
       const desiredModel = resolveModel(model);
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);

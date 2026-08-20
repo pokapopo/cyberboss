@@ -12,6 +12,7 @@ crash-ck.txt
 temp/
 .vscode/
 .playwright-mcp/
+.ncp/
 cheatsheet-gaoshu.txt
 tmp-cdn-probe.js
 CLAUDE.local.md

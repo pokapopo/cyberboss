@@ -1618,6 +1618,9 @@ class CyberbossApp {
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       return false;
     }
+    // A background binding always opens an ephemeral runtime session. The
+    // Claude adapter owns a separate physical client for it, so clearing this
+    // id cannot replace or resume the live Weixin client for the workspace.
     this.runtimeAdapter.getSessionStore().clearThreadIdForWorkspace(bindingKey, workspaceRoot);
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
   }

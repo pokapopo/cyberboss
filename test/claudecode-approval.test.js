@@ -443,6 +443,184 @@ test("claudecode adapter refuses memory-pressure hibernation during an active tu
   }
 });
 
+test("claudecode background turns use a separate process and route approvals without replacing chat", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-background-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const sessionsFile = path.join(tempDir, "sessions.json");
+  const captureFile = path.join(tempDir, "capture.jsonl");
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    `const fs = require("node:fs");`,
+    `const capture = ${JSON.stringify(captureFile)};`,
+    `const sessionId = "00000000-0000-4000-8000-" + String(process.pid).padStart(12, "0");`,
+    `const log = (value) => fs.appendFileSync(capture, JSON.stringify({ pid: process.pid, ...value }) + "\\n");`,
+    `log({ kind: "start", args: process.argv.slice(2), sessionId });`,
+    `console.log(JSON.stringify({ type: "system", session_id: sessionId }));`,
+    `let buffer = "";`,
+    `process.stdin.on("data", (chunk) => {`,
+    `  buffer += chunk.toString();`,
+    `  let newline;`,
+    `  while ((newline = buffer.indexOf("\\n")) >= 0) {`,
+    `    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);`,
+    `    if (!line.trim()) continue;`,
+    `    const value = JSON.parse(line); log({ kind: "input", value });`,
+    `    if (value.type === "user" && value.message.content === "BG_APPROVAL") {`,
+    `      console.log(JSON.stringify({ type: "control_request", request_id: "req-bg", request: { subtype: "can_use_tool", tool_name: "mcp__cyberboss_tools__cyberboss_diary_append", input: {} } }));`,
+    `    } else if (value.type === "user" && value.message.content !== "BG_HOLD") {`,
+    `      console.log(JSON.stringify({ type: "result", session_id: sessionId, result: "done" }));`,
+    `    } else if (value.type === "control_response") {`,
+    `      console.log(JSON.stringify({ type: "result", session_id: sessionId, result: "approved" }));`,
+    `    }`,
+    `  }`,
+    `});`,
+    `process.stdin.on("end", () => process.exit(0));`,
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile,
+    claudeCommand: commandFile,
+    claudeDisableVerbose: true,
+  });
+  const events = [];
+  const waiters = [];
+  adapter.onEvent((event) => {
+    events.push(event);
+    for (const waiter of [...waiters]) {
+      if (waiter.predicate(event)) {
+        waiters.splice(waiters.indexOf(waiter), 1);
+        waiter.resolve(event);
+      }
+    }
+  });
+  const waitForEvent = (predicate) => new Promise((resolve) => waiters.push({ predicate, resolve }));
+
+  try {
+    const mainCompleted = waitForEvent((event) => event.type === "runtime.turn.completed");
+    const mainTurn = await adapter.sendTurn({
+      bindingKey: "binding-chat",
+      workspaceRoot,
+      text: "MAIN_ONE",
+    });
+    await mainCompleted;
+
+    const approvalEvent = waitForEvent((event) => event.type === "runtime.approval.requested");
+    const backgroundTurn = await adapter.sendTurn({
+      bindingKey: "binding-chat::background:diary_incremental",
+      workspaceRoot,
+      text: "BG_APPROVAL",
+    });
+    const approval = await approvalEvent;
+    assert.equal(approval.payload.threadId, backgroundTurn.threadId);
+    const backgroundCompleted = waitForEvent((event) => (
+      event.type === "runtime.turn.completed" && event.payload.threadId === backgroundTurn.threadId
+    ));
+    await adapter.respondApproval({ requestId: approval.payload.requestId, decision: "accept" });
+    await backgroundCompleted;
+
+    assert.notEqual(backgroundTurn.threadId, mainTurn.threadId);
+    assert.equal(
+      adapter.getSessionStore().getThreadIdForWorkspace("binding-chat", workspaceRoot),
+      mainTurn.threadId,
+    );
+    assert.equal(
+      adapter.getSessionStore().getThreadIdForWorkspace("binding-chat::background:diary_incremental", workspaceRoot),
+      "",
+    );
+
+    const secondMainCompleted = waitForEvent((event) => (
+      event.type === "runtime.turn.completed" && event.payload.threadId === mainTurn.threadId
+    ));
+    await adapter.sendTurn({ bindingKey: "binding-chat", workspaceRoot, text: "MAIN_TWO" });
+    await secondMainCompleted;
+
+    const captured = (await waitForFileText(captureFile, /MAIN_TWO/)).trim().split("\n").map(JSON.parse);
+    const mainInputs = captured.filter((entry) => (
+      entry.kind === "input" && ["MAIN_ONE", "MAIN_TWO"].includes(entry.value?.message?.content)
+    ));
+    const backgroundInputs = captured.filter((entry) => (
+      entry.kind === "input" && entry.value?.message?.content === "BG_APPROVAL"
+    ));
+    const approvalResponses = captured.filter((entry) => (
+      entry.kind === "input" && entry.value?.type === "control_response"
+    ));
+    assert.equal(new Set(mainInputs.map((entry) => entry.pid)).size, 1);
+    assert.notEqual(mainInputs[0].pid, backgroundInputs[0].pid);
+    assert.equal(approvalResponses[0].pid, backgroundInputs[0].pid);
+    assert.equal(approvalResponses[0].value.response.response.behavior, "allow");
+    assert.equal(events.some((event) => event.type === "runtime.turn.failed"), false);
+  } finally {
+    await adapter.close();
+  }
+});
+
+test("cancelling a background turn leaves the live chat process running", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-background-cancel-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const captureFile = path.join(tempDir, "capture.jsonl");
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    `const fs = require("node:fs");`,
+    `const capture = ${JSON.stringify(captureFile)};`,
+    `const sessionId = "00000000-0000-4000-8000-" + String(process.pid).padStart(12, "0");`,
+    `console.log(JSON.stringify({ type: "system", session_id: sessionId }));`,
+    `process.stdin.on("data", (chunk) => {`,
+    `  const text = chunk.toString(); fs.appendFileSync(capture, JSON.stringify({ pid: process.pid, text }) + "\\n");`,
+    `  if (!text.includes("BG_HOLD")) console.log(JSON.stringify({ type: "result", session_id: sessionId, result: "done" }));`,
+    `});`,
+    `process.stdin.on("end", () => process.exit(0));`,
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile: path.join(tempDir, "sessions.json"),
+    claudeCommand: commandFile,
+    claudeDisableVerbose: true,
+  });
+  const completions = [];
+  adapter.onEvent((event) => {
+    if (event.type === "runtime.turn.completed") completions.push(event.payload.threadId);
+  });
+  try {
+    const mainTurn = await adapter.sendTurn({ bindingKey: "binding-chat", workspaceRoot, text: "MAIN_ONE" });
+    await waitUntil(() => completions.includes(mainTurn.threadId));
+    const backgroundTurn = await adapter.sendTurn({
+      bindingKey: "binding-chat::background:checkin",
+      workspaceRoot,
+      text: "BG_HOLD",
+    });
+    await adapter.cancelTurn({
+      threadId: backgroundTurn.threadId,
+      turnId: backgroundTurn.turnId,
+      workspaceRoot,
+    });
+    await adapter.sendTurn({ bindingKey: "binding-chat", workspaceRoot, text: "MAIN_TWO" });
+    await waitUntil(() => completions.filter((threadId) => threadId === mainTurn.threadId).length === 2);
+
+    const captured = (await waitForFileText(captureFile, /MAIN_TWO/)).trim().split("\n").map(JSON.parse);
+    const mainPids = captured
+      .filter((entry) => entry.text.includes("MAIN_ONE") || entry.text.includes("MAIN_TWO"))
+      .map((entry) => entry.pid);
+    assert.equal(new Set(mainPids).size, 1);
+    assert.equal(
+      adapter.getSessionStore().getThreadIdForWorkspace("binding-chat", workspaceRoot),
+      mainTurn.threadId,
+    );
+  } finally {
+    await adapter.close();
+  }
+});
+
 test("claudecode process client delivers assistant text items and supports dual event type compatibility", () => {
   const client = new ClaudeCodeProcessClient({
     command: "claude",
@@ -1844,4 +2022,14 @@ async function waitForFileText(filePath, pattern, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+}
+
+async function waitUntil(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(predicate(), true, "condition was not met before timeout");
+  return true;
 }
