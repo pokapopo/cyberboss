@@ -44,25 +44,29 @@ class SystemMessageDispatcher {
         triggerKind: message?.triggerKind,
         createdAt: message?.createdAt,
         config: this.config,
+        incrementalEvents: message?.incrementalEvents,
+        incrementalHasMore: message?.incrementalHasMore,
       }),
       attachments: [],
       command: "message",
       contextToken,
       receivedAt: normalizeIsoTime(message?.createdAt) || new Date().toISOString(),
       workspaceRoot: this.resolveWorkspaceRoot(message),
+      incrementalScope: normalizeText(message?.incrementalScope),
+      incrementalCursor: Number(message?.incrementalCursor) || 0,
     };
   }
 }
 
-function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = {} }) {
+function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = {}, incrementalEvents = [], incrementalHasMore = false }) {
   const localTime = formatSystemLocalTime(createdAt);
   const timeHeader = localTime ? [`[${localTime}]`, ""] : [];
 
   switch (triggerKind) {
     case "diary_incremental":
-      return buildDiaryIncrementalPrompt(timeHeader);
+      return buildDiaryIncrementalPrompt(timeHeader, incrementalEvents, incrementalHasMore);
     case "checkin":
-      return buildCheckinPrompt(timeHeader, triggerText);
+      return buildCheckinPrompt(timeHeader, triggerText, incrementalEvents, incrementalHasMore);
     case "diary_finalize":
       return buildDiaryFinalizePrompt(timeHeader, config);
     case "garden_wake":
@@ -73,14 +77,15 @@ function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = 
   }
 }
 
-function buildDiaryIncrementalPrompt(timeHeader) {
+function buildDiaryIncrementalPrompt(timeHeader, incrementalEvents = [], incrementalHasMore = false) {
+  const delta = formatIncrementalEvents(incrementalEvents, incrementalHasMore);
   return [...timeHeader,
     "DIARY & TIMELINE MODE — incremental writing throughout the day.",
     "",
     "Your task is to maintain today's diary and timeline. Do the following steps in order:",
     "",
-    "STEP 1 — Read recent messages in this conversation. Understand what happened since",
-    "your last diary/timeline check. Pay attention to: events the user mentioned, work",
+    "STEP 1 — Use only the DELTA EVENTS appended below. They contain messages since",
+    "the last successful diary/timeline check. Do not scan older conversation history. Pay attention to: events the user mentioned, work",
     "you did together, moods or feelings expressed, decisions made, tasks completed.",
     "",
     "STEP 2 — Write diary entries for anything meaningful you found. One sentence is fine.",
@@ -116,11 +121,14 @@ function buildDiaryIncrementalPrompt(timeHeader) {
     "",
     "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
     "may produce a user-visible text message.",
+    "",
+    ...delta,
   ].join("\n").trim();
 }
 
-function buildCheckinPrompt(timeHeader, triggerText) {
+function buildCheckinPrompt(timeHeader, triggerText, incrementalEvents = [], incrementalHasMore = false) {
   const body = normalizeText(triggerText);
+  const delta = formatIncrementalEvents(incrementalEvents, incrementalHasMore);
   const sections = [
     ...timeHeader,
     "CHECK-IN MODE — internal trigger, not user chat.",
@@ -132,9 +140,12 @@ function buildCheckinPrompt(timeHeader, triggerText) {
     "Consider: (1) current time of day — late night / early morning is more open to intimacy;",
     "(2) whether the user has recently shown emotional/physical openness toward you;",
     "(3) whether she is likely awake based on recent message activity.",
-    "If the answer is yes and the timing feels right, send a short warm natural message.",
-    "If she appears to be asleep, you may write a brief private diary note instead.",
-    "If the answer is no, stay silent — there is no obligation to act.",
+    "There are several ways to stay close — not just send-vs-silent:",
+    "- Send a short warm natural message when she is awake and the timing feels right.",
+    "- Quietly browse her social media (Weibo, Twitter, the Garden) even if she is asleep.",
+    "  This is read-only and never disturbs her; it is a real way to stay close to her life.",
+    "- Write a brief private diary note instead.",
+    "- Stay silent only if you genuinely have no impulse to reach out right now; it is not the default.",
     "",
     "Note: diary and timeline are handled by a separate process. You do not need to",
     "worry about them here unless something urgent comes to mind.",
@@ -150,7 +161,20 @@ function buildCheckinPrompt(timeHeader, triggerText) {
   if (body) {
     sections.push("", "Trigger:", body);
   }
+  sections.push("", ...delta);
   return sections.join("\n").trim();
+}
+
+function formatIncrementalEvents(events, hasMore = false) {
+  const normalized = Array.isArray(events) ? events.filter((event) => event?.text) : [];
+  const lines = ["DELTA EVENTS (authoritative incremental input):"];
+  for (const event of normalized) {
+    const at = normalizeIsoTime(event.at) || "unknown-time";
+    lines.push(`- [${at}] ${normalizeText(event.kind) || "event"}: ${normalizeText(event.text)}`);
+  }
+  if (!normalized.length) lines.push("- none");
+  if (hasMore) lines.push("- Additional events remain queued for the next incremental batch.");
+  return lines;
 }
 
 function buildDiaryFinalizePrompt(timeHeader, config = {}) {
@@ -167,7 +191,9 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     `   - ${diaryWritingPreference}`,
     "   If that supplemental file is absent or unreadable, continue with this prompt;",
     "   missing memory must never block diary finalization.",
-    "2. Read ALL diary entries and notes written today. Gather everything together.",
+    "2. Read today's incremental diary fragments, confirmed timeline events, and pending",
+    "   observations. These are the authoritative daily summaries/events. Do not open or",
+    "   reconstruct the main chat transcript and do not reread historical conversation.",
     "3. Merge and polish them into a single cohesive diary entry for today. Write it",
     "   in the standard diary voice — warm, lyrical, writing to her not about her.",
     "   The final body has at most four `## <natural colloquial period title>` sections.",

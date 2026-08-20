@@ -38,6 +38,12 @@ const { createMessageDebouncer } = require("./message-debounce");
 const { WeixinDeliveryService } = require("./weixin-delivery-outbox");
 const { ConversationMemoryCoordinator } = require("./conversation-memory-coordinator");
 const { ConversationContinuityStore } = require("./conversation-continuity-store");
+const { IncrementalEventStore } = require("./incremental-event-store");
+const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
+const { ModelGateway } = require("../model-gateway");
+const { UsageLedger } = require("../model-gateway/usage-ledger");
+const { AdaptiveThrottleStore, buildThrottleKey } = require("../runtime/optimization/adaptive-throttle-store");
+const { CancellationCoordinator } = require("../runtime/optimization/cancellation-coordinator");
 const { ReminderQueueStore } = require("../adapters/channel/weixin/reminder-queue-store");
 const {
   matchesCommandPrefix,
@@ -50,6 +56,7 @@ const {
 } = require("../adapters/runtime/shared/approval-command");
 const { runCheckinPoller, runDiaryTimelinePoller } = require("../app/system-checkin-poller");
 const { createProjectTooling } = require("../tools/create-project-tooling");
+const { loadWechatInstructions } = require("../adapters/runtime/shared-instructions");
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MIN_LONG_POLL_TIMEOUT_MS = 2_000;
 const SESSION_EXPIRED_ERRCODE = -14;
@@ -85,6 +92,10 @@ class CyberbossApp {
     this.workLogStore = this.projectServices.workLog;
     this.workLogInstanceId = crypto.randomUUID();
     this.projectToolHost = projectTooling.toolHost;
+    this.fixedPrefixFingerprint = sha256Text(loadWechatInstructions(config));
+    this.toolCatalogFingerprint = sha256Text(JSON.stringify(
+      this.projectToolHost.listTools().map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })),
+    ));
     this.runtimeContextStore = projectTooling.runtimeContextStore;
     this.runtimeAdapter = createRuntimeAdapter(config);
     this.threadStateStore = new ThreadStateStore();
@@ -103,6 +114,25 @@ class CyberbossApp {
     this.pendingUserContexts = new Map();
     this.pendingMemoryTurns = new Map();
     this.lastWeixinActivityAtBySender = new Map();
+    this.incrementalEventStore = new IncrementalEventStore({
+      filePath: config.incrementalEventFile || path.join(config.stateDir, "incremental-events.json"),
+    });
+    this.pendingBackgroundDeltaByRunKey = new Map();
+    this.pendingModelRequestByRunKey = new Map();
+    this.modelUsageLedger = new UsageLedger({
+      filePath: config.modelGatewayUsageFile || path.join(config.stateDir, "model-gateway-usage.json"),
+      budgets: config.modelGatewayBudgets,
+    });
+    this.modelGateway = new ModelGateway({
+      routes: config.modelGatewayRoutes,
+      prices: config.modelGatewayPrices,
+      usageSink: this.modelUsageLedger,
+      budgetProvider: this.modelUsageLedger,
+      alertSink: this.modelUsageLedger,
+      cacheMonitor: config.modelGatewayCacheMonitor,
+    });
+    this.optimizationThrottleStore = new AdaptiveThrottleStore({ filePath: config.optimizationThrottleFile || path.join(config.stateDir, "optimization-throttle.json") });
+    this.cancellationCoordinator = new CancellationCoordinator();
     this.conversationContinuityStore = new ConversationContinuityStore({
       filePath: config.conversationContinuityFile || path.join(config.stateDir, "conversation-continuity.json"),
     });
@@ -423,6 +453,7 @@ class CyberbossApp {
     }
 
     this.lastWeixinActivityAtBySender.set(normalized.senderId, Date.now());
+    this.recordIncrementalUserEvent?.(normalized);
     this.primeDeferredRepliesForSender(normalized);
 
     const result = await this.messageDebouncer.enqueue(normalized.senderId, normalized);
@@ -606,9 +637,50 @@ class CyberbossApp {
   }
 
   async dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared }) {
-    const pendingScopeKey = this.turnGateStore.begin(bindingKey, workspaceRoot);
+    const pendingScopeKey = buildScopeKey(bindingKey, workspaceRoot);
+    const task = createTaskEnvelope({
+      taskId: prepared.messageId,
+      source: prepared.provider === "system" ? (prepared.triggerKind || "system") : "user_chat",
+      kind: prepared.triggerKind || "agent.turn",
+      priority: prepared.provider === "system" ? "background" : "interactive",
+      visibility: prepared.provider === "system" ? "internal" : "user",
+      background: prepared.provider === "system",
+      scope: pendingScopeKey,
+      continuityKey: pendingScopeKey,
+      idempotencyKey: prepared.messageId,
+      modelClass: prepared.provider === "system" ? "economy" : "primary",
+      createdAt: prepared.receivedAt,
+      metadata: {
+        cyberboss: {
+          triggerKind: prepared.triggerKind || "",
+          bindingKey,
+          workspaceRoot,
+        },
+      },
+    });
+    const admission = this.modelGateway?.admit?.({ task, requestedModel: "" });
+    if (admission?.action === "skip" && task.background) {
+      this.optimizationThrottleStore?.recordOutcome?.(buildThrottleKey({
+        kind: prepared.triggerKind,
+        accountId: prepared.accountId,
+        senderId: prepared.senderId,
+        workspaceRoot,
+      }), "limited");
+      console.warn(`[cyberboss] background task skipped by model gateway kind=${task.kind} reason=${admission.reason}`);
+      return true;
+    }
+    if (admission?.action === "downgrade" && task.background) {
+      this.optimizationThrottleStore?.recordOutcome?.(buildThrottleKey({
+        kind: prepared.triggerKind,
+        accountId: prepared.accountId,
+        senderId: prepared.senderId,
+        workspaceRoot,
+      }), "limited");
+      console.warn(`[cyberboss] background task budget soft limit kind=${task.kind}; throttle increased`);
+    }
+    this.turnGateStore.begin(bindingKey, workspaceRoot);
     const workLog = safeWorkLogCall(this, "startExecution", {
-      source: prepared.provider === "system" ? "system" : "weixin",
+      source: task.source,
       triggerKind: prepared.triggerKind,
       summary: buildWorkLogSummary(prepared),
       workspaceRoot,
@@ -624,6 +696,9 @@ class CyberbossApp {
     }).catch(() => {});
 
     try {
+      // Cyberboss background turns can still produce a user-visible cc message.
+      // Keep the cc session model here; economy routing is only safe for a future
+      // hidden structured subtask whose output cannot be delivered directly.
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
       const memoryContext = prepared.provider === "weixin"
         ? await this.memoryCoordinator?.prepareTurn?.({
@@ -648,6 +723,7 @@ class CyberbossApp {
         model,
         continuityContext,
         metadata: {
+          task,
           workspaceId: prepared.workspaceId,
           accountId: prepared.accountId,
           senderId: prepared.senderId,
@@ -657,6 +733,13 @@ class CyberbossApp {
         this.conversationContinuityStore?.markConsumed?.(pendingScopeKey, turn.threadId);
       }
       const runKey = buildRunKey(turn.threadId, turn.turnId);
+      task.runId = runKey || task.runId;
+      this.pendingModelRequestByRunKey?.set?.(runKey, createModelRequestEnvelope({
+        task,
+        requestedModel: model,
+        fixedPrefixFingerprint: this.fixedPrefixFingerprint,
+        toolCatalogFingerprint: this.toolCatalogFingerprint,
+      }));
       if (workLog?.id) {
         safeWorkLogCall(this, "bindRuntime", workLog.id, {
           runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
@@ -675,11 +758,18 @@ class CyberbossApp {
         workLogId: workLog?.id || "",
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
-      this.pendingUserContexts.set(turn.threadId, prepared.text);
       if (prepared.provider === "weixin") {
+        this.pendingUserContexts.set(turn.threadId, prepared.text);
         this.pendingMemoryTurns?.set?.(turn.threadId, {
           scopeKey: pendingScopeKey,
           userText: prepared.originalText || prepared.text,
+        });
+      }
+      if (prepared.incrementalCursor && prepared.incrementalScope) {
+        this.pendingBackgroundDeltaByRunKey?.set?.(runKey, {
+          consumer: prepared.triggerKind,
+          scope: prepared.incrementalScope,
+          cursor: prepared.incrementalCursor,
         });
       }
       const replyTarget = {
@@ -813,6 +903,16 @@ class CyberbossApp {
     if (!threadId || !threadState?.turnId || threadState.status !== "running" || !memoryTurn) {
       return false;
     }
+    const runKey = buildRunKey(threadId, threadState.turnId);
+    const cancellation = this.cancellationCoordinator?.request?.(runKey, prepared);
+    if (cancellation && !cancellation.accepted) {
+      console.log(`[cyberboss] live steering coalesced thread=${threadId} turn=${threadState.turnId} count=${cancellation.coalescedCount}`);
+      return true;
+    }
+    const steeringModelRequest = this.pendingModelRequestByRunKey?.get?.(runKey);
+    if (steeringModelRequest) {
+      this.modelGateway?.recordLifecycle?.({ request: steeringModelRequest, status: "cancel_requested", reason: "live_steering" });
+    }
 
     const model = sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
     const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext: null });
@@ -831,9 +931,19 @@ class CyberbossApp {
         text: steeringText,
         model,
       });
+      this.cancellationCoordinator?.acknowledge?.(runKey);
     } catch (error) {
+      this.cancellationCoordinator?.uncertain?.(runKey);
+      if (steeringModelRequest) {
+        this.modelGateway?.recordLifecycle?.({ request: steeringModelRequest, status: "cancel_uncertain", reason: error.message });
+      }
       console.error(`[cyberboss] live steering failed thread=${threadId}: ${error.message}`);
       return false;
+    }
+
+    const completedCancellation = this.cancellationCoordinator?.complete?.(runKey);
+    if (steeringModelRequest) {
+      this.modelGateway?.recordLifecycle?.({ request: steeringModelRequest, status: "cancelled_recompute", reason: "live_steering" });
     }
 
     const userText = String(prepared.originalText || prepared.text || "").trim();
@@ -868,6 +978,9 @@ class CyberbossApp {
       turnId: threadState.turnId,
     });
     console.log(`[cyberboss] live steering delivered thread=${threadId} turn=${threadState.turnId}`);
+    if (completedCancellation?.replacementDelta) {
+      return this.trySteerPreparedTurn({ bindingKey, workspaceRoot, prepared: completedCancellation.replacementDelta });
+    }
     return true;
   }
 
@@ -1209,19 +1322,100 @@ class CyberbossApp {
     const pendingMessages = this.systemMessageDispatcher?.drainPending() || [];
     for (const message of pendingMessages) {
       try {
-        const deferred = this.deferIncrementalMaintenanceUntilIdle(message);
+        const incremental = this.prepareIncrementalSystemMessage(message);
+        if (incremental?.skip) {
+          console.log(`[cyberboss] ${message.triggerKind} skipped: no incremental events`);
+          continue;
+        }
+        const preparedMessage = incremental?.message || message;
+        const deferred = this.deferIncrementalMaintenanceUntilIdle(preparedMessage);
         if (deferred) {
           this.systemMessageDispatcher.requeue(deferred);
           continue;
         }
-        const dispatched = await this.dispatchSystemMessage(message);
+        const dispatched = await this.dispatchSystemMessage(preparedMessage);
         if (!dispatched) {
-          this.systemMessageDispatcher.requeue(message);
+          this.systemMessageDispatcher.requeue(preparedMessage);
         }
       } catch {
         this.systemMessageDispatcher?.requeue(message);
       }
     }
+  }
+
+  recordIncrementalUserEvent(normalized) {
+    const text = normalizeCommandArgument(normalized?.text);
+    if (!text || !normalized?.senderId || !normalized?.accountId) return null;
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: normalized.workspaceId,
+      accountId: normalized.accountId,
+      senderId: normalized.senderId,
+    });
+    const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    const event = this.incrementalEventStore.append({
+      id: normalizeCommandArgument(normalized.messageId) || `weixin:${normalized.senderId}:${normalized.receivedAt}:${text.slice(0, 80)}`,
+      scope: buildScopeKey(bindingKey, workspaceRoot),
+      kind: "weixin.user",
+      text,
+      at: normalized.receivedAt,
+    });
+    for (const kind of ["checkin", "diary_incremental"]) {
+      this.optimizationThrottleStore?.recordOutcome?.(buildThrottleKey({
+        kind,
+        accountId: normalized.accountId,
+        senderId: normalized.senderId,
+        workspaceRoot,
+      }), "activity");
+    }
+    return event;
+  }
+
+  prepareIncrementalSystemMessage(message) {
+    const consumer = normalizeCommandArgument(message?.triggerKind);
+    if (consumer !== "checkin" && consumer !== "diary_incremental") return null;
+    const baseBindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: this.config.workspaceId,
+      accountId: message.accountId,
+      senderId: message.senderId,
+    });
+    const workspaceRoot = message.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey);
+    const scope = buildScopeKey(baseBindingKey, workspaceRoot);
+    const delta = this.incrementalEventStore.readDelta({ consumer, scope, limit: 100 });
+    const throttleKey = buildThrottleKey({
+      kind: consumer,
+      accountId: message.accountId,
+      senderId: message.senderId,
+      workspaceRoot,
+    });
+    if (!delta.events.length) {
+      const throttle = this.optimizationThrottleStore?.recordOutcome?.(throttleKey, "empty");
+      if (throttle?.emptyExponent === 4) {
+        this.modelUsageLedger?.recordAlert?.({
+          schema: "agent-runtime.alert.v1",
+          type: "continuous_empty_runs",
+          severity: "warning",
+          requestId: message.id || "",
+          taskId: message.id || "",
+          runId: message.id || "",
+          source: consumer,
+          kind: consumer,
+          details: { emptyExponent: throttle.emptyExponent, multiplier: throttle.multiplier },
+          recordedAt: new Date().toISOString(),
+        });
+      }
+      return { skip: true };
+    }
+    this.optimizationThrottleStore?.recordOutcome?.(throttleKey, "activity");
+    return {
+      skip: false,
+      message: {
+        ...message,
+        incrementalScope: scope,
+        incrementalCursor: delta.cursor,
+        incrementalEvents: delta.events,
+        incrementalHasMore: delta.hasMore,
+      },
+    };
   }
 
   deferIncrementalMaintenanceUntilIdle(message) {
@@ -1410,15 +1604,21 @@ class CyberbossApp {
     if (!prepared) {
       throw new Error("system message could not be prepared");
     }
-    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+    const baseBindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
       workspaceId: prepared.workspaceId,
       accountId: prepared.accountId,
       senderId: prepared.senderId,
     });
-    const workspaceRoot = prepared.workspaceRoot || this.resolveWorkspaceRoot(bindingKey);
+    const workspaceRoot = prepared.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey);
+    const triggerKind = normalizeCommandArgument(prepared.triggerKind) || "system";
+    const bindingKey = `${baseBindingKey}::background:${triggerKind}`;
+    if (this.isTurnDispatchBlocked(baseBindingKey, workspaceRoot)) {
+      return false;
+    }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       return false;
     }
+    this.runtimeAdapter.getSessionStore().clearThreadIdForWorkspace(bindingKey, workspaceRoot);
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
   }
 
@@ -2014,6 +2214,19 @@ class CyberbossApp {
 
   async handleRuntimeEvent(event) {
     safeWorkLogCall(this, "recordRuntimeEvent", event);
+    if (event?.type === "runtime.context.updated") {
+      const usageRunKey = buildRunKey(event.payload?.threadId, event.payload?.turnId);
+      const request = this.pendingModelRequestByRunKey?.get?.(usageRunKey);
+      if (request) {
+        this.modelGateway?.recordUsage?.({
+          request,
+          model: event.payload?.model,
+          provider: this.runtimeAdapter?.describe?.().id || "",
+          usageEventId: event.payload?.usageEventId,
+          providerUsage: event.payload,
+        });
+      }
+    }
     const failureReplyTarget = event?.type === "runtime.turn.failed"
       ? this.streamDelivery.resolveReplyTargetForRun({
           threadId: event?.payload?.threadId,
@@ -2027,12 +2240,21 @@ class CyberbossApp {
         this.pendingUserContexts.delete(event.payload.threadId);
         saveTurnContext(userText);
       }
-      if (event.payload?.text) {
-        saveAssistantContext(event.payload.text);
-      }
       const memoryTurn = this.pendingMemoryTurns?.get?.(event.payload.threadId);
       if (memoryTurn) {
         this.pendingMemoryTurns.delete(event.payload.threadId);
+        if (event.payload?.text) {
+          saveAssistantContext(event.payload.text);
+        }
+        if (event.payload?.text) {
+          this.incrementalEventStore?.append?.({
+            id: `assistant:${event.payload.threadId}:${event.payload.turnId}`,
+            scope: memoryTurn.scopeKey,
+            kind: "assistant.message",
+            text: event.payload.text,
+            at: new Date().toISOString(),
+          });
+        }
         this.conversationContinuityStore?.recordTurn?.(memoryTurn.scopeKey, {
           userText: memoryTurn.userText,
           assistantText: event.payload?.text || "",
@@ -2053,10 +2275,18 @@ class CyberbossApp {
       }
       this.clearTurnTimeout(event.payload.threadId);
       const completedRunKey = buildRunKey(event.payload.threadId, event.payload.turnId);
+      this.pendingModelRequestByRunKey?.delete?.(completedRunKey);
       const pendingOperations = this.pendingOperationByRunKey;
       const pendingOperation = pendingOperations?.get?.(completedRunKey) || null;
       if (pendingOperation && pendingOperations?.delete) {
         pendingOperations.delete(completedRunKey);
+      }
+      const backgroundDelta = this.pendingBackgroundDeltaByRunKey?.get?.(completedRunKey) || null;
+      if (backgroundDelta) {
+        this.pendingBackgroundDeltaByRunKey.delete(completedRunKey);
+        if (event.type === "runtime.turn.completed") {
+          this.incrementalEventStore.commit(backgroundDelta);
+        }
       }
       const sessionStore = this.runtimeAdapter.getSessionStore();
       sessionStore.clearApprovalPrompt(event.payload.threadId);
@@ -2617,6 +2847,10 @@ function isPathWithinAllowedDirectories(rawPath) {
 
 function normalizeCommandArgument(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function sha256Text(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
 function normalizeThreadId(value) {

@@ -242,7 +242,10 @@ test("claudecode assistant events map usage into context snapshots", () => {
       sessionId: "thread-1",
     },
     {
+      uuid: "raw-usage-1",
       message: {
+        id: "provider-message-1",
+        model: "deepseek-v4-pro",
         usage: {
           input_tokens: 7,
           cache_creation_input_tokens: 12150,
@@ -256,6 +259,8 @@ test("claudecode assistant events map usage into context snapshots", () => {
   assert.equal(event.type, "runtime.context.updated");
   assert.equal(event.payload.runtimeId, "claudecode");
   assert.equal(event.payload.threadId, "thread-1");
+  assert.equal(event.payload.usageEventId, "provider-message-1");
+  assert.equal(event.payload.model, "deepseek-v4-pro");
   assert.equal(event.payload.currentTokens, 27201);
 });
 

@@ -127,9 +127,15 @@ function normalizeSystemMessage(message) {
     workspaceRoot,
     text,
     triggerKind: normalizeText(message.triggerKind),
+    metadata: normalizeMetadata(message.metadata),
     createdAt: createdAt || new Date().toISOString(),
     notBefore,
   };
+}
+
+function normalizeMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return JSON.parse(JSON.stringify(value));
 }
 
 function normalizeIsoTime(value) {

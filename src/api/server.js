@@ -6,6 +6,8 @@ const { apiKeyAuth } = require("./auth");
 const { createOpenAiHandler, createModelsHandler } = require("./openai-handler");
 const { createMcpHandler } = require("./mcp-handler");
 const { SessionPool } = require("./session-pool");
+const { ModelGateway } = require("../model-gateway");
+const { UsageLedger } = require("../model-gateway/usage-ledger");
 
 function createApiServer({ config, toolHost, memoryCoordinator }) {
   const app = express();
@@ -51,6 +53,18 @@ function createApiServer({ config, toolHost, memoryCoordinator }) {
 
   // Session pool (shared across routes)
   const sessionPool = new SessionPool({ config });
+  const usageLedger = new UsageLedger({
+    filePath: config.modelGatewayUsageFile || path.join(config.stateDir, "model-gateway-usage.json"),
+    budgets: config.modelGatewayBudgets,
+  });
+  const modelGateway = new ModelGateway({
+    routes: config.modelGatewayRoutes,
+    prices: config.modelGatewayPrices,
+    usageSink: usageLedger,
+    budgetProvider: usageLedger,
+    alertSink: usageLedger,
+    cacheMonitor: config.modelGatewayCacheMonitor,
+  });
 
   // MCP GET (SSE) — before auth so RikkaHub can establish SSE without auth header
   const mcpHandler = createMcpHandler({ toolHost });
@@ -59,10 +73,20 @@ function createApiServer({ config, toolHost, memoryCoordinator }) {
   app.use(apiKeyAuth(config));
 
   // OpenAI-compatible routes
-  const openAiHandler = createOpenAiHandler({ sessionPool, config, memoryCoordinator });
+  const openAiHandler = createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGateway });
   const modelsHandler = createModelsHandler({ config });
   app.post("/v1/chat/completions", openAiHandler);
   app.get("/v1/models", modelsHandler);
+  app.get("/v1/usage", (req, res) => {
+    const since = typeof req.query?.since === "string" ? req.query.since : "";
+    const until = typeof req.query?.until === "string" ? req.query.until : "";
+    const source = typeof req.query?.source === "string" ? req.query.source : "";
+    const bySource = req.query?.group_by === "source" ? usageLedger.aggregateBySource({ since, until }) : undefined;
+    const alerts = req.query?.include_alerts === "true"
+      ? usageLedger.listAlerts({ since, until, source, limit: req.query?.alert_limit })
+      : undefined;
+    res.json({ schema: "model-gateway.usage-summary.v1", since, until, source, aggregate: usageLedger.aggregate({ since, until, source }), bySource, alerts });
+  });
 
   // MCP POST/DELETE — auth required for tool access
   app.post("/mcp", mcpHandler);
@@ -73,7 +97,7 @@ function createApiServer({ config, toolHost, memoryCoordinator }) {
     res.json({ status: "ok", sessions: sessionPool.sessions.size, filesDir });
   });
 
-  return { app, sessionPool, filesDir };
+  return { app, sessionPool, filesDir, modelGateway, usageLedger };
 }
 
 module.exports = { createApiServer };

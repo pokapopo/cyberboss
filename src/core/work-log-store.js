@@ -8,12 +8,13 @@ const {
   writeJsonFileAtomicSync,
 } = require("./json-state-file");
 
-const WORK_LOG_VERSION = 1;
+const WORK_LOG_VERSION = 2;
 const MAX_RECORDS = 200;
 const MAX_EVENTS_PER_RECORD = 20;
 const SUCCESS_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
 const ABNORMAL_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const ACTIVE_EXECUTION_STATUSES = new Set(["starting", "running"]);
+const MAX_USAGE_EVENT_IDS = 256;
 
 class WorkLogStore {
   constructor({ filePath, now = () => new Date() }) {
@@ -68,6 +69,8 @@ class WorkLogStore {
         updatedAt: nowIso,
         lastError: "",
         deliveryAttempts: 0,
+        usage: createEmptyUsage(),
+        usageEventIds: [],
         events: [],
       };
       appendEvent(record, {
@@ -109,6 +112,9 @@ class WorkLogStore {
       return null;
     }
     const type = sanitizeText(event?.type, 100);
+    if (type === "runtime.context.updated") {
+      return this.recordUsage(record.id, event?.payload);
+    }
     if (type === "runtime.tool.use") {
       return this.recordToolUse(record.id, event?.payload?.toolName);
     }
@@ -131,6 +137,42 @@ class WorkLogStore {
       });
     }
     return null;
+  }
+
+  recordUsage(id, payload = {}) {
+    const usageEventId = sanitizeText(payload?.usageEventId, 200);
+    return this.updateLocked(() => {
+      const record = this.state.records.find((item) => item.id === normalizeText(id));
+      if (!record) return null;
+      if (usageEventId && record.usageEventIds.includes(usageEventId)) {
+        return clone(record);
+      }
+      const sample = normalizeUsage(payload);
+      if (!sample.totalTokens) {
+        return clone(record);
+      }
+      record.usage.inputTokens += sample.inputTokens;
+      record.usage.cacheReadInputTokens += sample.cacheReadInputTokens;
+      record.usage.cacheCreationInputTokens += sample.cacheCreationInputTokens;
+      record.usage.outputTokens += sample.outputTokens;
+      record.usage.totalTokens += sample.totalTokens;
+      record.usage.requestCount += 1;
+      record.usage.model = sample.model || record.usage.model;
+      if (usageEventId) {
+        record.usageEventIds.push(usageEventId);
+        if (record.usageEventIds.length > MAX_USAGE_EVENT_IDS) {
+          record.usageEventIds.splice(0, record.usageEventIds.length - MAX_USAGE_EVENT_IDS);
+        }
+      }
+      const nowIso = this.nowIso();
+      appendEvent(record, {
+        type: "runtime.usage",
+        detail: `${sample.model || "unknown"} tokens=${sample.totalTokens}`,
+        at: nowIso,
+      });
+      record.updatedAt = nowIso;
+      return clone(record);
+    });
   }
 
   recordToolUse(id, toolName) {
@@ -406,6 +448,8 @@ function normalizeRecord(record) {
     updatedAt: normalizeIso(record.updatedAt) || startedAt,
     lastError: sanitizeText(record.lastError, 500),
     deliveryAttempts: Math.max(0, Number.parseInt(record.deliveryAttempts, 10) || 0),
+    usage: normalizeUsage(record.usage),
+    usageEventIds: normalizeStringArray(record.usageEventIds, MAX_USAGE_EVENT_IDS, 200),
     events: Array.isArray(record.events)
       ? record.events.map(normalizeEvent).filter(Boolean).slice(-MAX_EVENTS_PER_RECORD)
       : [],
@@ -460,8 +504,43 @@ function summarizeRecord(record) {
     runtimeId: record.runtimeId,
     threadId: record.threadId,
     turnId: record.turnId,
+    usage: clone(record.usage),
     recentEvents: record.events.slice(-6),
   };
+}
+
+function createEmptyUsage() {
+  return {
+    inputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    requestCount: 0,
+    model: "",
+  };
+}
+
+function normalizeUsage(value = {}) {
+  const inputTokens = normalizeNonNegativeInteger(value.inputTokens);
+  const cacheReadInputTokens = normalizeNonNegativeInteger(value.cacheReadInputTokens);
+  const cacheCreationInputTokens = normalizeNonNegativeInteger(value.cacheCreationInputTokens);
+  const outputTokens = normalizeNonNegativeInteger(value.outputTokens);
+  const computedTotal = inputTokens + cacheReadInputTokens + cacheCreationInputTokens + outputTokens;
+  return {
+    inputTokens,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    outputTokens,
+    totalTokens: computedTotal,
+    requestCount: normalizeNonNegativeInteger(value.requestCount),
+    model: sanitizeText(value.model, 120),
+  };
+}
+
+function normalizeNonNegativeInteger(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
 }
 
 function buildSearchText(record) {

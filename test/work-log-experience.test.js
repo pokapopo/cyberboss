@@ -92,6 +92,59 @@ test("work log keeps a small fixed record budget", () => {
   assert.equal(snapshot.records[0].summary, "message 25");
 });
 
+test("work log accumulates deduplicated runtime usage per run", () => {
+  const filePath = createTempFile("work-log.json");
+  const store = new WorkLogStore({ filePath });
+  const started = store.startExecution({
+    source: "system",
+    triggerKind: "checkin",
+    runtimeId: "claudecode",
+  });
+  store.bindRuntime(started.id, {
+    runtimeId: "claudecode",
+    threadId: "thread-usage",
+    turnId: "turn-usage",
+  });
+  const event = {
+    type: "runtime.context.updated",
+    payload: {
+      threadId: "thread-usage",
+      turnId: "turn-usage",
+      usageEventId: "provider-message-1",
+      model: "deepseek-v4-pro",
+      inputTokens: 100,
+      cacheReadInputTokens: 10_000,
+      cacheCreationInputTokens: 200,
+      outputTokens: 300,
+    },
+  };
+  store.recordRuntimeEvent(event);
+  store.recordRuntimeEvent(event);
+  store.recordRuntimeEvent({
+    ...event,
+    payload: {
+      ...event.payload,
+      usageEventId: "provider-message-2",
+      inputTokens: 50,
+      cacheReadInputTokens: 11_000,
+      cacheCreationInputTokens: 0,
+      outputTokens: 100,
+    },
+  });
+
+  const record = new WorkLogStore({ filePath }).get(started.id);
+  assert.deepEqual(record.usage, {
+    inputTokens: 150,
+    cacheReadInputTokens: 21_000,
+    cacheCreationInputTokens: 200,
+    outputTokens: 400,
+    totalTokens: 21_750,
+    requestCount: 2,
+    model: "deepseek-v4-pro",
+  });
+  assert.deepEqual(record.usageEventIds, ["provider-message-1", "provider-message-2"]);
+});
+
 test("work log bounds events and marks stale active executions interrupted", () => {
   const filePath = createTempFile("work-log.json");
   const store = new WorkLogStore({

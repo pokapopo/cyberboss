@@ -79,6 +79,36 @@ function listProjectToolNames() {
 
 const PROJECT_TOOLS = [
   {
+    name: "cyberboss_ncp_read_batch",
+    description: "Run 1-4 independent read-only Garden or browser observations through the isolated NCP tool layer. Only allowlisted reads are accepted; scheduling, MCP management, code mode, clicks, form changes, posts, replies, likes, uploads, and filesystem output are rejected. Results are bounded and may be partial.",
+    shortHint: "Batch bounded read-only Garden/browser observations through isolated NCP.",
+    topics: ["browser", "garden", "read"],
+    inputSchema: {
+      type: "object",
+      required: ["calls"],
+      properties: {
+        calls: {
+          type: "array", minItems: 1, maxItems: 4,
+          items: {
+            type: "object", required: ["server", "tool"],
+            properties: {
+              callId: { type: "string" },
+              server: { type: "string", enum: ["garden", "playwright"] },
+              tool: { type: "string" },
+              params: { type: "object" },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ncpReadOnly.readBatch(args.calls);
+      return { text: `NCP read batch ${result.status}: ${result.calls.length} call(s), ${result.returnedChars} returned chars.`, data: result };
+    },
+  },
+  {
     name: "cyberboss_memory_search",
     description: "Semantically search Cyberboss long-term Markdown memory. Use when the user asks what is remembered, requests a past preference/project fact, or automatic recalled context is insufficient. Treat results as historical context that may need current confirmation.",
     shortHint: "Search long-term memory by meaning when current context is insufficient.",

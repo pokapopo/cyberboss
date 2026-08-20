@@ -26,6 +26,8 @@
     "shared:open": "node ./scripts/shared-open.js",
     "shared:status": "node ./scripts/shared-status.js",
     "agent:status": "node ./scripts/agent-status.js",
+    "ncp:patch": "node ./scripts/patch-ncp-secure-profile.js",
+    "usage:report": "node ./scripts/token-usage-report.js",
     "check:syntax": "node ./scripts/check-syntax.js",
     "test": "node --test",
     "check": "npm run check:syntax && npm test"

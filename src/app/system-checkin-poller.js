@@ -9,6 +9,7 @@ const {
 } = require("../core/checkin-config-store");
 const { resolvePreferredSenderId, resolvePreferredWorkspaceRoot } = require("../core/default-targets");
 const { SystemMessageQueueStore } = require("../core/system-message-queue-store");
+const { AdaptiveThrottleStore, buildThrottleKey } = require("../runtime/optimization/adaptive-throttle-store");
 
 const INTERNAL_CHECKIN_TRIGGER_TEMPLATE = "%USER% comes to mind again.";
 const DIARY_TIMELINE_TRIGGER = "DIARY_TIMELINE_INCREMENTAL";
@@ -39,6 +40,8 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
   const checkinConfigStore = new CheckinConfigStore({ filePath: config.checkinConfigFile });
   const sessionStore = new SessionStore({ filePath: config.sessionsFile });
   const target = resolvePollerTarget({ config, account, sessionStore });
+  const throttleStore = new AdaptiveThrottleStore({ filePath: config.optimizationThrottleFile || require("path").join(config.stateDir, "optimization-throttle.json") });
+  const throttleKey = buildThrottleKey({ kind: name === "diary" ? "diary_incremental" : "checkin", accountId: account.accountId, senderId: target.senderId, workspaceRoot: target.workspaceRoot });
   let currentRange = getRange(checkinConfigStore, defaultRange);
 
   console.log(`[cyberboss] ${name} poller ready user=${target.senderId} workspace=${target.workspaceRoot}`);
@@ -46,7 +49,8 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
 
   while (true) {
     currentRange = getRange(checkinConfigStore, defaultRange);
-    const delayMs = pickRandomDelayMs(currentRange.minIntervalMs, currentRange.maxIntervalMs);
+    const multiplier = throttleStore.getMultiplier(throttleKey);
+    const delayMs = pickRandomDelayMs(currentRange.minIntervalMs, currentRange.maxIntervalMs) * multiplier;
     const wakeAt = formatLocalTime(Date.now() + delayMs);
     console.log(`[cyberboss] ${name} next in ${Math.round(delayMs / 60000)}m at ${wakeAt}`);
     await sleep(delayMs);
@@ -63,6 +67,7 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
       workspaceRoot: target.workspaceRoot,
       text: buildTrigger(config),
       triggerKind: name === "diary" ? "diary_incremental" : "checkin",
+      metadata: { runtime: { throttleKey } },
       createdAt: new Date().toISOString(),
     });
     console.log(`[cyberboss] ${name} queued id=${queued.id} triggerKind=${queued.triggerKind}`);

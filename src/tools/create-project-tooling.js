@@ -13,6 +13,7 @@ const { TimelineService } = require("../services/timeline-service");
 const { RuntimeContextStore } = require("./runtime-context-store");
 const { ProjectToolHost } = require("./tool-host");
 const { WhereaboutsService } = require("whereabouts-mcp");
+const { NcpReadOnlyAdapter } = require("../integrations/ncp-readonly");
 
 function createProjectTooling(config, options = {}) {
   const sessionStore = options.sessionStore || new SessionStore({
@@ -39,6 +40,7 @@ function createProjectTooling(config, options = {}) {
     channelFile,
     sticker: new StickerService({ config, channelAdapter, sessionStore, channelFileService: channelFile }),
     timeline: new TimelineService({ config, timelineIntegration, sessionStore }),
+    ncpReadOnly: options.ncpReadOnly || new NcpReadOnlyAdapter({ cwd: config.workspaceRoot }),
     whereabouts: new WhereaboutsService({
       config: {
         storeFile: config.locationStoreFile,

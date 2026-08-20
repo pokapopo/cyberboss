@@ -33,6 +33,28 @@ function readConfig() {
     deferredSystemReplyQueueFile: path.join(stateDir, "deferred-system-replies.json"),
     weixinDeliveryOutboxFile: path.join(stateDir, "weixin-delivery-outbox.json"),
     workLogFile: path.join(stateDir, "work-log.json"),
+    incrementalEventFile: path.join(stateDir, "incremental-events.json"),
+    modelGatewayUsageFile: path.join(stateDir, "model-gateway-usage.json"),
+    optimizationThrottleFile: path.join(stateDir, "optimization-throttle.json"),
+    modelGatewayBudgets: {
+      background: {
+        softMicros: readIntEnv("CYBERBOSS_BACKGROUND_BUDGET_SOFT_MICROS"),
+        hardMicros: readIntEnv("CYBERBOSS_BACKGROUND_BUDGET_HARD_MICROS"),
+        perTaskSoftTokens: readIntEnv("CYBERBOSS_BACKGROUND_TASK_SOFT_TOKENS") ?? 250_000,
+        perTaskHardTokens: readIntEnv("CYBERBOSS_BACKGROUND_TASK_HARD_TOKENS") ?? 500_000,
+        hourSoftTokens: readIntEnv("CYBERBOSS_BACKGROUND_HOUR_SOFT_TOKENS") ?? 1_000_000,
+        hourHardTokens: readIntEnv("CYBERBOSS_BACKGROUND_HOUR_HARD_TOKENS") ?? 2_000_000,
+        daySoftTokens: readIntEnv("CYBERBOSS_BACKGROUND_DAY_SOFT_TOKENS") ?? 5_000_000,
+        dayHardTokens: readIntEnv("CYBERBOSS_BACKGROUND_DAY_HARD_TOKENS") ?? 10_000_000,
+      },
+      sources: readJsonEnv("CYBERBOSS_BACKGROUND_SOURCE_BUDGETS_JSON", {}),
+    },
+    modelGatewayRoutes: readJsonEnv("CYBERBOSS_MODEL_GATEWAY_ROUTES_JSON", {}),
+    modelGatewayPrices: readJsonEnv("CYBERBOSS_MODEL_PRICES_JSON", {}),
+    modelGatewayCacheMonitor: {
+      minInputTokens: readIntEnv("CYBERBOSS_CACHE_ALERT_MIN_INPUT_TOKENS") || 20_000,
+      minReadRatio: readNumberEnv("CYBERBOSS_CACHE_ALERT_MIN_READ_RATIO", 0.05),
+    },
     experienceFile: path.join(stateDir, "experience-library.json"),
     memoryEnabled: readOptionalBoolEnv("CYBERBOSS_MEMORY_ENABLED") === true,
     memoryDir: readTextEnv("CYBERBOSS_MEMORY_DIR") || path.join(stateDir, "memory"),
@@ -159,6 +181,24 @@ function readIntEnv(name) {
   }
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function readNumberEnv(name, fallback) {
+  const value = readTextEnv(name);
+  if (!value) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readJsonEnv(name, fallback) {
+  const value = readTextEnv(name);
+  if (!value) return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function readKnownPlacesEnv() {

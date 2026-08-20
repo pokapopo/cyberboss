@@ -1,0 +1,124 @@
+const { spawn } = require("child_process");
+const { compressToolResult } = require("../runtime/optimization/tool-result-compressor");
+
+const ALLOWED_TOOLS = Object.freeze({
+  garden: new Set([
+    "list_notifications", "get_my_status", "get_self", "get_machine",
+    "list_threads", "get_thread", "list_games", "get_game_summary",
+    "get_chat_messages", "list_activity", "review_drift_bottles",
+  ]),
+  playwright: new Set([
+    "browser_snapshot", "browser_console_messages", "browser_network_requests",
+  ]),
+});
+
+class NcpReadOnlyAdapter {
+  constructor({ command = "ncp", cwd = process.cwd(), timeoutMs = 25_000, maxCalls = 4, maxChars = 4_000, executor = executeNcp } = {}) {
+    this.command = command;
+    this.cwd = cwd;
+    this.timeoutMs = timeoutMs;
+    this.maxCalls = maxCalls;
+    this.maxChars = maxChars;
+    this.executor = executor;
+  }
+
+  async readBatch(calls = []) {
+    if (!Array.isArray(calls) || calls.length < 1 || calls.length > this.maxCalls) {
+      throw new Error(`NCP read batch must contain 1-${this.maxCalls} calls`);
+    }
+    const normalized = calls.map(validateReadCall);
+    const results = await Promise.all(normalized.map(async (call) => {
+      const startedAt = Date.now();
+      try {
+        const result = await this.executor({
+          command: this.command, cwd: this.cwd, timeoutMs: this.timeoutMs, call,
+          maxOutputChars: Math.max(16_000, this.maxChars * 4),
+        });
+        return compressToolResult({
+          callId: call.callId, tool: `${call.server}:${call.tool}`, status: "completed",
+          text: result.text, durationMs: Date.now() - startedAt,
+          evidenceIds: result.evidenceIds, metadata: { ncp: { server: call.server } },
+        }, { maxChars: this.maxChars });
+      } catch (error) {
+        return compressToolResult({
+          callId: call.callId, tool: `${call.server}:${call.tool}`,
+          status: error?.code === "ETIMEDOUT" ? "cancelled" : "failed",
+          text: error?.message || "NCP read failed", durationMs: Date.now() - startedAt,
+          metadata: { ncp: { server: call.server } },
+        }, { maxChars: this.maxChars });
+      }
+    }));
+    return {
+      schema: "ncp.read-batch.v1",
+      status: results.every((item) => item.status === "completed") ? "completed" : "partial",
+      calls: results,
+      returnedChars: results.reduce((sum, item) => sum + item.returnedChars, 0),
+    };
+  }
+}
+
+function validateReadCall(value = {}, index = 0) {
+  const server = normalizeText(value.server);
+  const tool = normalizeText(value.tool);
+  if (!ALLOWED_TOOLS[server]?.has(tool)) throw new Error(`NCP call ${index + 1} is not an allowed read: ${server}:${tool}`);
+  const params = value.params && typeof value.params === "object" && !Array.isArray(value.params) ? value.params : {};
+  if (server === "playwright" && ("filename" in params || "path" in params)) {
+    throw new Error(`NCP call ${index + 1} may not write browser output to disk`);
+  }
+  return { callId: normalizeText(value.callId) || `call-${index + 1}`, server, tool, params };
+}
+
+function executeNcp({ command, cwd, timeoutMs, call, maxOutputChars = 64_000 }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, ["--profile", call.server, "run", `${call.server}:${call.tool}`, "--params", JSON.stringify(call.params), "--no-prompt", "--output-format", "json"], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        NCP_ENABLE_CODE_MODE: "false",
+        NCP_ENABLE_SKILLS: "false",
+        NCP_ENABLE_PHOTON_RUNTIME: "false",
+        NCP_ENABLE_SCHEDULE_MCP: "false",
+        NCP_ENABLE_MCP_MANAGEMENT: "false",
+        NCP_DIRECT_RUN: "true",
+      },
+    });
+    let stdout = ""; let stderr = ""; let settled = false; let successSettleTimer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(successSettleTimer);
+      fn(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      const error = new Error(`NCP read timed out after ${timeoutMs}ms`); error.code = "ETIMEDOUT";
+      finish(reject, error);
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout = appendBounded(stdout, chunk.toString(), maxOutputChars);
+      if (stdout.includes("Success! Tool execution completed")) {
+        clearTimeout(successSettleTimer);
+        successSettleTimer = setTimeout(() => {
+          child.kill("SIGTERM");
+          finish(resolve, { text: stdout.trim(), evidenceIds: [] });
+        }, 750);
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk.toString(), maxOutputChars); });
+    child.on("error", (error) => finish(reject, error));
+    child.on("close", (code) => code === 0
+      ? finish(resolve, { text: stdout.trim(), evidenceIds: [] })
+      : finish(reject, new Error(`NCP read failed (${code}): ${stderr.trim() || stdout.trim()}`)));
+  });
+}
+
+function normalizeText(value) { return typeof value === "string" ? value.trim() : ""; }
+function appendBounded(current, next, limit) {
+  const max = Math.max(1_000, Number(limit) || 64_000);
+  if (current.length >= max) return current;
+  return (current + next).slice(0, max);
+}
+
+module.exports = { NcpReadOnlyAdapter, ALLOWED_TOOLS, validateReadCall, executeNcp };

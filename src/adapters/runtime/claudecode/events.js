@@ -141,6 +141,9 @@ function normalizeClaudeContextPayload(message, raw) {
   return {
     runtimeId: "claudecode",
     threadId: normalizeString(message?.sessionId),
+    turnId: normalizeString(message?.turnId),
+    usageEventId: normalizeString(raw?.message?.id || raw?.uuid),
+    model: normalizeString(raw?.message?.model),
     inputTokens,
     cacheCreationInputTokens,
     cacheReadInputTokens,

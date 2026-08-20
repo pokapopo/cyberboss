@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const fs = require("fs");
+const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
 
 const AGENT_EVENT_PROTOCOL = "cyberboss.agent.v1";
 const API_TURN_SYSTEM_PROMPT = [
@@ -32,7 +33,7 @@ function loadSystemPrompt(config) {
   return parts.join("\n\n").trim();
 }
 
-function createOpenAiHandler({ sessionPool, config, memoryCoordinator }) {
+function createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGateway = null }) {
   // Load system prompt once at startup
   const systemPrompt = loadSystemPrompt(config);
   console.log(`[api] system prompt loaded: ${systemPrompt.length} chars`);
@@ -47,6 +48,21 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator }) {
 
     const conversation = resolveConversationContext({ req, messages });
     const { conversationId, scopeKey } = conversation;
+    const task = createTaskEnvelope({
+      source: "frontend_chat",
+      kind: "agent.turn",
+      priority: "interactive",
+      visibility: "user",
+      scope: scopeKey,
+      continuityKey: conversationId,
+      modelClass: "primary",
+      metadata: { frontend: { conversationId: conversation.publicConversationId } },
+    });
+    const modelRequest = createModelRequestEnvelope({
+      task,
+      requestedModel: model,
+      fixedPrefixFingerprint: crypto.createHash("sha256").update(systemPrompt).digest("hex"),
+    });
     let session = null;
     let released = false;
 
@@ -115,6 +131,17 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator }) {
       if (!stream) {
         // Non-streaming mode: collect all text and return as JSON
         const result = await runNonStreaming({ session, userText: finalText });
+        if (result.usage) {
+          modelGateway?.recordUsage?.({
+            request: modelRequest,
+            model,
+            provider: "claudecode",
+            providerUsage: {
+              inputTokens: result.usage.prompt_tokens,
+              outputTokens: result.usage.completion_tokens,
+            },
+          });
+        }
         // Feed turn into memory extraction
         if (memoryCoordinator) {
           memoryCoordinator.completeTurn({
@@ -271,6 +298,19 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator }) {
             usage.cache_read_input_tokens = accumulatedUsage.cacheReadTokens || 0;
             usage.cache_creation_input_tokens = accumulatedUsage.cacheCreationTokens || 0;
           }
+        }
+        if (usage) {
+          modelGateway?.recordUsage?.({
+            request: modelRequest,
+            model,
+            provider: "claudecode",
+            providerUsage: {
+              inputTokens: Math.max(0, usage.prompt_tokens - (usage.cache_read_input_tokens || 0) - (usage.cache_creation_input_tokens || 0)),
+              cacheReadInputTokens: usage.cache_read_input_tokens || 0,
+              cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
+              outputTokens: usage.completion_tokens,
+            },
+          });
         }
         writeSseChunk(res, chatId, created, model, {}, "stop", usage);
         res.write("data: [DONE]\n\n");
