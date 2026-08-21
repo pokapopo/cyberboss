@@ -5,11 +5,13 @@ function handleRuntimeEventForTest(appLike, event) {
   appLike.pendingOperationByRunKey ||= new Map();
   appLike.turnTimeouts ||= new Map();
   appLike.turnBoundaryScopeKeys ||= new Set();
+  appLike.tokenLimitedRunKeys ||= new Set();
   appLike.threadStateStore ||= {};
   appLike.threadStateStore.getThreadState ||= () => null;
   appLike.clearTurnTimeout ||= CyberbossApp.prototype.clearTurnTimeout.bind(appLike);
   appLike.scheduleTurnTimeout ||= () => {};
   appLike._autoCompactIfNeeded ||= async () => {};
+  appLike.enforceTimelineTokenLimit ||= CyberbossApp.prototype.enforceTimelineTokenLimit.bind(appLike);
   return CyberbossApp.prototype.handleRuntimeEvent.call(appLike, event);
 }
 

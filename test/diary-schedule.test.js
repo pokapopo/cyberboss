@@ -44,9 +44,8 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /tool description and this system prompt are authoritative/);
   assert.match(prepared.text, /preference-diary-writing\.md/);
   assert.match(prepared.text, /missing memory must never block diary finalization/);
-  assert.match(prepared.text, /cyberboss_timeline_reconcile/);
-  assert.match(prepared.text, /leave unknown\/ongoing observations pending/);
-  assert.match(prepared.text, /finalize=true/);
+  assert.doesNotMatch(prepared.text, /cyberboss_timeline_reconcile/);
+  assert.match(prepared.text, /Timeline finalization is a separate pipeline/);
 });
 
 test("incremental diary prompt explicitly treats append entries as draft fragments", () => {
@@ -64,12 +63,16 @@ test("incremental diary prompt explicitly treats append entries as draft fragmen
 
   assert.match(prepared.text, /cyberboss_diary_append/);
   assert.match(prepared.text, /timestamped draft fragments/);
-  assert.match(prepared.text, /do not try to\s+turn each fragment into a complete formatted diary/);
-  assert.match(prepared.text, /closes a diary day/);
-  assert.match(prepared.text, /automatically rolls later material/);
-  assert.match(prepared.text, /cyberboss_timeline_capture first/);
-  assert.match(prepared.text, /cyberboss_timeline_reconcile/);
-  assert.match(prepared.text, /Leave unknown-time or ongoing observations pending/);
-  assert.match(prepared.text, /waking closes a known sleep/);
-  assert.match(prepared.text, /Combine complementary start\/end observations/);
+  assert.match(prepared.text, /sourceEventIds/);
+  assert.match(prepared.text, /atomic no-ops/);
+  assert.doesNotMatch(prepared.text, /cyberboss_timeline_capture/);
+});
+
+test("incremental timeline prompt has explicit transition boundaries and no diary work", () => {
+  const dispatcher = new SystemMessageDispatcher({ queueStore: {}, config: { workspaceId: "default", workspaceRoot: "/workspace" }, accountId: "account-1" });
+  const prepared = dispatcher.buildPreparedMessage({ id: "timeline-1", senderId: "user-1", triggerKind: "timeline_incremental", createdAt: "2026-08-05T10:00:00.000Z", incrementalEvents: [{ id: "event-1", seq: 9, kind: "weixin.user", at: "2026-08-05T09:00:00Z", text: "醒了" }] });
+  assert.match(prepared.text, /boundaryType=start/);
+  assert.match(prepared.text, /boundaryType=end/);
+  assert.match(prepared.text, /id=event-1 seq=9/);
+  assert.doesNotMatch(prepared.text, /cyberboss_diary_append/);
 });

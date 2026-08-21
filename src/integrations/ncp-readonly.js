@@ -1,5 +1,10 @@
-const { spawn } = require("child_process");
+const fs = require("fs");
+const { execFile, spawn } = require("child_process");
+const { promisify } = require("util");
 const { compressToolResult } = require("../runtime/optimization/tool-result-compressor");
+
+const execFileAsync = promisify(execFile);
+const PERSONAL_BROWSER_ACTIVITY_FILE = "/var/lib/personal-remote-browser/last-activity";
 
 const ALLOWED_TOOLS = Object.freeze({
   garden: new Set([
@@ -31,13 +36,15 @@ const INTERACTION_TOOLS = new Set([
 const AUTHORIZATION_DECISIONS = new Set(["within_existing_authority", "user_confirmed"]);
 
 class NcpReadOnlyAdapter {
-  constructor({ command = "ncp", cwd = process.cwd(), timeoutMs = 25_000, maxCalls = 4, maxChars = 4_000, executor = executeNcp } = {}) {
+  constructor({ command = "ncp", cwd = process.cwd(), timeoutMs = 25_000, maxCalls = 4, maxChars = 4_000, executor = executeNcp, browserLifecycle = null } = {}) {
     this.command = command;
     this.cwd = cwd;
     this.timeoutMs = timeoutMs;
     this.maxCalls = maxCalls;
     this.maxChars = maxChars;
     this.executor = executor;
+    this.browserLifecycle = browserLifecycle
+      || (executor === executeNcp ? ensurePersonalBrowserStarted : async () => {});
   }
 
   async readBatch(calls = []) {
@@ -45,6 +52,9 @@ class NcpReadOnlyAdapter {
       throw new Error(`NCP read batch must contain 1-${this.maxCalls} calls`);
     }
     const normalized = calls.map(validateReadCall);
+    if (normalized.some((call) => call.server === "playwright")) {
+      await this.browserLifecycle();
+    }
     const results = await Promise.all(normalized.map(async (call) => {
       const startedAt = Date.now();
       try {
@@ -72,6 +82,43 @@ class NcpReadOnlyAdapter {
       calls: results,
       returnedChars: results.reduce((sum, item) => sum + item.returnedChars, 0),
     };
+  }
+}
+
+async function ensurePersonalBrowserStarted({
+  activityFile = PERSONAL_BROWSER_ACTIVITY_FILE,
+  exec = execFileAsync,
+} = {}) {
+  await touchBrowserActivity(activityFile);
+  try {
+    await exec("systemctl", ["is-active", "--quiet", "personal-browser-core.service"], { timeout: 5_000 });
+  } catch {
+    await exec("systemctl", ["start", "personal-browser-core.service"], { timeout: 20_000 });
+  }
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch("http://127.0.0.1:9333/json/version", { signal: AbortSignal.timeout(1_500) });
+      if (response.ok) {
+        await touchBrowserActivity(activityFile);
+        return;
+      }
+    } catch {
+      // Chrome may still be restoring its profile.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("personal browser did not become ready within 15 seconds");
+}
+
+async function touchBrowserActivity(filePath = PERSONAL_BROWSER_ACTIVITY_FILE) {
+  await fs.promises.mkdir(require("path").dirname(filePath), { recursive: true });
+  const now = new Date();
+  try {
+    await fs.promises.utimes(filePath, now, now);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    await fs.promises.writeFile(filePath, "", { mode: 0o664 });
   }
 }
 
@@ -166,4 +213,6 @@ module.exports = {
   INTERACTION_TOOLS,
   validateReadCall,
   executeNcp,
+  ensurePersonalBrowserStarted,
+  touchBrowserActivity,
 };

@@ -81,6 +81,15 @@ class SystemMessageQueueStore {
     return this.state.messages.some((message) => message.accountId === normalizedAccountId);
   }
 
+  hasPendingForPipeline(accountId, triggerKind) {
+    this.load();
+    const normalizedAccountId = normalizeText(accountId);
+    const normalizedKind = normalizeText(triggerKind);
+    return this.state.messages.some((message) => (
+      message.accountId === normalizedAccountId && message.triggerKind === normalizedKind
+    ));
+  }
+
   hasDueForAccount(accountId, nowMs = Date.now()) {
     this.load();
     const normalizedAccountId = normalizeText(accountId);

@@ -275,6 +275,7 @@ class WeixinDeliveryService {
     now = () => new Date(),
     instanceId = crypto.randomUUID(),
     onDeliveryEvent = null,
+    onDeliveryConfirmed = null,
   }) {
     this.store = new WeixinDeliveryOutboxStore({ filePath });
     this.channelAdapter = channelAdapter;
@@ -282,6 +283,7 @@ class WeixinDeliveryService {
     this.now = now;
     this.instanceId = instanceId;
     this.onDeliveryEvent = typeof onDeliveryEvent === "function" ? onDeliveryEvent : null;
+    this.onDeliveryConfirmed = typeof onDeliveryConfirmed === "function" ? onDeliveryConfirmed : null;
     this.timer = null;
     this.drainPromise = null;
     this.closed = false;
@@ -343,6 +345,7 @@ class WeixinDeliveryService {
     runKey,
     threadId = "",
     turnId = "",
+    bindingKey = "",
     target = null,
     kind,
     text,
@@ -367,6 +370,7 @@ class WeixinDeliveryService {
       runKey,
       threadId: threadId || run?.threadId,
       turnId: turnId || run?.turnId,
+      bindingKey,
       userId,
       contextToken,
       kind,
@@ -433,7 +437,10 @@ class WeixinDeliveryService {
   async attemptDelivery(delivery) {
     const chunk = delivery.chunks[delivery.nextChunkIndex];
     if (!chunk) {
-      this.store.markChunkDelivered(delivery.id, delivery.chunks.length, this.nowIso());
+      const result = this.store.markChunkDelivered(delivery.id, delivery.chunks.length, this.nowIso());
+      if (result.delivered && result.delivery) {
+        await this.notifyDeliveryConfirmed(result.delivery);
+      }
       return;
     }
     const latestToken = normalizeText(
@@ -490,6 +497,7 @@ class WeixinDeliveryService {
           kind: delivery.kind,
           attemptCount: delivery.attemptCount,
         });
+        await this.notifyDeliveryConfirmed(result.delivery);
       }
     } catch (error) {
       const waitingForContext = isContextFailure(error);
@@ -565,6 +573,19 @@ class WeixinDeliveryService {
       );
     }
   }
+
+  async notifyDeliveryConfirmed(delivery) {
+    if (!this.onDeliveryConfirmed || !delivery) {
+      return;
+    }
+    try {
+      await this.onDeliveryConfirmed(delivery);
+    } catch (error) {
+      console.error(
+        `[cyberboss] delivery confirmation observer failed id=${normalizeText(delivery.id)} error=${sanitizeError(error)}`
+      );
+    }
+  }
 }
 
 function createEmptyState() {
@@ -634,6 +655,7 @@ function normalizeDelivery(delivery) {
     runKey,
     threadId: normalizeText(delivery.threadId),
     turnId: normalizeText(delivery.turnId),
+    bindingKey: normalizeText(delivery.bindingKey),
     userId,
     contextToken: normalizeText(delivery.contextToken),
     kind,

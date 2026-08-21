@@ -10,6 +10,7 @@ const DEFAULT_TTL_MS = 48 * HOUR_MS;
 const MAX_OBSERVATIONS = 160;
 const VALID_PRECISIONS = new Set(["exact", "approximate", "unknown"]);
 const VALID_STATUSES = new Set(["ongoing", "completed"]);
+const VALID_BOUNDARY_TYPES = new Set(["start", "end", "point", "range", "unknown"]);
 
 class TimelineObservationStore {
   constructor({ filePath, now = () => new Date() } = {}) {
@@ -38,6 +39,9 @@ class TimelineObservationStore {
           existing.timePrecision = candidate.timePrecision;
           existing.startAt = candidate.startAt || existing.startAt;
           existing.endAt = candidate.endAt || existing.endAt;
+          existing.activityType = candidate.activityType || existing.activityType;
+          existing.boundaryType = candidate.boundaryType || existing.boundaryType;
+          existing.boundaryAt = candidate.boundaryAt || existing.boundaryAt;
           existing.sourceMessageIds = uniqueStrings([
             ...existing.sourceMessageIds,
             ...candidate.sourceMessageIds,
@@ -123,17 +127,24 @@ function normalizeObservationInput(value, context, now) {
   const observedAt = normalizeIso(value?.observedAt) || timestamp;
   const startAt = normalizeIso(value?.startAt);
   const endAt = normalizeIso(value?.endAt);
-  const sourceMessageIds = uniqueStrings([
+  const explicitSourceIds = uniqueStrings([
     ...(Array.isArray(value?.sourceMessageIds) ? value.sourceMessageIds : []),
-    ...(Array.isArray(context?.sourceMessageIds) ? context.sourceMessageIds : []),
+    ...(Array.isArray(value?.sourceEventIds) ? value.sourceEventIds : []),
   ]);
+  const sourceMessageIds = explicitSourceIds.length
+    ? explicitSourceIds
+    : uniqueStrings(context?.sourceMessageIds);
   const timePrecision = VALID_PRECISIONS.has(value?.timePrecision)
     ? value.timePrecision
     : (startAt && endAt ? "exact" : "unknown");
   const status = VALID_STATUSES.has(value?.status) ? value.status : "completed";
+  const boundaryType = VALID_BOUNDARY_TYPES.has(value?.boundaryType) ? value.boundaryType : inferBoundaryType({ startAt, endAt });
+  const boundaryAt = normalizeIso(value?.boundaryAt)
+    || (boundaryType === "start" ? startAt : boundaryType === "end" || boundaryType === "point" ? endAt || startAt || observedAt : "");
+  const activityType = sanitizeText(value?.activityType, 120).toLowerCase();
   const date = normalizeDate(value?.date) || formatShanghaiDate(startAt || observedAt);
   const fingerprintBasis = sourceMessageIds.length
-    ? `${sourceMessageIds.join("|")}\n${text}`
+    ? `${sourceMessageIds.sort().join("|")}\n${activityType}\n${boundaryType}`
     : `${date}\n${startAt}\n${endAt}\n${text}`;
   return {
     id: `timeline_observation_${crypto.randomUUID()}`,
@@ -145,6 +156,9 @@ function normalizeObservationInput(value, context, now) {
     endAt,
     timePrecision,
     status,
+    activityType,
+    boundaryType,
+    boundaryAt,
     sourceMessageIds,
     threadId: sanitizeText(context?.threadId, 200),
     createdAt: timestamp,
@@ -173,12 +187,20 @@ function normalizeStoredObservation(value) {
     endAt,
     timePrecision: VALID_PRECISIONS.has(value?.timePrecision) ? value.timePrecision : "unknown",
     status: VALID_STATUSES.has(value?.status) ? value.status : "completed",
+    activityType: sanitizeText(value?.activityType, 120).toLowerCase(),
+    boundaryType: VALID_BOUNDARY_TYPES.has(value?.boundaryType) ? value.boundaryType : inferBoundaryType({ startAt, endAt }),
+    boundaryAt: normalizeIso(value?.boundaryAt),
     sourceMessageIds: uniqueStrings(value?.sourceMessageIds),
     threadId: sanitizeText(value?.threadId, 200),
     createdAt,
     lastObservedAt: normalizeIso(value?.lastObservedAt) || createdAt,
     expiresAt,
   };
+}
+
+function inferBoundaryType({ startAt = "", endAt = "" } = {}) {
+  if (startAt && endAt) return "range";
+  return "unknown";
 }
 
 function formatShanghaiDate(value) {

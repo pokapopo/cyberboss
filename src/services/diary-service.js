@@ -1,6 +1,8 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
+const { withFileLockSync } = require("../core/json-state-file");
 const { resolveBodyInput } = require("./text-input");
 const { writeDiaryView } = require("../../scripts/diary-view");
 const { captureDiaryScreenshot } = require("../../scripts/diary-screenshot");
@@ -12,7 +14,7 @@ class DiaryService {
     this.screenshotDiary = screenshotDiary;
   }
 
-  async append({ text = "", textFile = "", title = "", date = "", time = "" } = {}) {
+  async append({ text = "", textFile = "", title = "", date = "", time = "", sourceEventIds = [] } = {}) {
     const body = await resolveBodyInput({ text, textFile });
     if (!body) {
       throw new Error("Diary content cannot be empty. Pass text or textFile.");
@@ -32,15 +34,28 @@ class DiaryService {
       title,
       body,
     });
+    const normalizedSourceIds = uniqueStrings(sourceEventIds);
+    const idempotencyKey = normalizedSourceIds.length
+      ? crypto.createHash("sha256").update(normalizedSourceIds.sort().join("\n")).digest("hex")
+      : "";
+    const marker = idempotencyKey ? `<!-- cyberboss-diary-fragment:${idempotencyKey} -->` : "";
 
     fs.mkdirSync(this.config.diaryDir, { recursive: true });
-    const prefix = fs.existsSync(filePath) && fs.statSync(filePath).size > 0 ? "\n\n" : "";
-    fs.appendFileSync(filePath, `${prefix}${entry}`, "utf8");
+    const duplicate = withFileLockSync(filePath, () => {
+      const current = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+      if (marker && current.includes(marker)) return true;
+      const prefix = current.trim() ? "\n\n" : "";
+      writeTextFileAtomicSync(filePath, `${current}${prefix}${marker ? `${marker}\n` : ""}${entry}`);
+      return false;
+    });
     return {
       filePath,
       date: dateString,
       time: timeString,
       body,
+      sourceEventIds: normalizedSourceIds,
+      idempotencyKey,
+      duplicate,
       rolledOverFrom: dateString === requestedDate ? null : requestedDate,
     };
   }
@@ -68,6 +83,12 @@ class DiaryService {
       warnings: validation.warnings,
     };
   }
+}
+
+function uniqueStrings(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
 }
 
 function validateFinalDiaryMarkdown(value) {

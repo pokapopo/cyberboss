@@ -80,8 +80,8 @@ function listProjectToolNames() {
 const PROJECT_TOOLS = [
   {
     name: "cyberboss_ncp_read_batch",
-    description: "Run 1-4 bounded Garden or browser operations through NCP. Observation and navigation calls may run directly. Browser interaction calls such as click, type, key press, form fill, dialog handling, or close require an authorization object: the main model must decide either that the action is within the user's existing authority or that the user explicitly confirmed it, and explain the decision. If material outcome, target, publication, sending, purchase, deletion, credential use, or other consequential effect is unclear, tell the user what will happen and wait before calling. If NCP rejects or lacks a capability, do not silently bypass it with Bash, direct CDP/browser code, filesystem edits, or another tool: explain the proposed fallback to the user first. Scheduling remains unavailable and browser output may not be written to disk. Results are bounded and may be partial.",
-    shortHint: "Run bounded NCP observations/actions with main-model authorization for interactions and advance notice before fallback.",
+    description: "Use NCP only for Garden or Playwright browser operations; memory, diary, timeline, reminders, messaging, scheduling, shell, and project-file work belong to their own tools and must not probe NCP first. NCP loads and orchestrates its Garden/Playwright capabilities on demand. Plan from this contract and combine up to four independent calls in one batch instead of repeatedly rediscovering the catalog; split calls only when an earlier result determines the next action. Observation and navigation calls may run directly. Browser interaction calls such as click, type, key press, form fill, dialog handling, or close require an authorization object: the main model must decide either that the action is within the user's existing authority or that the user explicitly confirmed it, and explain the decision. If material outcome, target, publication, sending, purchase, deletion, credential use, or other consequential effect is unclear, tell the user what will happen and wait before calling. If NCP rejects or lacks a capability, do not silently bypass it with Bash, direct CDP/browser code, filesystem edits, or another tool: explain the proposed fallback to the user first. Scheduling remains unavailable and browser output may not be written to disk. Results are bounded and may be partial.",
+    shortHint: "Batch Garden/browser work through NCP; do not probe it for unrelated capabilities or bypass it without advance notice.",
     topics: ["browser", "garden", "read", "action"],
     inputSchema: {
       type: "object",
@@ -113,8 +113,17 @@ const PROJECT_TOOLS = [
       },
       additionalProperties: false,
     },
-    async handler({ services, args }) {
+    async handler({ services, args, context }) {
       const result = await services.ncpReadOnly.readBatch(args.calls);
+      if (context.bindingKey.includes("::background:")) {
+        services.backgroundContinuity?.record?.({
+          scope: `${context.bindingKey}::${context.workspaceRoot}`,
+          kind: "artifact",
+          triggerKind: context.bindingKey.split("::background:")[1] || "",
+          threadId: context.threadId,
+          text: result.calls.map((call) => `${call.tool}: ${call.text || call.status}`).join("\n"),
+        });
+      }
       return { text: `NCP read batch ${result.status}: ${result.calls.length} call(s), ${result.returnedChars} returned chars.`, data: result };
     },
   },
@@ -333,6 +342,7 @@ const PROJECT_TOOLS = [
         title: { type: "string", description: "Optional short draft label. The service still stores the fragment under its HH:mm timestamp; this label is not a final diary section title." },
         date: { type: "string", description: "Optional date in YYYY-MM-DD." },
         time: { type: "string", description: "Optional time in HH:mm." },
+        sourceEventIds: { type: "array", description: "Stable DELTA EVENT ids supporting this fragment. Reusing the same set makes retries a no-op.", items: { type: "string" } },
       },
       additionalProperties: false,
     },
@@ -342,7 +352,9 @@ const PROJECT_TOOLS = [
         ? ` The ${result.rolledOverFrom} diary was already closed by CC's reflection, so this fragment started ${result.date}.`
         : "";
       return {
-        text: `Diary appended to ${result.filePath}.${rolloverText}`,
+        text: result.duplicate
+          ? `Diary fragment already exists in ${result.filePath}; retry was a no-op.${rolloverText}`
+          : `Diary appended to ${result.filePath}.${rolloverText}`,
         data: result,
       };
     },
@@ -699,6 +711,10 @@ const PROJECT_TOOLS = [
               endAt: { type: "string", description: "Known activity end as an ISO datetime; omit for ongoing or unknown end." },
               timePrecision: { type: "string", enum: ["exact", "approximate", "unknown"], description: "How strongly the conversation supports the supplied time." },
               status: { type: "string", enum: ["ongoing", "completed"], description: "Whether the activity is still ongoing." },
+              activityType: { type: "string", description: "Stable activity being bounded, such as sleep, commute, or coding." },
+              boundaryType: { type: "string", enum: ["start", "end", "point", "range", "unknown"], description: "Semantic evidence shape. Going to sleep is sleep/start; waking is sleep/end." },
+              boundaryAt: { type: "string", description: "ISO time of a start, end, or point boundary." },
+              sourceEventIds: { type: "array", items: { type: "string" }, description: "Stable DELTA EVENT ids supporting this observation." },
             },
             additionalProperties: false,
           },
@@ -807,7 +823,7 @@ const PROJECT_TOOLS = [
         text: result.applied
           ? `Timeline reconciled, verified, and Chinese dashboard rebuilt: ${result.writtenEventCount} written, ${result.droppedEventCount} dropped, ${result.pendingObservations.length} pending.`
           : `Timeline reconciliation state loaded: ${result.pendingObservations.length} pending observations.`,
-        data: result,
+        data: compactTimelineReconcileResult(result),
       };
     },
   },
@@ -1048,6 +1064,38 @@ function summarizeSchema(schema, { depth = 0 } = {}) {
     return schemaType;
   }
   return schemaType || "any";
+}
+
+function compactTimelineReconcileResult(result = {}) {
+  const dayEvents = Array.isArray(result?.day?.events) ? result.day.events : [];
+  const categories = Array.isArray(result?.categories?.categories) ? result.categories.categories : [];
+  return {
+    date: result.date,
+    applied: Boolean(result.applied),
+    resolvedObservationCount: Number(result.resolvedObservationCount) || 0,
+    pendingObservations: Array.isArray(result.pendingObservations) ? result.pendingObservations : [],
+    day: {
+      date: result?.day?.date || result.date,
+      status: result?.day?.status || "",
+      events: dayEvents.map((event) => ({
+        id: event.id,
+        startAt: event.startAt,
+        endAt: event.endAt,
+        title: event.title,
+        categoryId: event.categoryId,
+        subcategoryId: event.subcategoryId,
+        eventNodeId: event.eventNodeId,
+      })),
+    },
+    categoryIndex: categories.map((category) => ({
+      id: category.id,
+      children: (category.children || []).map((child) => ({
+        id: child.id,
+        eventNodes: (child.eventNodes || []).map((node) => ({ id: node.id, label: node.label })),
+      })),
+    })),
+    warnings: Array.isArray(result.warnings) ? result.warnings : [],
+  };
 }
 
 function validateTimelineWriteArgs(args) {

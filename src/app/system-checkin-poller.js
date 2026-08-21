@@ -12,7 +12,7 @@ const { SystemMessageQueueStore } = require("../core/system-message-queue-store"
 const { AdaptiveThrottleStore, buildThrottleKey } = require("../runtime/optimization/adaptive-throttle-store");
 
 const INTERNAL_CHECKIN_TRIGGER_TEMPLATE = "%USER% comes to mind again.";
-const DIARY_TIMELINE_TRIGGER = "DIARY_TIMELINE_INCREMENTAL";
+const DIARY_INCREMENTAL_TRIGGER = "DIARY_INCREMENTAL";
 
 async function runCheckinPoller(config) {
   return runPollerLoop({
@@ -24,13 +24,23 @@ async function runCheckinPoller(config) {
   });
 }
 
-async function runDiaryTimelinePoller(config) {
+async function runDiaryPoller(config) {
   return runPollerLoop({
     config,
     name: "diary",
     defaultRange: resolveDefaultDiaryRange(),
     getRange: (store, fallback) => store.getDiaryRange(fallback),
-    buildTrigger: () => DIARY_TIMELINE_TRIGGER,
+    buildTrigger: () => DIARY_INCREMENTAL_TRIGGER,
+  });
+}
+
+async function runTimelinePoller(config) {
+  return runPollerLoop({
+    config,
+    name: "timeline",
+    defaultRange: resolveDefaultDiaryRange(),
+    getRange: (store, fallback) => store.getDiaryRange(fallback),
+    buildTrigger: () => "TIMELINE_INCREMENTAL",
   });
 }
 
@@ -41,7 +51,8 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
   const sessionStore = new SessionStore({ filePath: config.sessionsFile });
   const target = resolvePollerTarget({ config, account, sessionStore });
   const throttleStore = new AdaptiveThrottleStore({ filePath: config.optimizationThrottleFile || require("path").join(config.stateDir, "optimization-throttle.json") });
-  const throttleKey = buildThrottleKey({ kind: name === "diary" ? "diary_incremental" : "checkin", accountId: account.accountId, senderId: target.senderId, workspaceRoot: target.workspaceRoot });
+  const triggerKind = name === "diary" ? "diary_incremental" : name === "timeline" ? "timeline_incremental" : "checkin";
+  const throttleKey = buildThrottleKey({ kind: triggerKind, accountId: account.accountId, senderId: target.senderId, workspaceRoot: target.workspaceRoot });
   let currentRange = getRange(checkinConfigStore, defaultRange);
 
   console.log(`[cyberboss] ${name} poller ready user=${target.senderId} workspace=${target.workspaceRoot}`);
@@ -55,8 +66,8 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
     console.log(`[cyberboss] ${name} next in ${Math.round(delayMs / 60000)}m at ${wakeAt}`);
     await sleep(delayMs);
 
-    if (queue.hasPendingForAccount(account.accountId)) {
-      console.log(`[cyberboss] ${name} skipped: pending system message still in queue`);
+    if (queue.hasPendingForPipeline(account.accountId, triggerKind)) {
+      console.log(`[cyberboss] ${name} skipped: same pipeline still pending`);
       continue;
     }
 
@@ -66,7 +77,7 @@ async function runPollerLoop({ config, name, defaultRange, getRange, buildTrigge
       senderId: target.senderId,
       workspaceRoot: target.workspaceRoot,
       text: buildTrigger(config),
-      triggerKind: name === "diary" ? "diary_incremental" : "checkin",
+      triggerKind,
       metadata: { runtime: { throttleKey } },
       createdAt: new Date().toISOString(),
     });
@@ -140,4 +151,4 @@ function buildCheckinTrigger(config) {
   return INTERNAL_CHECKIN_TRIGGER_TEMPLATE.replace("%USER%", userName);
 }
 
-module.exports = { runSystemCheckinPoller: runCheckinPoller, runCheckinPoller, runDiaryTimelinePoller };
+module.exports = { runSystemCheckinPoller: runCheckinPoller, runCheckinPoller, runDiaryPoller, runTimelinePoller };

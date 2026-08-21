@@ -77,6 +77,19 @@ test("NCP observations and navigation stay low-friction without authorization me
   assert.equal(calls[0].authorization, undefined);
 });
 
+test("NCP starts the personal browser once before a Playwright batch", async () => {
+  let lifecycleCalls = 0;
+  const adapter = new NcpReadOnlyAdapter({
+    browserLifecycle: async () => { lifecycleCalls += 1; },
+    executor: async () => ({ text: "observed" }),
+  });
+  await adapter.readBatch([
+    { server: "playwright", tool: "browser_snapshot", params: {} },
+    { server: "playwright", tool: "browser_tabs", params: {} },
+  ]);
+  assert.equal(lifecycleCalls, 1);
+});
+
 test("NCP executor treats a completed tool result as final even when NCP cleanup lingers", async () => {
   const { executeNcp } = require("../src/integrations/ncp-readonly");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncp-lingering-"));

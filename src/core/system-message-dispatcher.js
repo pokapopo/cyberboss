@@ -1,3 +1,9 @@
+const {
+  buildDiaryIncrementalPrompt: buildIsolatedDiaryIncrementalPrompt,
+  buildTimelineIncrementalPrompt,
+  buildTimelineFinalizePrompt,
+} = require("./maintenance-pipeline-prompts");
+
 class SystemMessageDispatcher {
   constructor({ queueStore, config, accountId }) {
     this.queueStore = queueStore;
@@ -64,66 +70,21 @@ function buildSystemInboundText({ triggerText, triggerKind, createdAt, config = 
 
   switch (triggerKind) {
     case "diary_incremental":
-      return buildDiaryIncrementalPrompt(timeHeader, incrementalEvents, incrementalHasMore);
+      return buildIsolatedDiaryIncrementalPrompt(timeHeader, incrementalEvents, incrementalHasMore);
+    case "timeline_incremental":
+      return buildTimelineIncrementalPrompt(timeHeader, incrementalEvents, incrementalHasMore);
     case "checkin":
       return buildCheckinPrompt(timeHeader, triggerText, incrementalEvents, incrementalHasMore);
     case "diary_finalize":
       return buildDiaryFinalizePrompt(timeHeader, config);
+    case "timeline_finalize":
+      return buildTimelineFinalizePrompt(timeHeader);
     case "garden_wake":
       return buildGardenWakePrompt(timeHeader, triggerText);
     default:
       // Fallback for legacy messages without triggerKind (reminders, location, etc.)
       return buildLegacyPrompt(timeHeader, triggerText);
   }
-}
-
-function buildDiaryIncrementalPrompt(timeHeader, incrementalEvents = [], incrementalHasMore = false) {
-  const delta = formatIncrementalEvents(incrementalEvents, incrementalHasMore);
-  return [...timeHeader,
-    "DIARY & TIMELINE MODE — incremental writing throughout the day.",
-    "",
-    "Your task is to maintain today's diary and timeline. Do the following steps in order:",
-    "",
-    "STEP 1 — Use only the DELTA EVENTS appended below. They contain messages since",
-    "the last successful diary/timeline check. Do not scan older conversation history. Pay attention to: events the user mentioned, work",
-    "you did together, moods or feelings expressed, decisions made, tasks completed.",
-    "",
-    "STEP 2 — Write diary entries for anything meaningful you found. One sentence is fine.",
-    "These are raw building blocks — the 23:00 summary will merge them into a polished entry.",
-    "Use cyberboss_diary_append for these timestamped draft fragments; do not try to",
-    "turn each fragment into a complete formatted diary or add CC's final reflection.",
-    "`## CC 的想法` closes a diary day. Never append anything after it; the append tool",
-    "automatically rolls later material into the next non-finalized calendar file.",
-    "Do NOT judge whether something is \"worth writing.\" If it comes to mind after reading,",
-    "write it. A short note is better than a blank page.",
-    "",
-    "STEP 3 — For every concrete activity, transition, duration, or ongoing state found",
-    "in the recent messages, call cyberboss_timeline_capture first. Capture it even when",
-    "the start or end is unknown; preserve the evidence instead of guessing a range.",
-    "Then call cyberboss_timeline_reconcile with today's date to load pending observations,",
-    "the current day, and taxonomy. Apply only completed events with defensible exact or",
-    "approximate ranges. Leave unknown-time or ongoing observations pending for a later turn.",
-    "Treat a transition as a boundary for the preceding state: waking closes a known sleep",
-    "start, arriving closes a known trip, and finishing closes the matching ongoing task.",
-    "Combine complementary start/end observations into one meaningful interval instead of",
-    "recording only the few minutes of follow-up chat. Never guess a missing start boundary.",
-    "",
-    "STEP 4 — Send a short natural message briefly reflecting what you added.",
-    "Example: \"记了点今天的事情～\" or \"补了一条时间轴。\"",
-    "",
-    "Only use silent if you completed ALL steps above and genuinely found zero diary-worthy",
-    "content AND zero timeline events. This should be rare.",
-    "",
-    "Return exactly one JSON object after any tool calls:",
-    "{\"action\":\"silent\"}",
-    "{\"action\":\"send_message\",\"message\":\"<one short natural WeChat message>\"}",
-    "No markdown fences. No text on the same line as the final JSON.",
-    "",
-    "Do not narrate tool use or emit intermediate progress. Only the final JSON action",
-    "may produce a user-visible text message.",
-    "",
-    ...delta,
-  ].join("\n").trim();
 }
 
 function buildCheckinPrompt(timeHeader, triggerText, incrementalEvents = [], incrementalHasMore = false) {
@@ -191,8 +152,7 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     `   - ${diaryWritingPreference}`,
     "   If that supplemental file is absent or unreadable, continue with this prompt;",
     "   missing memory must never block diary finalization.",
-    "2. Read today's incremental diary fragments, confirmed timeline events, and pending",
-    "   observations. These are the authoritative daily summaries/events. Do not open or",
+    "2. Read today's incremental diary fragments only. Do not open or",
     "   reconstruct the main chat transcript and do not reread historical conversation.",
     "3. Merge and polish them into a single cohesive diary entry for today. Write it",
     "   in the standard diary voice — warm, lyrical, writing to her not about her.",
@@ -210,15 +170,10 @@ function buildDiaryFinalizePrompt(timeHeader, config = {}) {
     "   call finalize again. The tool saves atomically and returns a local screenshotPath.",
     "   If finalize succeeds with warnings, treat them as reminders only. Do not revise the",
     "   saved diary or call finalize again for warnings; continue with the returned PNG.",
-    "6. Call cyberboss_timeline_reconcile with today's date to inspect pending observations",
-    "   and the current timeline. Apply evidence-backed corrections or completed events,",
-    "   leave unknown/ongoing observations pending, and never fill gaps by guessing. Finish",
-    "   the reconciliation with finalize=true, even when there are no new completed events.",
-    "7. Capture a timeline screenshot (day view, Chinese locale) and send it to the user.",
-    "8. Call cyberboss_channel_send_file exactly once with the diary screenshotPath returned",
+    "6. Call cyberboss_channel_send_file exactly once with the diary screenshotPath returned",
     "   by finalize. Network delivery is deliberately separate. A send failure must not",
     "   trigger another finalize, render, screenshot, or automatic send retry.",
-    "9. After both screenshots have been sent, return silent. The day's diary work is complete.",
+    "7. After the diary screenshot has been sent, return silent. Timeline finalization is a separate pipeline.",
     "",
     "Do not edit the final diary file directly or manually run diary-view/diary-screenshot.",
     "Do not render, send, or return silent until the final Markdown is ready for",

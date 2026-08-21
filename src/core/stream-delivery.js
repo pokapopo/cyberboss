@@ -26,6 +26,7 @@ class StreamDelivery {
     onDeferredSystemReply,
     onTaskDelivery,
     onTaskProgressSuppressed,
+    onSystemReplyDelivered,
     progressMinIntervalMs = TASK_PROGRESS_MIN_INTERVAL_MS,
     now = () => Date.now(),
     setTimeoutFn = setTimeout,
@@ -42,6 +43,7 @@ class StreamDelivery {
     this.onTaskProgressSuppressed = typeof onTaskProgressSuppressed === "function"
       ? onTaskProgressSuppressed
       : null;
+    this.onSystemReplyDelivered = typeof onSystemReplyDelivered === "function" ? onSystemReplyDelivered : null;
     this.progressMinIntervalMs = positiveDelay(progressMinIntervalMs, TASK_PROGRESS_MIN_INTERVAL_MS);
     this.now = now;
     this.setTimeoutFn = setTimeoutFn;
@@ -543,6 +545,7 @@ class StreamDelivery {
       runKey: state.runKey,
       threadId: state.threadId,
       turnId: state.turnId,
+      bindingKey: state.bindingKey,
       target: normalizeReplyTarget(state.replyTarget),
       kind,
       text,
@@ -696,6 +699,11 @@ class StreamDelivery {
     const delivered = await this.sendTextWithRetry(state, payload, { kind: "system_reply" });
     if (delivered) {
       state.sentSystemReplyTexts.add(deliveryKey);
+      try {
+        await this.onSystemReplyDelivered?.({ bindingKey: state.bindingKey, threadId: state.threadId, turnId: state.turnId, text: deliveryKey });
+      } catch (error) {
+        console.error(`[cyberboss] background continuity record failed thread=${state.threadId}: ${error.message}`);
+      }
     }
   }
 

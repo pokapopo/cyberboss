@@ -376,6 +376,13 @@ function prepareReconciledEvent(event, pendingById) {
   if (missingId) {
     throw new Error(`Unknown or already resolved timeline observation: ${missingId}`);
   }
+  const activityTypes = uniqueStrings(observations.map((item) => normalizeText(item.activityType).toLowerCase()));
+  if (activityTypes.length > 1) {
+    const error = new Error(`Timeline activity mismatch: observations describe different activities (${activityTypes.join(", ")}).`);
+    error.code = "TIMELINE_ACTIVITY_MISMATCH";
+    error.details = { observationIds, activityTypes };
+    throw error;
+  }
   const hasCompletedTimedEvidence = observations.some((item) => (
     item.status === "completed"
       && item.timePrecision !== "unknown"
@@ -388,14 +395,33 @@ function prepareReconciledEvent(event, pendingById) {
     throw new Error("Reconciled timeline events require a valid startAt/endAt range.");
   }
   const hasCollectiveBoundaryEvidence = observations.some((item) => (
-    item.timePrecision !== "unknown" && normalizeIso(item.startAt) === startAt
+    item.timePrecision !== "unknown" && (
+      normalizeIso(item.startAt) === startAt
+      || (item.boundaryType === "start" && normalizeIso(item.boundaryAt) === startAt)
+    )
   )) && observations.some((item) => (
     item.status === "completed"
       && item.timePrecision !== "unknown"
-      && [normalizeIso(item.endAt), normalizeIso(item.observedAt)].includes(endAt)
+      && [
+        normalizeIso(item.endAt),
+        item.boundaryType === "end" ? normalizeIso(item.boundaryAt) : "",
+        normalizeIso(item.observedAt),
+      ].includes(endAt)
   ));
   if (!hasCompletedTimedEvidence && !hasCollectiveBoundaryEvidence) {
-    throw new Error("Unknown-time or ongoing observations must remain pending until completed evidence supplies a defensible range or complementary transition boundaries.");
+    const availableStarts = uniqueStrings(observations.flatMap((item) => [
+      normalizeIso(item.startAt),
+      item.boundaryType === "start" ? normalizeIso(item.boundaryAt) : "",
+    ]));
+    const availableEnds = uniqueStrings(observations.flatMap((item) => [
+      normalizeIso(item.endAt),
+      item.boundaryType === "end" ? normalizeIso(item.boundaryAt) : "",
+      normalizeIso(item.observedAt),
+    ]));
+    const error = new Error(`Timeline boundary mismatch: requested ${startAt}..${endAt}; available starts=${availableStarts.join(",") || "none"}; available ends=${availableEnds.join(",") || "none"}. Incomplete evidence must remain pending.`);
+    error.code = "TIMELINE_BOUNDARY_MISMATCH";
+    error.details = { requestedStartAt: startAt, requestedEndAt: endAt, availableStarts, availableEnds };
+    throw error;
   }
   const timePrecision = normalizeText(event?.timePrecision).toLowerCase();
   if (!["exact", "approximate"].includes(timePrecision)) {

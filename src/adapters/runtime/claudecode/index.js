@@ -391,6 +391,17 @@ function createClaudeCodeRuntimeAdapter(config) {
     async hibernateIdleClients(options = {}) {
       return hibernateIdleClients(options);
     },
+    async cancelBackgroundTurnsForWorkspace({ workspaceRoot } = {}) {
+      const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+      let cancelled = 0;
+      for (const scopeKey of [...backgroundClientsByScope.keys()]) {
+        if (!normalizedWorkspaceRoot || scopeKey.endsWith(`::${normalizedWorkspaceRoot}`)) {
+          await closeBackgroundClient(scopeKey);
+          cancelled += 1;
+        }
+      }
+      return { cancelled, workspaceRoot: normalizedWorkspaceRoot };
+    },
     async respondApproval({ requestId, decision, result = null }) {
       const pending = pendingApprovals.get(requestId);
       const candidates = pending?.client

@@ -34,6 +34,7 @@ function readConfig() {
     weixinDeliveryOutboxFile: path.join(stateDir, "weixin-delivery-outbox.json"),
     workLogFile: path.join(stateDir, "work-log.json"),
     incrementalEventFile: path.join(stateDir, "incremental-events.json"),
+    backgroundContinuityFile: path.join(stateDir, "background-continuity.json"),
     modelGatewayUsageFile: path.join(stateDir, "model-gateway-usage.json"),
     optimizationThrottleFile: path.join(stateDir, "optimization-throttle.json"),
     modelGatewayBudgets: {
@@ -47,7 +48,12 @@ function readConfig() {
         daySoftTokens: readIntEnv("CYBERBOSS_BACKGROUND_DAY_SOFT_TOKENS") ?? 5_000_000,
         dayHardTokens: readIntEnv("CYBERBOSS_BACKGROUND_DAY_HARD_TOKENS") ?? 10_000_000,
       },
-      sources: readJsonEnv("CYBERBOSS_BACKGROUND_SOURCE_BUDGETS_JSON", {}),
+      sources: {
+        timeline_incremental: {
+          perTaskHardTokens: readIntEnv("CYBERBOSS_TIMELINE_INCREMENTAL_HARD_TOKENS") ?? 60_000,
+        },
+        ...readJsonEnv("CYBERBOSS_BACKGROUND_SOURCE_BUDGETS_JSON", {}),
+      },
     },
     modelGatewayRoutes: readJsonEnv("CYBERBOSS_MODEL_GATEWAY_ROUTES_JSON", {}),
     modelGatewayPrices: readJsonEnv("CYBERBOSS_MODEL_PRICES_JSON", {}),

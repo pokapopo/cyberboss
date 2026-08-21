@@ -769,7 +769,7 @@ test("durable Weixin tool phases stay silent while final delivery remains immedi
   const deliveries = [];
   const clock = createProgressClock();
   let cleared = false;
-  const { streamDelivery } = createHarness({
+  const { streamDelivery, bindingByThreadId } = createHarness({
     runtimeId: "claudecode",
     async onTaskDelivery(payload) {
       deliveries.push(payload);
@@ -783,6 +783,10 @@ test("durable Weixin tool phases stay silent while final delivery remains immedi
         clock.clearTimeoutFn(timer);
       },
     },
+  });
+  bindingByThreadId.set("thread-progress", {
+    bindingKey: "binding::background:diary_incremental",
+    workspaceRoot: "/workspace",
   });
   streamDelivery.queueReplyTargetForThread("thread-progress", {
     userId: "user-progress",
@@ -832,6 +836,7 @@ test("durable Weixin tool phases stay silent while final delivery remains immedi
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0].kind, "final");
   assert.equal(deliveries[0].text, "已经修复消息投递。");
+  assert.equal(deliveries[0].bindingKey, "binding::background:diary_incremental");
   assert.equal(streamDelivery.stateByRunKey.has("thread-progress:turn-progress"), false);
   assert.equal(clock.activeTimers().length, 0);
 });

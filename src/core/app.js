@@ -28,6 +28,7 @@ const {
 const { CheckinConfigStore, parseCheckinRangeMinutes, resolveDefaultCheckinRange } = require("./checkin-config-store");
 const { resolvePreferredSenderId, resolvePreferredWorkspaceRoot } = require("./default-targets");
 const { StreamDelivery } = require("./stream-delivery");
+const { BackgroundContinuityBridge } = require("./background-continuity-bridge");
 const { ThreadStateStore } = require("./thread-state-store");
 const { DeferredSystemReplyStore } = require("./deferred-system-reply-store");
 const { SystemMessageQueueStore } = require("./system-message-queue-store");
@@ -54,7 +55,7 @@ const {
   normalizeCommandTokens,
   splitCommandLine,
 } = require("../adapters/runtime/shared/approval-command");
-const { runCheckinPoller, runDiaryTimelinePoller } = require("../app/system-checkin-poller");
+const { runCheckinPoller, runDiaryPoller, runTimelinePoller } = require("../app/system-checkin-poller");
 const { createProjectTooling } = require("../tools/create-project-tooling");
 const { loadWechatInstructions } = require("../adapters/runtime/shared-instructions");
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -68,9 +69,12 @@ const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
 const MAX_RETRY_COUNT = 3;
 const SHANGHAI_UTC_OFFSET_MS = 8 * 60 * 60_000;
 const SHANGHAI_DIARY_FINALIZE_UTC_HOUR = 15;
-// Safety net: if a turn gate has been locked for >5 min, force-release it.
-// Normal turn timeout is 120s; 5 min gives ample margin for close() retries.
-const STUCK_GATE_MAX_AGE_MS = 300_000;
+const BACKGROUND_RETRY_BASE_MS = 30_000;
+const BACKGROUND_RETRY_MAX_MS = 30 * 60_000;
+const BACKGROUND_PRESSURE_RETRY_MS = 2 * 60_000;
+const BACKGROUND_MIN_AVAILABLE_BYTES = 384 * 1024 * 1024;
+const BACKGROUND_MAX_PSI_SOME_AVG10 = 20;
+const BACKGROUND_MAX_PSI_FULL_AVG10 = 10;
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -118,7 +122,11 @@ class CyberbossApp {
       filePath: config.incrementalEventFile || path.join(config.stateDir, "incremental-events.json"),
     });
     this.pendingBackgroundDeltaByRunKey = new Map();
+    this.backgroundContinuityBridge = new BackgroundContinuityBridge({ store: this.projectServices.backgroundContinuity });
+    this.activeBackgroundWorkspaces = new Set();
+    this.activeBackgroundBindingsByWorkspace = new Map();
     this.pendingModelRequestByRunKey = new Map();
+    this.tokenLimitedRunKeys = new Set();
     this.modelUsageLedger = new UsageLedger({
       filePath: config.modelGatewayUsageFile || path.join(config.stateDir, "model-gateway-usage.json"),
       budgets: config.modelGatewayBudgets,
@@ -145,6 +153,7 @@ class CyberbossApp {
       filePath: config.weixinDeliveryOutboxFile || path.join(config.stateDir, "weixin-delivery-outbox.json"),
       channelAdapter: this.channelAdapter,
       onDeliveryEvent: (event) => safeWorkLogCall(this, "recordDeliveryEvent", event),
+      onDeliveryConfirmed: (delivery) => this.recordDeliveredBackgroundReply(delivery),
     });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
@@ -153,6 +162,7 @@ class CyberbossApp {
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
       onTaskDelivery: (payload) => this.weixinDeliveryService.enqueueTaskDelivery(payload),
       onTaskProgressSuppressed: (payload) => this.weixinDeliveryService.suppressRunProgress(payload.runKey),
+      onSystemReplyDelivered: (payload) => this.recordDeliveredBackgroundReply(payload),
     });
     this.pendingOperationByRunKey = new Map();
     this.runtimeEventChain = Promise.resolve();
@@ -237,7 +247,7 @@ class CyberbossApp {
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
     if (this.config.startWithCheckin) {
       console.log("[cyberboss] checkin: enabled");
-      this._startCheckinPoller();
+      this._startBackgroundPollers();
     }
 
     const crashLogPath = path.join(os.homedir(), ".cyberboss", "crash.log");
@@ -282,17 +292,9 @@ class CyberbossApp {
             this.flushPendingSystemMessages(),
             this.flushPendingTimelineScreenshots(account),
           ]);
-          // Safety net: force-release any turn gate that has been stuck
-          // beyond STUCK_GATE_MAX_AGE_MS.  Under normal operation the
-          // 120 s turn timeout handles this, but if the child process
-          // survives SIGKILL or another bug prevents normal release,
-          // this prevents permanent deadlock of ALL message processing.
-          const stuckReleased = this.turnGateStore.releaseStuckScopes(STUCK_GATE_MAX_AGE_MS);
-          if (stuckReleased > 0) {
-            console.error(
-              `[cyberboss] stuck-gate watchdog: force-released ${stuckReleased} scope(s) stuck >${STUCK_GATE_MAX_AGE_MS / 1000}s`
-            );
-          }
+          // Turn timeouts own cancellation and gate release. Never release a
+          // live gate based on age alone: doing so can overlap the still-live
+          // process with a new background Claude client.
           const response = await this.channelAdapter.getUpdates({
             syncBuffer: this.channelAdapter.loadSyncBuffer(),
             timeoutMs: this.resolveLongPollTimeoutMs(),
@@ -587,8 +589,11 @@ class CyberbossApp {
   scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId, turnId }) {
     this.clearTurnTimeout(threadId);
     const turnTimeoutMs = (() => {
-      const raw = Number(process.env.CYBERBOSS_TURN_TIMEOUT_MS);
-      return Number.isFinite(raw) && raw >= 0 ? raw : 600_000;
+      const background = normalizeText(bindingKey).includes("::background:");
+      const raw = Number(process.env[
+        background ? "CYBERBOSS_BACKGROUND_TURN_TIMEOUT_MS" : "CYBERBOSS_TURN_TIMEOUT_MS"
+      ]);
+      return Number.isFinite(raw) && raw >= 0 ? raw : (background ? 180_000 : 600_000);
     })();
     if (turnTimeoutMs <= 0) {
       // Disabled via CYBERBOSS_TURN_TIMEOUT_MS=0 — no turn watchdog.
@@ -602,6 +607,10 @@ class CyberbossApp {
         console.error(`[cyberboss] turn timeout cancel failed: ${err.message}`);
       }
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
+      if (normalizeText(bindingKey).includes("::background:")) {
+        this.activeBackgroundWorkspaces?.delete(workspaceRoot);
+        this.activeBackgroundBindingsByWorkspace?.delete(workspaceRoot);
+      }
       const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
       if (scopeKey) {
         this.turnBoundaryScopeKeys.delete(scopeKey);
@@ -615,14 +624,18 @@ class CyberbossApp {
         type: "runtime.turn.failed",
         payload: { threadId, turnId, text: `Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
       });
-      await this.sendFailureToThread(
-        threadId,
-        `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)`,
-        null,
-        turnId,
-      ).catch((error) => {
-        console.error(`[cyberboss] failed to persist turn timeout reply: ${error.message}`);
-      });
+      if (!normalizeText(bindingKey).includes("::background:")) {
+        await this.sendFailureToThread(
+          threadId,
+          `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)`,
+          null,
+          turnId,
+        ).catch((error) => {
+          console.error(`[cyberboss] failed to persist turn timeout reply: ${error.message}`);
+        });
+      } else {
+        console.error(`[cyberboss] background turn timeout suppressed thread=${threadId} turn=${turnId}`);
+      }
       await this.flushPendingInboundMessages({ bindingKey, workspaceRoot, ignoreBoundary: true }).catch(() => {});
     }, turnTimeoutMs);
     this.turnTimeouts.set(threadId, timeout);
@@ -707,6 +720,10 @@ class CyberbossApp {
           })
         : null;
       const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext });
+      const backgroundContinuity = prepared.provider === "weixin"
+        ? this.backgroundContinuityBridge?.prepare?.(pendingScopeKey, runtimeTurn.text) || { text: runtimeTurn.text, ids: [] }
+        : { text: runtimeTurn.text, ids: [] };
+      runtimeTurn.text = backgroundContinuity.text;
       const sendTurn = typeof this.runtimeAdapter.sendTurn === "function"
         ? this.runtimeAdapter.sendTurn.bind(this.runtimeAdapter)
         : this.runtimeAdapter.sendTextTurn.bind(this.runtimeAdapter);
@@ -764,6 +781,7 @@ class CyberbossApp {
           scopeKey: pendingScopeKey,
           userText: prepared.originalText || prepared.text,
         });
+        this.backgroundContinuityBridge?.bindThread?.(turn.threadId, backgroundContinuity.ids);
       }
       if (prepared.incrementalCursor && prepared.incrementalScope) {
         this.pendingBackgroundDeltaByRunKey?.set?.(runKey, {
@@ -807,11 +825,16 @@ class CyberbossApp {
           error: messageText,
         });
       }
+      const isBackgroundTurn = prepared.provider === "system";
       const failurePayload = {
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
         contextToken: prepared.contextToken,
       };
+      if (isBackgroundTurn) {
+        console.error(`[cyberboss] background dispatch failed kind=${prepared.triggerKind || "system"} id=${prepared.messageId || "unknown"} error=${messageText}`);
+        throw error;
+      }
       if (this.weixinDeliveryService?.enqueue) {
         await this.weixinDeliveryService.enqueue({
           runKey: dispatchRunKey,
@@ -868,7 +891,26 @@ class CyberbossApp {
     };
   }
 
+  recordDeliveredBackgroundReply({ bindingKey = "", threadId = "", text = "", kind = "final" } = {}) {
+    if (kind !== "final" || !bindingKey.includes("::background:") || !text) return null;
+    const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
+    const workspaceRoot = linked?.workspaceRoot || this.config.workspaceRoot;
+    return this.backgroundContinuityBridge.recordDelivered({ bindingKey, workspaceRoot, threadId, text });
+  }
+
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
+    if (prepared?.provider === "weixin" && this.activeBackgroundWorkspaces?.has(workspaceRoot)) {
+      const backgroundBinding = this.activeBackgroundBindingsByWorkspace?.get(workspaceRoot) || "";
+      await this.runtimeAdapter.cancelBackgroundTurnsForWorkspace?.({ workspaceRoot }).catch((error) => {
+        console.error(`[cyberboss] background preemption failed workspace=${workspaceRoot} error=${error.message}`);
+      });
+      if (backgroundBinding) {
+        this.turnGateStore.releaseScope(backgroundBinding, workspaceRoot);
+      }
+      this.activeBackgroundBindingsByWorkspace?.delete(workspaceRoot);
+      this.activeBackgroundWorkspaces.delete(workspaceRoot);
+      console.log(`[cyberboss] background preempted for user chat workspace=${workspaceRoot}`);
+    }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       const steered = typeof this.trySteerPreparedTurn === "function"
         ? await this.trySteerPreparedTurn({ bindingKey, workspaceRoot, prepared })
@@ -1337,8 +1379,15 @@ class CyberbossApp {
         if (!dispatched) {
           this.systemMessageDispatcher.requeue(preparedMessage);
         }
-      } catch {
-        this.systemMessageDispatcher?.requeue(message);
+      } catch (error) {
+        const retry = buildBackgroundRetryMessage(message, {
+          error,
+          nowMs: Date.now(),
+        });
+        console.error(
+          `[cyberboss] background retry scheduled kind=${message.triggerKind || "system"} id=${message.id} attempt=${retry.metadata.backgroundRetry.attempt} notBefore=${retry.notBefore} error=${retry.metadata.backgroundRetry.lastError}`
+        );
+        this.systemMessageDispatcher?.requeue(retry);
       }
     }
   }
@@ -1359,7 +1408,7 @@ class CyberbossApp {
       text,
       at: normalized.receivedAt,
     });
-    for (const kind of ["checkin", "diary_incremental"]) {
+    for (const kind of ["checkin", "diary_incremental", "timeline_incremental"]) {
       this.optimizationThrottleStore?.recordOutcome?.(buildThrottleKey({
         kind,
         accountId: normalized.accountId,
@@ -1372,7 +1421,7 @@ class CyberbossApp {
 
   prepareIncrementalSystemMessage(message) {
     const consumer = normalizeCommandArgument(message?.triggerKind);
-    if (consumer !== "checkin" && consumer !== "diary_incremental") return null;
+    if (!["checkin", "diary_incremental", "timeline_incremental"].includes(consumer)) return null;
     const baseBindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
       workspaceId: this.config.workspaceId,
       accountId: message.accountId,
@@ -1419,7 +1468,7 @@ class CyberbossApp {
   }
 
   deferIncrementalMaintenanceUntilIdle(message) {
-    if (normalizeCommandArgument(message?.triggerKind) !== "diary_incremental") {
+    if (!["diary_incremental", "timeline_incremental"].includes(normalizeCommandArgument(message?.triggerKind))) {
       return null;
     }
     const idleMs = Math.max(0, Number(this.config.timelineIdleMs) || 0);
@@ -1529,11 +1578,12 @@ class CyberbossApp {
     return this.runtimeAdapter.getSessionStore().getActiveWorkspaceRoot(bindingKey) || this.config.workspaceRoot;
   }
 
-  _startCheckinPoller() {
-    console.log("[cyberboss] checkin: enabled (diary + checkin pollers)");
-    this._startPollerLoop(runDiaryTimelinePoller, "diary");
+  _startBackgroundPollers() {
+    console.log("[cyberboss] background pollers enabled (diary + timeline + checkin)");
+    this._startPollerLoop(runDiaryPoller, "diary");
+    this._startPollerLoop(runTimelinePoller, "timeline");
     this._startPollerLoop(runCheckinPoller, "checkin");
-    this._startDiarySummaryScheduler();
+    this._startDailyMaintenanceFinalizers();
   }
 
   _startPollerLoop(pollerFn, name) {
@@ -1553,7 +1603,7 @@ class CyberbossApp {
     });
   }
 
-  _startDiarySummaryScheduler() {
+  _startDailyMaintenanceFinalizers() {
     const schedule = () => {
       const now = new Date();
       const target = resolveNextDiaryFinalizeAt(now);
@@ -1589,6 +1639,17 @@ class CyberbossApp {
               createdAt: new Date().toISOString(),
             });
             console.log(`[cyberboss] diary summarize queued id=${queued.id}`);
+            const timelineQueued = this.systemMessageQueue.enqueue({
+              id: crypto.randomUUID(),
+              accountId: account.accountId,
+              senderId,
+              workspaceRoot,
+              text: "TIMELINE_FINALIZE",
+              triggerKind: "timeline_finalize",
+              createdAt: new Date().toISOString(),
+              notBefore: new Date(Date.now() + 1_000).toISOString(),
+            });
+            console.log(`[cyberboss] timeline finalize queued id=${timelineQueued.id}`);
           }
         } catch (error) {
           console.error(`[cyberboss] diary summarize enqueue failed: ${error.message}`);
@@ -1612,7 +1673,19 @@ class CyberbossApp {
     const workspaceRoot = prepared.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey);
     const triggerKind = normalizeCommandArgument(prepared.triggerKind) || "system";
     const bindingKey = `${baseBindingKey}::background:${triggerKind}`;
+    const pressure = this.readBackgroundMemoryPressure?.() || readBackgroundMemoryPressure();
+    if (pressure.pressured) {
+      const deferred = deferSystemMessage(message, BACKGROUND_PRESSURE_RETRY_MS);
+      console.warn(
+        `[cyberboss] background deferred for memory pressure kind=${triggerKind} available_mb=${Math.round(pressure.availableBytes / 1024 / 1024)} psi_some=${pressure.psiSomeAvg10} psi_full=${pressure.psiFullAvg10} notBefore=${deferred.notBefore}`
+      );
+      this.systemMessageDispatcher.requeue(deferred);
+      return true;
+    }
     if (this.isTurnDispatchBlocked(baseBindingKey, workspaceRoot)) {
+      return false;
+    }
+    if (this.activeBackgroundWorkspaces?.has(workspaceRoot)) {
       return false;
     }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
@@ -1622,7 +1695,15 @@ class CyberbossApp {
     // Claude adapter owns a separate physical client for it, so clearing this
     // id cannot replace or resume the live Weixin client for the workspace.
     this.runtimeAdapter.getSessionStore().clearThreadIdForWorkspace(bindingKey, workspaceRoot);
-    return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+    this.activeBackgroundWorkspaces?.add(workspaceRoot);
+    this.activeBackgroundBindingsByWorkspace?.set(workspaceRoot, bindingKey);
+    try {
+      return await this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+    } catch (error) {
+      this.activeBackgroundWorkspaces?.delete(workspaceRoot);
+      this.activeBackgroundBindingsByWorkspace?.delete(workspaceRoot);
+      throw error;
+    }
   }
 
   async dispatchChannelCommand(normalized, command) {
@@ -2228,6 +2309,7 @@ class CyberbossApp {
           usageEventId: event.payload?.usageEventId,
           providerUsage: event.payload,
         });
+        await this.enforceTimelineTokenLimit({ event, request, runKey: usageRunKey });
       }
     }
     const failureReplyTarget = event?.type === "runtime.turn.failed"
@@ -2267,6 +2349,7 @@ class CyberbossApp {
           userText: memoryTurn.userText,
           assistantText: event.payload?.text || "",
         });
+        this.backgroundContinuityBridge?.completeThread?.(event.payload.threadId);
       }
     }
     if (!event) {
@@ -2275,10 +2358,12 @@ class CyberbossApp {
     if (event.type === "runtime.turn.completed" || event.type === "runtime.turn.failed") {
       if (event.type === "runtime.turn.failed") {
         this.pendingMemoryTurns?.delete?.(event.payload.threadId);
+        this.backgroundContinuityBridge?.failThread?.(event.payload.threadId);
       }
       this.clearTurnTimeout(event.payload.threadId);
       const completedRunKey = buildRunKey(event.payload.threadId, event.payload.turnId);
       this.pendingModelRequestByRunKey?.delete?.(completedRunKey);
+      this.tokenLimitedRunKeys?.delete?.(completedRunKey);
       const pendingOperations = this.pendingOperationByRunKey;
       const pendingOperation = pendingOperations?.get?.(completedRunKey) || null;
       if (pendingOperation && pendingOperations?.delete) {
@@ -2294,6 +2379,11 @@ class CyberbossApp {
       const sessionStore = this.runtimeAdapter.getSessionStore();
       sessionStore.clearApprovalPrompt(event.payload.threadId);
       const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(event.payload.threadId);
+      const isBackgroundTurn = Boolean(linked?.bindingKey?.includes("::background:"));
+      if (isBackgroundTurn && linked?.workspaceRoot) {
+        this.activeBackgroundWorkspaces?.delete(linked.workspaceRoot);
+        this.activeBackgroundBindingsByWorkspace?.delete(linked.workspaceRoot);
+      }
       const scopeKey = linked?.bindingKey && linked?.workspaceRoot
         ? buildScopeKey(linked.bindingKey, linked.workspaceRoot)
         : "";
@@ -2302,12 +2392,16 @@ class CyberbossApp {
       }
       try {
         this.turnGateStore.releaseThread(event.payload.threadId);
-        if (event.type === "runtime.turn.failed") {
+        if (event.type === "runtime.turn.failed" && !isBackgroundTurn) {
           await this.sendFailureToThread(
             event.payload.threadId,
             event.payload.text || "❌ Execution failed",
             failureReplyTarget,
             event.payload.turnId,
+          );
+        } else if (event.type === "runtime.turn.failed") {
+          console.error(
+            `[cyberboss] background runtime failure suppressed thread=${event.payload.threadId} turn=${event.payload.turnId || "unknown"} error=${normalizeCommandArgument(event.payload.text) || "execution failed"}`
           );
         }
         if (linked?.bindingKey && linked?.workspaceRoot) {
@@ -2417,6 +2511,45 @@ class CyberbossApp {
         turnId: resolvedState.turnId,
       });
     }
+  }
+
+  async enforceTimelineTokenLimit({ event, request, runKey }) {
+    if (request?.task?.source !== "timeline_incremental" || this.tokenLimitedRunKeys?.has?.(runKey)) {
+      return false;
+    }
+    const budget = this.modelUsageLedger?.getBudgetState?.(request.task);
+    const taskWindow = budget?.windows?.task;
+    if (!taskWindow?.hardExceeded) {
+      return false;
+    }
+
+    this.tokenLimitedRunKeys ||= new Set();
+    this.tokenLimitedRunKeys.add(runKey);
+    const usedTokens = Number(taskWindow.tokens) || 0;
+    const hardTokens = Number(taskWindow.hardTokens) || 0;
+    this.modelGateway?.recordLifecycle?.({
+      request,
+      status: "cancel_requested",
+      reason: `timeline_token_limit:${usedTokens}/${hardTokens}`,
+    });
+    console.error(
+      `[cyberboss] timeline token hard limit reached thread=${event.payload?.threadId} turn=${event.payload?.turnId} tokens=${usedTokens} limit=${hardTokens} — cancelling`,
+    );
+    try {
+      await this.runtimeAdapter.cancelTurn({
+        threadId: event.payload?.threadId,
+        turnId: event.payload?.turnId,
+        workspaceRoot: request.task?.metadata?.cyberboss?.workspaceRoot || event.payload?.workspaceRoot,
+      });
+    } catch (error) {
+      this.modelGateway?.recordLifecycle?.({
+        request,
+        status: "cancel_uncertain",
+        reason: error?.message || "timeline token-limit cancellation failed",
+      });
+      console.error(`[cyberboss] timeline token-limit cancellation failed: ${error.message}`);
+    }
+    return true;
   }
 
   async stopTypingForThread(threadId) {
@@ -2577,6 +2710,91 @@ function resolveNextDiaryFinalizeAt(now = new Date()) {
     targetMs += 24 * 60 * 60_000;
   }
   return new Date(targetMs);
+}
+
+function readBackgroundMemoryPressure({
+  meminfoPath = "/proc/meminfo",
+  pressurePath = "/proc/pressure/memory",
+} = {}) {
+  let availableBytes = os.freemem();
+  try {
+    const meminfo = fs.readFileSync(meminfoPath, "utf8");
+    const match = meminfo.match(/^MemAvailable:\s+(\d+)\s+kB$/m);
+    if (match) availableBytes = Number(match[1]) * 1024;
+  } catch {
+    // Fall back to os.freemem() on non-Linux hosts and tests.
+  }
+
+  let psiSomeAvg10 = 0;
+  let psiFullAvg10 = 0;
+  try {
+    const pressure = fs.readFileSync(pressurePath, "utf8");
+    psiSomeAvg10 = parsePsiAvg10(pressure, "some");
+    psiFullAvg10 = parsePsiAvg10(pressure, "full");
+  } catch {
+    // PSI is optional; MemAvailable remains a sufficient safety signal.
+  }
+
+  const minAvailableBytes = readPositiveNumberEnv(
+    "CYBERBOSS_BACKGROUND_MIN_AVAILABLE_MB",
+    BACKGROUND_MIN_AVAILABLE_BYTES / 1024 / 1024,
+  ) * 1024 * 1024;
+  const maxPsiSomeAvg10 = readPositiveNumberEnv(
+    "CYBERBOSS_BACKGROUND_MAX_PSI_SOME_AVG10",
+    BACKGROUND_MAX_PSI_SOME_AVG10,
+  );
+  const maxPsiFullAvg10 = readPositiveNumberEnv(
+    "CYBERBOSS_BACKGROUND_MAX_PSI_FULL_AVG10",
+    BACKGROUND_MAX_PSI_FULL_AVG10,
+  );
+  return {
+    pressured: availableBytes < minAvailableBytes
+      || psiSomeAvg10 >= maxPsiSomeAvg10
+      || psiFullAvg10 >= maxPsiFullAvg10,
+    availableBytes,
+    psiSomeAvg10,
+    psiFullAvg10,
+  };
+}
+
+function parsePsiAvg10(text, category) {
+  const line = String(text || "").split("\n").find((item) => item.startsWith(`${category} `));
+  const match = line?.match(/\bavg10=([0-9.]+)/);
+  return match ? Number(match[1]) || 0 : 0;
+}
+
+function deferSystemMessage(message, delayMs, nowMs = Date.now()) {
+  const currentNotBeforeMs = Date.parse(message?.notBefore || "") || 0;
+  return {
+    ...message,
+    notBefore: new Date(Math.max(currentNotBeforeMs, nowMs + Math.max(1, Number(delayMs) || 1))).toISOString(),
+  };
+}
+
+function buildBackgroundRetryMessage(message, { error, nowMs = Date.now() } = {}) {
+  const previous = message?.metadata?.backgroundRetry || {};
+  const attempt = Math.max(0, Number(previous.attempt) || 0) + 1;
+  const delayMs = Math.min(
+    BACKGROUND_RETRY_MAX_MS,
+    BACKGROUND_RETRY_BASE_MS * (2 ** Math.min(attempt - 1, 10)),
+  );
+  const errorText = error instanceof Error ? error.message : String(error || "unknown error");
+  return deferSystemMessage({
+    ...message,
+    metadata: {
+      ...(message?.metadata || {}),
+      backgroundRetry: {
+        attempt,
+        lastError: errorText.replace(/\s+/g, " ").slice(0, 240),
+        lastFailedAt: new Date(nowMs).toISOString(),
+      },
+    },
+  }, delayMs, nowMs);
+}
+
+function readPositiveNumberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function buildRunKey(threadId, turnId) {
@@ -2755,7 +2973,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { CyberbossApp, resolveNextDiaryFinalizeAt };
+module.exports = {
+  CyberbossApp,
+  buildBackgroundRetryMessage,
+  deferSystemMessage,
+  readBackgroundMemoryPressure,
+  resolveNextDiaryFinalizeAt,
+};
 
 function parseChannelCommand(text) {
   const normalized = typeof text === "string" ? text.trim() : "";

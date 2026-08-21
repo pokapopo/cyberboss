@@ -77,6 +77,19 @@ test("append rolls forward instead of writing after a finalized reflection", asy
   assert.match(fs.readFileSync(nextPath, "utf8"), /^## 00:20\n\n收尾后的新内容/);
 });
 
+test("append is an atomic no-op when the same source events are retried", async () => {
+  const diaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-diary-idempotent-"));
+  const service = new DiaryService({ config: { diaryDir } });
+  const args = { date: "2026-08-08", time: "18:01", text: "醒来以后精神很好。", sourceEventIds: ["event-2", "event-1"] };
+  const first = await service.append(args);
+  const second = await service.append({ ...args, sourceEventIds: ["event-1", "event-2"], text: "重试时模型换了措辞。" });
+  assert.equal(first.duplicate, false);
+  assert.equal(second.duplicate, true);
+  const body = fs.readFileSync(path.join(diaryDir, "2026-08-08.md"), "utf8");
+  assert.equal((body.match(/^## 18:01$/gm) || []).length, 1);
+  assert.doesNotMatch(body, /模型换了措辞/);
+});
+
 test("finalize rejects invalid input without changing the diary file", async () => {
   const diaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-diary-finalize-invalid-"));
   const diaryPath = path.join(diaryDir, "2026-08-05.md");

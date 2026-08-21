@@ -131,6 +131,50 @@ test("outbox resumes at the first unconfirmed chunk with the same client id", as
   await resumedService.close();
 });
 
+test("outbox reports one confirmed final delivery after every chunk succeeds", async () => {
+  const filePath = createTempFile();
+  const confirmed = [];
+  const service = new WeixinDeliveryService({
+    filePath,
+    now: () => new Date("2026-08-21T15:10:50.000Z"),
+    onDeliveryConfirmed(delivery) {
+      confirmed.push(delivery);
+    },
+    channelAdapter: {
+      prepareTextDelivery() {
+        return ["第一段", "第二段", "第三段"];
+      },
+      getKnownContextTokens() {
+        return { "user-1": "ctx-1" };
+      },
+      async sendTextChunk() {},
+    },
+  });
+  service.registerRun({
+    runKey: "thread-bg:turn-bg",
+    threadId: "thread-bg",
+    turnId: "turn-bg",
+    target: createTarget(),
+  });
+
+  await service.enqueueTaskDelivery({
+    runKey: "thread-bg:turn-bg",
+    threadId: "thread-bg",
+    turnId: "turn-bg",
+    bindingKey: "binding::background:diary_incremental",
+    target: createTarget(),
+    kind: "final",
+    text: "刚才给你发过一条后台消息。",
+  });
+  await service.drain();
+
+  assert.equal(confirmed.length, 1);
+  assert.equal(confirmed[0].kind, "final");
+  assert.equal(confirmed[0].bindingKey, "binding::background:diary_incremental");
+  assert.equal(confirmed[0].text, "刚才给你发过一条后台消息。");
+  await service.close();
+});
+
 test("context failures wait on disk until a new inbound token wakes the user", async () => {
   const filePath = createTempFile();
   let activeToken = "ctx-stale";

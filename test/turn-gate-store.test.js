@@ -18,6 +18,76 @@ test("turn gate tracks pending scopes until the turn is released", () => {
   assert.equal(gate.isPending("binding-1", "/workspace"), false);
 });
 
+test("timeline incremental turns are cancelled after crossing their per-task token hard limit", async () => {
+  const cancellations = [];
+  const lifecycle = [];
+  const request = {
+    task: {
+      source: "timeline_incremental",
+      metadata: { cyberboss: { workspaceRoot: "/workspace" } },
+    },
+  };
+  const appLike = {
+    tokenLimitedRunKeys: new Set(),
+    modelUsageLedger: {
+      getBudgetState() {
+        return { windows: { task: { tokens: 72_000, hardTokens: 60_000, hardExceeded: true } } };
+      },
+    },
+    modelGateway: {
+      recordLifecycle(entry) { lifecycle.push(entry); },
+    },
+    runtimeAdapter: {
+      async cancelTurn(entry) { cancellations.push(entry); },
+    },
+  };
+
+  const event = { payload: { threadId: "thread-timeline", turnId: "turn-timeline" } };
+  const first = await CyberbossApp.prototype.enforceTimelineTokenLimit.call(appLike, {
+    event,
+    request,
+    runKey: "thread-timeline::turn-timeline",
+  });
+  const duplicate = await CyberbossApp.prototype.enforceTimelineTokenLimit.call(appLike, {
+    event,
+    request,
+    runKey: "thread-timeline::turn-timeline",
+  });
+
+  assert.equal(first, true);
+  assert.equal(duplicate, false);
+  assert.deepEqual(cancellations, [{
+    threadId: "thread-timeline",
+    turnId: "turn-timeline",
+    workspaceRoot: "/workspace",
+  }]);
+  assert.equal(lifecycle[0].status, "cancel_requested");
+});
+
+test("timeline token enforcement does not cancel diary work", async () => {
+  let cancelled = false;
+  const appLike = {
+    tokenLimitedRunKeys: new Set(),
+    modelUsageLedger: {
+      getBudgetState() {
+        throw new Error("diary budget should not be read by timeline limiter");
+      },
+    },
+    runtimeAdapter: {
+      async cancelTurn() { cancelled = true; },
+    },
+  };
+
+  const limited = await CyberbossApp.prototype.enforceTimelineTokenLimit.call(appLike, {
+    event: { payload: { threadId: "thread-diary", turnId: "turn-diary" } },
+    request: { task: { source: "diary_incremental" } },
+    runKey: "thread-diary::turn-diary",
+  });
+
+  assert.equal(limited, false);
+  assert.equal(cancelled, false);
+});
+
 test("handlePreparedMessage queues a normal inbound message while the scope is busy", async () => {
   const queued = [];
   let dispatched = false;
@@ -130,6 +200,9 @@ test("dispatchSystemMessage yields when a local pending turn already owns the wo
       },
     },
     turnBoundaryScopeKeys: new Set(),
+    readBackgroundMemoryPressure() {
+      return { pressured: false };
+    },
     resolveWorkspaceRoot() {
       return "/workspace";
     },
@@ -147,6 +220,88 @@ test("dispatchSystemMessage yields when a local pending turn already owns the wo
 
   assert.equal(dispatched, false);
   assert.equal(handled, false);
+});
+
+test("different background kinds share one workspace admission lane", async () => {
+  let dispatched = false;
+  const appLike = {
+    activeBackgroundWorkspaces: new Set(["/workspace"]),
+    readBackgroundMemoryPressure() {
+      return { pressured: false, availableBytes: 1024 ** 3, psiSomeAvg10: 0, psiFullAvg10: 0 };
+    },
+    systemMessageDispatcher: {
+      buildPreparedMessage(message) {
+        return {
+          workspaceId: "default",
+          accountId: "acc-1",
+          senderId: "user-1",
+          workspaceRoot: "/workspace",
+          triggerKind: message.triggerKind,
+        };
+      },
+      requeue() {},
+    },
+    channelAdapter: {
+      getKnownContextTokens() {
+        return {};
+      },
+    },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          buildBindingKey() { return "binding-1"; },
+          getThreadIdForWorkspace() { return ""; },
+          clearThreadIdForWorkspace() {},
+        };
+      },
+    },
+    threadStateStore: { getThreadState() { return null; } },
+    turnGateStore: { isPending() { return false; } },
+    turnBoundaryScopeKeys: new Set(),
+    resolveWorkspaceRoot() { return "/workspace"; },
+    isTurnDispatchBlocked: CyberbossApp.prototype.isTurnDispatchBlocked,
+    async dispatchPreparedTurn() {
+      dispatched = true;
+      return true;
+    },
+  };
+
+  const result = await CyberbossApp.prototype.dispatchSystemMessage.call(appLike, {
+    id: "checkin-1",
+    senderId: "user-1",
+    triggerKind: "checkin",
+  });
+  assert.equal(result, false);
+  assert.equal(dispatched, false);
+});
+
+test("user chat preempts background work before dispatching", async () => {
+  const calls = [];
+  const appLike = {
+    activeBackgroundWorkspaces: new Set(["/workspace"]),
+    activeBackgroundBindingsByWorkspace: new Map([["/workspace", "binding-1::background:checkin"]]),
+    runtimeAdapter: {
+      async cancelBackgroundTurnsForWorkspace() { calls.push("cancelBackground"); },
+    },
+    turnGateStore: {
+      releaseScope(bindingKey) { calls.push(`release:${bindingKey}`); },
+    },
+    isTurnDispatchBlocked() { return false; },
+    async dispatchPreparedTurn() { calls.push("dispatchUser"); return true; },
+  };
+
+  const result = await CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared: { provider: "weixin", text: "hello" },
+  });
+
+  assert.equal(result, true);
+  assert.deepEqual(calls, [
+    "cancelBackground",
+    "release:binding-1::background:checkin",
+    "dispatchUser",
+  ]);
 });
 
 test("handlePreparedMessage queues while the scope is in a turn-boundary handoff", async () => {
@@ -369,6 +524,48 @@ test("completed turns flush queued inbound work before system messages", async (
   });
 
   assert.deepEqual(calls, ["releaseThread", "flushInbound:ignoreBoundary", "stopTyping", "flushSystem"]);
+});
+
+test("background runtime failures are logged without sending WeChat errors", async () => {
+  const calls = [];
+  const appLike = {
+    activeBackgroundWorkspaces: new Set(["/workspace"]),
+    streamDelivery: {
+      resolveReplyTargetForRun() { return null; },
+      async handleRuntimeEvent() {},
+    },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          clearApprovalPrompt() {},
+          findBindingForThreadId() {
+            return {
+              bindingKey: "binding-1::background:diary_incremental",
+              workspaceRoot: "/workspace",
+            };
+          },
+        };
+      },
+    },
+    turnGateStore: {
+      releaseThread() { calls.push("releaseThread"); },
+      isPending() { return false; },
+    },
+    turnBoundaryScopeKeys: new Set(),
+    hasPendingInboundMessage() { return false; },
+    async stopTypingForThread() { calls.push("stopTyping"); },
+    async sendFailureToThread() { calls.push("sendFailure"); },
+    async flushPendingInboundMessages() { calls.push("flushInbound"); },
+    async flushPendingSystemMessages() { calls.push("flushSystem"); },
+  };
+
+  await handleRuntimeEventForTest(appLike, {
+    type: "runtime.turn.failed",
+    payload: { threadId: "thread-bg", turnId: "turn-bg", text: "startup failed" },
+  });
+
+  assert.equal(appLike.activeBackgroundWorkspaces.has("/workspace"), false);
+  assert.equal(calls.includes("sendFailure"), false);
 });
 
 test("completed turns keep the boundary closed until queued inbound work has been flushed", async () => {

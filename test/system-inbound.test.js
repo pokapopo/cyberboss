@@ -4,7 +4,11 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { CyberbossApp } = require("../src/core/app");
+const {
+  CyberbossApp,
+  buildBackgroundRetryMessage,
+  readBackgroundMemoryPressure,
+} = require("../src/core/app");
 const { SystemMessageDispatcher } = require("../src/core/system-message-dispatcher");
 
 test("system messages bypass normal inbound wrapping", async () => {
@@ -23,6 +27,48 @@ test("system messages bypass normal inbound wrapping", async () => {
   });
 });
 
+test("background startup failures use persistent exponential retry delays", () => {
+  const original = {
+    id: "system-1",
+    triggerKind: "diary_incremental",
+    metadata: {},
+  };
+  const first = buildBackgroundRetryMessage(original, {
+    error: new Error("timed out waiting for claudecode session id"),
+    nowMs: 1_000_000,
+  });
+  const second = buildBackgroundRetryMessage(first, {
+    error: new Error("timed out waiting for claudecode session id"),
+    nowMs: 2_000_000,
+  });
+
+  assert.equal(first.metadata.backgroundRetry.attempt, 1);
+  assert.equal(Date.parse(first.notBefore) - 1_000_000, 30_000);
+  assert.equal(second.metadata.backgroundRetry.attempt, 2);
+  assert.equal(Date.parse(second.notBefore) - 2_000_000, 60_000);
+  assert.match(second.metadata.backgroundRetry.lastError, /timed out waiting/);
+});
+
+test("background memory admission reads MemAvailable and PSI pressure", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-pressure-test-"));
+  const meminfoPath = path.join(dir, "meminfo");
+  const pressurePath = path.join(dir, "pressure");
+  fs.writeFileSync(meminfoPath, "MemTotal: 2097152 kB\nMemAvailable: 200000 kB\n");
+  fs.writeFileSync(pressurePath, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+
+  const lowMemory = readBackgroundMemoryPressure({ meminfoPath, pressurePath });
+  assert.equal(lowMemory.pressured, true);
+
+  fs.writeFileSync(meminfoPath, "MemTotal: 2097152 kB\nMemAvailable: 1000000 kB\n");
+  fs.writeFileSync(pressurePath, "some avg10=25.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+  const highPsi = readBackgroundMemoryPressure({ meminfoPath, pressurePath });
+  assert.equal(highPsi.pressured, true);
+
+  fs.writeFileSync(pressurePath, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+  const healthy = readBackgroundMemoryPressure({ meminfoPath, pressurePath });
+  assert.equal(healthy.pressured, false);
+});
+
 test("system poller prompts forbid intermediate progress messages", () => {
   const dispatcher = new SystemMessageDispatcher({
     queueStore: {},
@@ -33,7 +79,7 @@ test("system poller prompts forbid intermediate progress messages", () => {
     accountId: "account-1",
   });
 
-  for (const triggerKind of ["diary_incremental", "checkin", "diary_finalize", "legacy"]) {
+  for (const triggerKind of ["diary_incremental", "timeline_incremental", "checkin", "diary_finalize", "legacy"]) {
     const prepared = dispatcher.buildPreparedMessage({
       id: `message-${triggerKind}`,
       senderId: "user-1",

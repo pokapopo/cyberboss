@@ -4,6 +4,7 @@ const { createTimelineIntegration } = require("../integrations/timeline");
 const { ExperienceStore } = require("../core/experience-store");
 const { MemorySemanticService } = require("../core/memory-semantic-service");
 const { WorkLogStore } = require("../core/work-log-store");
+const { BackgroundContinuityStore } = require("../core/background-continuity-store");
 const { ChannelFileService } = require("../services/channel-file-service");
 const { DiaryService } = require("../services/diary-service");
 const { ReminderService } = require("../services/reminder-service");
@@ -27,6 +28,7 @@ function createProjectTooling(config, options = {}) {
   });
   const channelFile = new ChannelFileService({ config, channelAdapter, sessionStore });
   const services = {
+    backgroundContinuity: options.backgroundContinuityStore || new BackgroundContinuityStore({ filePath: config.backgroundContinuityFile }),
     workLog: options.workLogStore || new WorkLogStore({
       filePath: config.workLogFile,
     }),

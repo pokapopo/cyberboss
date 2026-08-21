@@ -359,6 +359,35 @@ test("timeline reconcile accepts complementary state-transition boundaries", asy
   assert.deepEqual(result.day.events[0].sourceMessageIds, ["msg-sleep", "msg-wake"]);
 });
 
+test("timeline reconcile accepts explicit sleep start and wake end boundaries", async () => {
+  let dayEvents = [];
+  const pending = [{ id: "sleep-start", text: "睡了", activityType: "sleep", boundaryType: "start", boundaryAt: "2026-08-05T21:02:00.000Z", timePrecision: "exact", status: "ongoing", sourceMessageIds: ["event-1"] }, { id: "sleep-end", text: "醒了", activityType: "sleep", boundaryType: "end", boundaryAt: "2026-08-06T09:45:00.000Z", observedAt: "2026-08-06T09:45:00.000Z", timePrecision: "exact", status: "completed", sourceMessageIds: ["event-2"] }];
+  const observationStore = { listPending() { return pending; }, resolve() { return pending; } };
+  const timelineIntegration = { async runSubcommand(subcommand, args) {
+    if (subcommand === "read") return { stdout: JSON.stringify({ date: "2026-08-06", events: dayEvents, eventCount: dayEvents.length }) };
+    if (subcommand === "categories") return { stdout: JSON.stringify({ categories: [{ id: "rest" }] }) };
+    if (subcommand === "write") { dayEvents = JSON.parse(args[args.indexOf("--events-json") + 1]).events; return { stdout: "written" }; }
+    if (subcommand === "build") return { stdout: "built" };
+    throw new Error(`unexpected subcommand ${subcommand}`);
+  } };
+  const { service } = createService({ observationStore, timelineIntegration });
+  const result = await service.reconcile({ date: "2026-08-06", events: [{ observationIds: ["sleep-start", "sleep-end"], startAt: "2026-08-05T21:02:00.000Z", endAt: "2026-08-06T09:45:00.000Z", timePrecision: "exact", title: "睡眠", categoryId: "rest", subcategoryId: "rest.sleep" }], resolvedObservationIds: ["sleep-start", "sleep-end"] });
+  assert.equal(result.applied, true);
+});
+
+test("timeline reconcile rejects boundaries from different activities", async () => {
+  const pending = [
+    { id: "sleep-start", activityType: "sleep", boundaryType: "start", boundaryAt: "2026-08-05T21:02:00.000Z", timePrecision: "exact", status: "ongoing", sourceMessageIds: ["event-1"] },
+    { id: "trip-end", activityType: "commute", boundaryType: "end", boundaryAt: "2026-08-06T09:45:00.000Z", timePrecision: "exact", status: "completed", sourceMessageIds: ["event-2"] },
+  ];
+  const observationStore = { listPending() { return pending; }, resolve() { return pending; } };
+  const { service } = createService({ observationStore });
+  await assert.rejects(
+    service.reconcile({ date: "2026-08-06", events: [{ observationIds: ["sleep-start", "trip-end"], startAt: "2026-08-05T21:02:00.000Z", endAt: "2026-08-06T09:45:00.000Z", timePrecision: "exact", title: "错误拼接" }] }),
+    (error) => error.code === "TIMELINE_ACTIVITY_MISMATCH"
+  );
+});
+
 test("timeline event patch updates one stable event without loading reconciliation state", async () => {
   const calls = [];
   let dayEvents = [{
