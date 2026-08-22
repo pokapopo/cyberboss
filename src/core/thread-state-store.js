@@ -72,6 +72,13 @@ class ThreadStateStore {
         next.turnId = event.payload.turnId || next.turnId;
         next.pendingApproval = null;
         break;
+      case "runtime.turn.cancelled":
+        next.status = "idle";
+        next.turnId = event.payload.turnId || next.turnId;
+        next.lastError = "";
+        next.lastCancellationReason = event.payload.reason || "cancelled";
+        next.pendingApproval = null;
+        break;
       case "runtime.turn.failed":
         next.status = "failed";
         next.turnId = event.payload.turnId || next.turnId;
@@ -125,6 +132,7 @@ function createEmptyThreadState(threadId) {
     status: "idle",
     lastReplyText: "",
     lastError: "",
+    lastCancellationReason: "",
     context: null,
     pendingApproval: null,
     updatedAt: new Date().toISOString(),

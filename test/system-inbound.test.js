@@ -93,14 +93,12 @@ test("system poller prompts forbid intermediate progress messages", () => {
   }
 });
 
-test("nightly diary prompt uses one supplemental preference and hard CC reflection validation", () => {
-  const memoryDir = "/state/memory";
+test("nightly diary prompt uses Ombré when needed and hard CC reflection validation", () => {
   const dispatcher = new SystemMessageDispatcher({
     queueStore: {},
     config: {
       workspaceId: "default",
       workspaceRoot: "/workspace",
-      memoryDir,
     },
     accountId: "account-1",
   });
@@ -112,9 +110,9 @@ test("nightly diary prompt uses one supplemental preference and hard CC reflecti
     createdAt: "2026-07-29T23:00:00.000Z",
   });
 
-  assert.match(prepared.text, new RegExp(`${memoryDir}/preference-diary-writing\\.md`));
-  assert.match(prepared.text, /use Read to load the COMPLETE/);
-  assert.match(prepared.text, /missing memory must never block diary finalization/);
+  assert.match(prepared.text, /use Ombré Brain/);
+  assert.doesNotMatch(prepared.text, /preference-diary-writing\.md/);
+  assert.match(prepared.text, /missing memory\s+must never block diary finalization/);
   assert.doesNotMatch(prepared.text, /reference-diary-format|feedback-diary-send-screenshot/);
   assert.match(prepared.text, /exact standalone heading `## CC 的想法`/);
   assert.match(prepared.text, /must not be empty/);

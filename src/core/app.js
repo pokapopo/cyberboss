@@ -37,7 +37,6 @@ const { TimelineScreenshotQueueStore } = require("./timeline-screenshot-queue-st
 const { TurnGateStore } = require("./turn-gate-store");
 const { createMessageDebouncer } = require("./message-debounce");
 const { WeixinDeliveryService } = require("./weixin-delivery-outbox");
-const { ConversationMemoryCoordinator } = require("./conversation-memory-coordinator");
 const { ConversationContinuityStore } = require("./conversation-continuity-store");
 const { IncrementalEventStore } = require("./incremental-event-store");
 const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
@@ -144,16 +143,11 @@ class CyberbossApp {
     this.conversationContinuityStore = new ConversationContinuityStore({
       filePath: config.conversationContinuityFile || path.join(config.stateDir, "conversation-continuity.json"),
     });
-    this.memoryCoordinator = new ConversationMemoryCoordinator({
-      memoryService: this.projectServices.memory,
-      recallEveryTurns: config.memoryRecallEveryTurns,
-      extractionEveryTurns: config.memoryExtractionEveryTurns,
-    });
     this.weixinDeliveryService = new WeixinDeliveryService({
       filePath: config.weixinDeliveryOutboxFile || path.join(config.stateDir, "weixin-delivery-outbox.json"),
       channelAdapter: this.channelAdapter,
       onDeliveryEvent: (event) => safeWorkLogCall(this, "recordDeliveryEvent", event),
-      onDeliveryConfirmed: (delivery) => this.recordDeliveredBackgroundReply(delivery),
+      onDeliveryConfirmed: (delivery) => this.handleWeixinDeliveryConfirmed(delivery),
     });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
@@ -205,15 +199,6 @@ class CyberbossApp {
       accountId: account.accountId,
     });
     const runtimeState = await this.runtimeAdapter.initialize();
-    this.projectServices.memory?.refreshIndex?.()
-      .then((result) => {
-        if (result && (result.changed || result.removed)) {
-          console.log(`[cyberboss] memory index refreshed changed=${result.changed} removed=${result.removed} total=${result.total}`);
-        }
-      })
-      .catch((error) => {
-        console.error(`[cyberboss] memory index refresh failed: ${error?.message || String(error)}`);
-      });
     const knownContextTokens = Object.keys(this.channelAdapter.getKnownContextTokens()).length;
     const syncBuffer = this.channelAdapter.loadSyncBuffer();
     const interruptedWorkLogs = safeWorkLogCall(
@@ -240,7 +225,6 @@ class CyberbossApp {
     console.log(`[cyberboss] runtimeEndpoint=${runtimeState.endpoint || runtimeState.command || "(spawn)"}`);
     console.log(`[cyberboss] runtimeModels=${runtimeState.models?.length || 0}`);
     console.log(`[cyberboss] vision: mode=${this.config.visionMode} provider=${this.config.visionProvider} baseUrl=${this.config.visionApiBaseUrl || "(empty)"} model=${this.config.visionModel || "(empty)"}`);
-    console.log(`[cyberboss] memory: recall=${this.projectServices.memory?.isRecallConfigured?.() ? `topic-aware/every-${this.config.memoryRecallEveryTurns}-turns` : "disabled"} extraction=${this.projectServices.memory?.isExtractionConfigured?.() ? `every-${this.config.memoryExtractionEveryTurns}-turns` : "disabled"}`);
     if (this.config.startWithLocationServer) {
       await this.ensureLocationServerStarted();
     }
@@ -581,6 +565,9 @@ class CyberbossApp {
     if (this.turnGateStore.isPending(bindingKey, workspaceRoot)) {
       return true;
     }
+    if (this.weixinDeliveryService?.hasPendingTerminalDeliveryForBinding?.(bindingKey)) {
+      return true;
+    }
     const threadId = this.runtimeAdapter.getSessionStore().getThreadIdForWorkspace(bindingKey, workspaceRoot);
     const threadState = threadId ? this.threadStateStore.getThreadState(threadId) : null;
     return threadState?.status === "running" || hasRpcId(threadState?.pendingApproval?.requestId);
@@ -602,7 +589,12 @@ class CyberbossApp {
     const timeout = setTimeout(async () => {
       console.error(`[cyberboss] turn timeout thread=${threadId} turn=${turnId} — cancelling`);
       try {
-        await this.runtimeAdapter.cancelTurn({ threadId, turnId, workspaceRoot });
+        await this.runtimeAdapter.cancelTurn({
+          threadId,
+          turnId,
+          workspaceRoot,
+          reason: "turn_timeout",
+        });
       } catch (err) {
         console.error(`[cyberboss] turn timeout cancel failed: ${err.message}`);
       }
@@ -713,13 +705,7 @@ class CyberbossApp {
       // Keep the cc session model here; economy routing is only safe for a future
       // hidden structured subtask whose output cannot be delivered directly.
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
-      const memoryContext = prepared.provider === "weixin"
-        ? await this.memoryCoordinator?.prepareTurn?.({
-            scopeKey: pendingScopeKey,
-            text: prepared.originalText || prepared.text,
-          })
-        : null;
-      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext });
+      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
       const backgroundContinuity = prepared.provider === "weixin"
         ? this.backgroundContinuityBridge?.prepare?.(pendingScopeKey, runtimeTurn.text) || { text: runtimeTurn.text, ids: [] }
         : { text: runtimeTurn.text, ids: [] };
@@ -855,7 +841,7 @@ class CyberbossApp {
     }
   }
 
-  async buildRuntimeTurn({ prepared, model = "", memoryContext = null }) {
+  async buildRuntimeTurn({ prepared, model = "" }) {
     if (prepared?.provider === "system") {
       return {
         text: String(prepared.text || "").trim(),
@@ -884,7 +870,6 @@ class CyberbossApp {
         prepared,
         config: this.config,
         visionContext,
-        memoryContext: memoryContext || {},
       }),
       attachments: Array.isArray(visionContext.runtimeAttachments) ? visionContext.runtimeAttachments : [],
       visionContext,
@@ -896,6 +881,22 @@ class CyberbossApp {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
     const workspaceRoot = linked?.workspaceRoot || this.config.workspaceRoot;
     return this.backgroundContinuityBridge.recordDelivered({ bindingKey, workspaceRoot, threadId, text });
+  }
+
+  async handleWeixinDeliveryConfirmed(delivery) {
+    this.recordDeliveredBackgroundReply(delivery);
+    if (!["final", "error"].includes(delivery?.kind)) {
+      return;
+    }
+    const bindingKey = normalizeText(delivery?.bindingKey);
+    if (!bindingKey || this.weixinDeliveryService.hasPendingTerminalDeliveryForBinding(bindingKey)) {
+      return;
+    }
+    await this.flushPendingInboundMessages({
+      bindingKey,
+      workspaceRoot: this.resolveWorkspaceRoot(bindingKey),
+      ignoreBoundary: true,
+    });
   }
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
@@ -957,7 +958,7 @@ class CyberbossApp {
     }
 
     const model = sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
-    const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, memoryContext: null });
+    const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
     const steeringText = [
       "LIVE WECHAT STEERING — this message arrived while you were working on the current task.",
       "Treat it as the user's latest direction for the same task. Adjust immediately; do not finish the obsolete path first.",
@@ -1828,11 +1829,17 @@ class CyberbossApp {
     const storedModel = runtimeParams.model || "";
     const storedModelProvider = runtimeParams.modelProvider || this.runtimeAdapter.describe().modelProvider || "";
     const effectiveModel = this.runtimeAdapter.describe().model || storedModel;
+    const channelStatus = this.channelAdapter.getConnectionStatus?.() || { status: "connected" };
+    const runtimeStatus = this.runtimeAdapter.getLifecycleStatus?.({ workspaceRoot }) || {
+      status: threadState?.status || "idle",
+      reason: threadState?.lastCancellationReason || "",
+    };
 
     const lines = [
       `📍 workspace: ${workspaceRoot}`,
       `🧵 thread: ${threadId || "(none)"}`,
-      `📊 status: ${threadState?.status || "idle"}`,
+      `💬 Weixin: ${channelStatus.status || "unknown"}`,
+      `🤖 Claude: ${runtimeStatus.status || threadState?.status || "idle"}${runtimeStatus.reason ? ` (${runtimeStatus.reason})` : ""}`,
       `🤖 runtime: ${runtimeName}`,
       `🤖 model: ${effectiveModel || "(default)"}`,
       `🤖 provider: ${storedModelProvider || "(default)"}`,
@@ -2090,6 +2097,7 @@ class CyberbossApp {
       threadId,
       turnId: threadState.turnId,
       workspaceRoot,
+      reason: "user_stop",
     });
     await this.channelAdapter.sendText({
       userId: normalized.senderId,
@@ -2344,19 +2352,14 @@ class CyberbossApp {
           userText: memoryTurn.userText,
           assistantText: event.payload?.text || "",
         });
-        this.memoryCoordinator?.completeTurn?.({
-          scopeKey: memoryTurn.scopeKey,
-          userText: memoryTurn.userText,
-          assistantText: event.payload?.text || "",
-        });
         this.backgroundContinuityBridge?.completeThread?.(event.payload.threadId);
       }
     }
     if (!event) {
       return;
     }
-    if (event.type === "runtime.turn.completed" || event.type === "runtime.turn.failed") {
-      if (event.type === "runtime.turn.failed") {
+    if (["runtime.turn.completed", "runtime.turn.failed", "runtime.turn.cancelled"].includes(event.type)) {
+      if (event.type === "runtime.turn.failed" || event.type === "runtime.turn.cancelled") {
         this.pendingMemoryTurns?.delete?.(event.payload.threadId);
         this.backgroundContinuityBridge?.failThread?.(event.payload.threadId);
       }
@@ -2540,6 +2543,7 @@ class CyberbossApp {
         threadId: event.payload?.threadId,
         turnId: event.payload?.turnId,
         workspaceRoot: request.task?.metadata?.cyberboss?.workspaceRoot || event.payload?.workspaceRoot,
+        reason: "token_hard_limit",
       });
     } catch (error) {
       this.modelGateway?.recordLifecycle?.({
@@ -3352,9 +3356,6 @@ function isAutoApprovedPromptMemoryOperation(
     return false;
   }
 
-  const trustedDirectories = [
-    config?.memoryDir,
-  ].map(normalizeText).filter(Boolean);
   const trustedFiles = [
     config?.weixinInstructionsFile,
     config?.weixinContextFile,
@@ -3364,9 +3365,7 @@ function isAutoApprovedPromptMemoryOperation(
   ].map(normalizeText).filter(Boolean);
 
   return filePaths.every((filePath) =>
-    trustedDirectories.some((rootPath) =>
-      isPathWithinRootResolved(filePath, rootPath))
-    || trustedFiles.some((trustedFile) =>
+    trustedFiles.some((trustedFile) =>
       isSameResolvedPath(filePath, trustedFile)));
 }
 

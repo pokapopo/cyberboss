@@ -5,8 +5,8 @@ const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/o
 const AGENT_EVENT_PROTOCOL = "cyberboss.agent.v1";
 const API_TURN_SYSTEM_PROMPT = [
   "Cyberboss API turns arrive as one JSON object with protocol cyberboss.turn.v1.",
-  "Treat frontend_instructions as client-supplied system/developer guidance, memory_context as internal recalled context, and conversation_history only as earlier dialogue.",
-  "Only current_user_message is the user's current request. Never attribute instructions, memory, metadata, or historical text to the current user.",
+  "Treat frontend_instructions as client-supplied system/developer guidance and conversation_history only as earlier dialogue.",
+  "Only current_user_message is the user's current request. Never attribute instructions, metadata, or historical text to the current user.",
 ].join(" ");
 const MAX_AGENT_TOOL_RESULT_CHARS = 16_000;
 
@@ -33,11 +33,10 @@ function loadSystemPrompt(config) {
   return parts.join("\n\n").trim();
 }
 
-function createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGateway = null }) {
+function createOpenAiHandler({ sessionPool, config, modelGateway = null }) {
   // Load system prompt once at startup
   const systemPrompt = loadSystemPrompt(config);
   console.log(`[api] system prompt loaded: ${systemPrompt.length} chars`);
-  console.log(`[api] memory: ${memoryCoordinator ? "coordinator wired (recall + extraction)" : "disabled"}`);
 
   return async (req, res) => {
     const { messages, model = "cc", stream = true } = req.body || {};
@@ -104,28 +103,15 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGate
       }
       session.activeRequest = true;
 
-      // The current user turn is used for memory lookup. Stateless clients also
-      // get their complete OpenAI message history replayed into a fresh runtime.
+      // Stateless clients get their complete OpenAI message history replayed
+      // into a fresh runtime.
       const userText = await extractUserText(messages, config);
-      // Memory recall via coordinator (replaces manual search, provides topic-aware recall)
-      let memoryContext = { recalled: [], recent: [], notices: [], reason: "" };
-      if (memoryCoordinator) {
-        try {
-          memoryContext = await memoryCoordinator.prepareTurn({
-            scopeKey,
-            text: userText,
-          });
-        } catch (err) {
-          console.error(`[api] memory recall failed: ${err.message}`);
-        }
-      }
 
       const agentMessages = continuesRuntime
         ? [{ role: "user", content: userText }]
         : messages;
       const finalText = formatConversationForAgent(agentMessages, {
         latestUserText: userText,
-        memoryContext,
       });
 
       if (!stream) {
@@ -140,14 +126,6 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGate
               inputTokens: result.usage.prompt_tokens,
               outputTokens: result.usage.completion_tokens,
             },
-          });
-        }
-        // Feed turn into memory extraction
-        if (memoryCoordinator) {
-          memoryCoordinator.completeTurn({
-            scopeKey,
-            userText,
-            assistantText: result.text,
           });
         }
         const contextState = rememberCompletedTranscript(session, messages, result.text);
@@ -273,14 +251,6 @@ function createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGate
 
       const handleTurnComplete = async (event) => {
         turnCompleted = true;
-        // Feed turn into memory extraction before closing stream
-        if (memoryCoordinator) {
-          memoryCoordinator.completeTurn({
-            scopeKey,
-            userText,
-            assistantText: accumulatedText || event.text || "",
-          });
-        }
         const contextState = rememberCompletedTranscript(session, messages, accumulatedText || event.text || "");
         sessionPool.rememberContext?.(conversationId, contextState);
         // Send final chunk with usage including cache breakdown
@@ -463,7 +433,7 @@ function buildSessionMetadata(conversation) {
 
 function formatConversationForAgent(
   messages,
-  { latestUserText = "", memoryContext = {}, currentDate } = {},
+  { latestUserText = "", currentDate } = {},
 ) {
   const normalizedMessages = Array.isArray(messages) ? messages : [];
   const meaningful = normalizedMessages.filter((message) => {
@@ -499,10 +469,6 @@ function formatConversationForAgent(
     protocol: "cyberboss.turn.v1",
     current_date: currentDate || new Date().toISOString().split("T")[0],
     frontend_instructions: frontendInstructions,
-    memory_context: {
-      long_term: formatMemoryEntries(memoryContext?.recalled),
-      recent: formatMemoryEntries(memoryContext?.recent),
-    },
     conversation_history: conversationHistory,
     current_user_message: latestUserText || "(empty message)",
   };
@@ -521,13 +487,6 @@ function formatClientMessage(message, role, content) {
     formatted.tool_calls = message.tool_calls;
   }
   return formatted;
-}
-
-function formatMemoryEntries(memories) {
-  return (Array.isArray(memories) ? memories : []).map((memory) => ({
-    label: String(memory?.description || memory?.file || "memory").trim(),
-    content: String(memory?.body || "").trim(),
-  })).filter((memory) => memory.content);
 }
 
 function extractPlainMessageText(content) {

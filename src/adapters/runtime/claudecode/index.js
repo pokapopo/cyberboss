@@ -61,7 +61,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       if (normalizeText(existing.model) === desiredModel) {
         return existing;
       }
-      await closeWorkspaceClient(workspaceRoot);
+      await closeWorkspaceClient(workspaceRoot, "model_switch");
     }
     const projectSettings = ensureClaudeProjectMcpConfig({
       workspaceRoot,
@@ -155,7 +155,7 @@ function createClaudeCodeRuntimeAdapter(config) {
 
     const existingClient = clientsByWorkspace.get(normalizedWorkspaceRoot);
     if (existingClient?.alive && normalizeText(existingClient.model) !== desiredModel) {
-      await closeWorkspaceClient(normalizedWorkspaceRoot);
+      await closeWorkspaceClient(normalizedWorkspaceRoot, "model_switch");
     }
 
     if (normalizedThreadId && clientMatchesThread(existingClient, normalizedThreadId)) {
@@ -163,13 +163,13 @@ function createClaudeCodeRuntimeAdapter(config) {
     }
 
     if (!normalizedThreadId && existingClient?.alive) {
-      await closeWorkspaceClient(normalizedWorkspaceRoot);
+      await closeWorkspaceClient(normalizedWorkspaceRoot, "fresh_session");
     }
 
     let client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
     if (!client.alive || (normalizedThreadId && !clientMatchesThread(client, normalizedThreadId))) {
       if (client.alive && normalizedThreadId && !clientMatchesThread(client, normalizedThreadId)) {
-        await closeWorkspaceClient(normalizedWorkspaceRoot);
+        await closeWorkspaceClient(normalizedWorkspaceRoot, "session_switch");
         client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
       }
       await client.connect(normalizedThreadId);
@@ -177,7 +177,7 @@ function createClaudeCodeRuntimeAdapter(config) {
 
     return { client, threadId: normalizedThreadId || normalizeThreadId(client.sessionId) };
   }
-  async function closeWorkspaceClient(workspaceRoot) {
+  async function closeWorkspaceClient(workspaceRoot, reason) {
     const normalizedWorkspaceRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : "";
     if (!normalizedWorkspaceRoot) {
       return;
@@ -188,7 +188,7 @@ function createClaudeCodeRuntimeAdapter(config) {
     }
     cancelIdleTimer(normalizedWorkspaceRoot);
     clientsByWorkspace.delete(normalizedWorkspaceRoot);
-    await client.close();
+    await client.close({ reason });
     for (const [requestId, pending] of pendingApprovals.entries()) {
       if (pending?.client === client) {
         pendingApprovals.delete(requestId);
@@ -200,7 +200,7 @@ function createClaudeCodeRuntimeAdapter(config) {
     return normalizeText(bindingKey).includes("::background:");
   }
 
-  async function closeBackgroundClient(scopeKey) {
+  async function closeBackgroundClient(scopeKey, reason) {
     const normalizedScopeKey = normalizeText(scopeKey);
     const client = backgroundClientsByScope.get(normalizedScopeKey);
     if (!client) return;
@@ -208,14 +208,14 @@ function createClaudeCodeRuntimeAdapter(config) {
     for (const [requestId, pending] of pendingApprovals.entries()) {
       if (pending?.client === client) pendingApprovals.delete(requestId);
     }
-    await client.close().catch(() => {});
+    await client.close({ reason }).catch(() => {});
   }
 
   async function sendBackgroundTurn({ bindingKey, workspaceRoot, text, model = "", continuityContext = null }) {
     const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
     const scopeKey = `${normalizeText(bindingKey)}::${normalizedWorkspaceRoot}`;
     if (!normalizedWorkspaceRoot) throw new Error("workspaceRoot is required");
-    await closeBackgroundClient(scopeKey);
+    await closeBackgroundClient(scopeKey, "background_replaced");
 
     const desiredModel = resolveModel(model);
     const projectSettings = ensureClaudeProjectMcpConfig({
@@ -254,7 +254,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       if (mapped && globalListener) globalListener(mapped, raw);
       if (event.type === "turn.completed" || event.type === "turn.interrupted"
           || event.type === "process.error" || event.type === "process.close") {
-        void closeBackgroundClient(scopeKey);
+        void closeBackgroundClient(scopeKey, "turn_finished");
       }
     });
 
@@ -274,7 +274,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       );
       return { threadId: returnedThreadId, turnId: client.pendingTurnId };
     } catch (error) {
-      await closeBackgroundClient(scopeKey);
+      await closeBackgroundClient(scopeKey, "startup_failed_cleanup");
       throw error;
     }
   }
@@ -304,7 +304,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       ) {
         return;
       }
-      closeWorkspaceClient(normalizedWorkspaceRoot)
+      closeWorkspaceClient(normalizedWorkspaceRoot, "idle_timeout")
         .then(() => {
           console.log(`[claudecode-runtime] hibernated idle workspace=${normalizedWorkspaceRoot} timeout_ms=${idleTimeoutMs}`);
         })
@@ -324,7 +324,7 @@ function createClaudeCodeRuntimeAdapter(config) {
         active += 1;
         continue;
       }
-      await closeWorkspaceClient(workspaceRoot);
+      await closeWorkspaceClient(workspaceRoot, normalizeText(reason) || "memory_pressure");
       hibernated += 1;
       console.log(`[claudecode-runtime] hibernated workspace=${workspaceRoot} reason=${normalizeText(reason) || "manual"}`);
     }
@@ -355,6 +355,16 @@ function createClaudeCodeRuntimeAdapter(config) {
     getSessionStore() {
       return sessionStore;
     },
+    getLifecycleStatus({ workspaceRoot } = {}) {
+      const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
+      const client = clientsByWorkspace.get(normalizedWorkspaceRoot);
+      if (!client) return { status: "idle", reason: "" };
+      if (client.expectedCloseReason) {
+        return { status: "cancelling", reason: client.expectedCloseReason };
+      }
+      if (client.pendingTurnId) return { status: "running", reason: "" };
+      return { status: client.alive ? "idle" : "restarting", reason: "" };
+    },
     getTurnCapabilities({ model = "" } = {}) {
       const effectiveModel = resolveModel(model);
       return {
@@ -376,16 +386,16 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       idleTimersByWorkspace.clear();
       for (const client of clientsByWorkspace.values()) {
-        await client.close();
+        await client.close({ reason: "runtime_shutdown" });
       }
       clientsByWorkspace.clear();
       for (const scopeKey of [...backgroundClientsByScope.keys()]) {
-        await closeBackgroundClient(scopeKey);
+        await closeBackgroundClient(scopeKey, "runtime_shutdown");
       }
       await ipcServer.close();
     },
     async startFreshThreadDraft({ workspaceRoot }) {
-      await closeWorkspaceClient(workspaceRoot);
+      await closeWorkspaceClient(workspaceRoot, "new_thread");
       return { workspaceRoot };
     },
     async hibernateIdleClients(options = {}) {
@@ -396,7 +406,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       let cancelled = 0;
       for (const scopeKey of [...backgroundClientsByScope.keys()]) {
         if (!normalizedWorkspaceRoot || scopeKey.endsWith(`::${normalizedWorkspaceRoot}`)) {
-          await closeBackgroundClient(scopeKey);
+          await closeBackgroundClient(scopeKey, "background_preempted");
           cancelled += 1;
         }
       }
@@ -424,20 +434,22 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       throw new Error("no active claudecode session to respond to approval");
     },
-    async cancelTurn({ threadId, turnId, workspaceRoot }) {
+    async cancelTurn({ threadId, turnId, workspaceRoot, reason }) {
+      const closeReason = normalizeText(reason);
+      if (!closeReason) throw new Error("cancelTurn reason is required");
       for (const [scopeKey, client] of backgroundClientsByScope.entries()) {
         if (clientMatchesThread(client, threadId)) {
-          await closeBackgroundClient(scopeKey);
+          await closeBackgroundClient(scopeKey, closeReason);
           return { threadId, turnId };
         }
       }
       if (workspaceRoot) {
-        await closeWorkspaceClient(workspaceRoot);
+        await closeWorkspaceClient(workspaceRoot, closeReason);
         return { threadId, turnId };
       }
       for (const [workspaceRoot, client] of clientsByWorkspace.entries()) {
         if (client.sessionId === threadId) {
-          await closeWorkspaceClient(workspaceRoot);
+          await closeWorkspaceClient(workspaceRoot, closeReason);
           return { threadId, turnId };
         }
       }

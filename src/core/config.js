@@ -62,22 +62,6 @@ function readConfig() {
       minReadRatio: readNumberEnv("CYBERBOSS_CACHE_ALERT_MIN_READ_RATIO", 0.05),
     },
     experienceFile: path.join(stateDir, "experience-library.json"),
-    memoryEnabled: readOptionalBoolEnv("CYBERBOSS_MEMORY_ENABLED") === true,
-    memoryDir: readTextEnv("CYBERBOSS_MEMORY_DIR") || path.join(stateDir, "memory"),
-    memoryIndexFile: readTextEnv("CYBERBOSS_MEMORY_INDEX_FILE")
-      || path.join(stateDir, "memory-search", "embeddings.json"),
-    memoryCandidatesFile: readTextEnv("CYBERBOSS_MEMORY_CANDIDATES_FILE")
-      || path.join(stateDir, "memory-candidates.json"),
-    recentMemoryFile: readTextEnv("CYBERBOSS_RECENT_MEMORY_FILE")
-      || path.join(stateDir, "recent-memory.json"),
-    memoryApiBaseUrl: readTextEnv("CYBERBOSS_MEMORY_API_BASE_URL") || visionApiBaseUrl,
-    memoryApiKey: readTextEnv("CYBERBOSS_MEMORY_API_KEY") || visionApiKey,
-    memoryEmbeddingModel: readTextEnv("CYBERBOSS_MEMORY_EMBEDDING_MODEL") || "text-embedding-v4",
-    memoryEmbeddingDimensions: readIntEnv("CYBERBOSS_MEMORY_EMBEDDING_DIMENSIONS") || 1024,
-    memoryExtractionModel: readTextEnv("CYBERBOSS_MEMORY_EXTRACTION_MODEL") || visionModel,
-    memoryRecallEveryTurns: readIntEnv("CYBERBOSS_MEMORY_RECALL_EVERY_TURNS") || 5,
-    memoryExtractionEveryTurns: readIntEnv("CYBERBOSS_MEMORY_EXTRACTION_EVERY_TURNS") || 10,
-    memoryTimeoutMs: readIntEnv("CYBERBOSS_MEMORY_TIMEOUT_MS") || 15_000,
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     timelineObservationFile: path.join(stateDir, "timeline-observations.json"),
     timelineIdleMs: readIntEnv("CYBERBOSS_TIMELINE_IDLE_MS") || 10 * 60_000,

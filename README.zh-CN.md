@@ -473,19 +473,13 @@ ${HOME}/.cyberboss
 - `cyberboss_worklog_get`
 - `cyberboss_experience_search`
 - `cyberboss_experience_record`
-- `cyberboss_memory_search`
-- `cyberboss_memory_index_refresh`
-- `cyberboss_memory_candidates`
-- `cyberboss_memory_candidate_review`
 
 ### Agent 使用约定
 
 - diary、reminder、timeline、screenshot、file-send 这类 Cyberboss 能力使用项目工具
 - 微信与系统 runtime 执行会自动留下精简档案；询问近期执行情况时，agent 先查 work log
 - 重复问题排查前先搜索经验库；只有确认根因、修复并验证后才记录经验
-- 长期记忆在首次、明显换话题或每 5 轮周期到达时自动召回；周期检索不会在 20 轮内重复注入正文未变化的同一记忆，单次注入正文总量不超过 3600 字符；后台约每 10 个完成轮次提取一次，敏感或不确定内容进入候选区
-- 记忆自动化默认关闭；设置 `CYBERBOSS_MEMORY_ENABLED=true` 才启用。启用后，换话题或每 5 轮的周期查询以及新增/变更记忆正文会发送给 embedding 服务，约 10 轮的提取批次会发送给配置的提取模型。周期可用 `CYBERBOSS_MEMORY_RECALL_EVERY_TURNS` 调整
-- embedding 或提取服务拒绝、超时或返回异常时静默降级，不影响当前回复，也不会向微信发送记忆服务错误
+- 长期记忆统一由 Ombré Brain MCP 提供；需要过去经历、关系脉络或项目事实时，由 agent 按当前语境调用 Ombré 的召回工具
 - 工作档案和经验默认写入 `~/.cyberboss/work-log.json` 与 `~/.cyberboss/experience-library.json`，不保存完整聊天或工具参数
 - 终端给人手动使用的仍然是 `README`、`--help` 和 [docs/commands.md](./docs/commands.md) 中的生命周期入口
 - 第一次执行失败时，先反馈报错，不要立刻读源码

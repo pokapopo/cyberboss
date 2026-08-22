@@ -24,6 +24,7 @@ class ClaudeCodeProcessClient {
     this.alive = false;
     this.sessionWaiters = new Set();
     this.suppressNextCloseEvent = false;
+    this.expectedCloseReason = "";
     this.pendingInterrupt = null;
   }
 
@@ -52,6 +53,7 @@ class ClaudeCodeProcessClient {
   async connect(resumeSessionId = "") {
     if (this.child) return;
     this.suppressNextCloseEvent = false;
+    this.expectedCloseReason = "";
     this.sessionId = "";
     this.resumeSessionId = isValidSessionId(resumeSessionId) ? resumeSessionId : "";
     this.activeThreadId = "";
@@ -130,6 +132,8 @@ class ClaudeCodeProcessClient {
     });
 
     child.on("close", (code) => {
+      const expectedCloseReason = this.expectedCloseReason;
+      this.expectedCloseReason = "";
       const closeError = new Error(`claudecode process closed with code ${code ?? "unknown"}`);
       this.rejectSessionWaiters(closeError);
       this.rejectPendingInterrupt(closeError);
@@ -138,6 +142,17 @@ class ClaudeCodeProcessClient {
       this.stdin = null;
       if (this.suppressNextCloseEvent) {
         this.suppressNextCloseEvent = false;
+        return;
+      }
+      if (expectedCloseReason) {
+        if (this.pendingTurnId) {
+          this.emit({
+            type: "turn.cancelled",
+            reason: expectedCloseReason,
+            sessionId: this.activeThreadId || this.sessionId,
+            turnId: this.pendingTurnId,
+          }, null);
+        }
         return;
       }
       this.emit({ type: "process.close", code, sessionId: this.activeThreadId || this.sessionId, turnId: this.pendingTurnId }, null);
@@ -333,7 +348,7 @@ class ClaudeCodeProcessClient {
       turnId: this.pendingTurnId,
     }, raw);
     setImmediate(() => {
-      this.close().catch(() => {});
+      this.close({ reason: "session_mismatch" }).catch(() => {});
     });
   }
 
@@ -487,12 +502,18 @@ class ClaudeCodeProcessClient {
     });
   }
 
-  async close() {
+  async close({ reason } = {}) {
     if (!this.child) return;
+    const normalizedReason = typeof reason === "string" ? reason.trim() : "";
+    if (!normalizedReason) {
+      throw new Error("claudecode close reason is required");
+    }
     // All calls to close() are intentional lifecycle actions (shutdown,
     // cancellation, model switch, or idle hibernation). Do not translate the
     // resulting child exit into a runtime failure that clears a resumable ID.
-    this.suppressNextCloseEvent = true;
+    // Install the reason before stdin.end() or any signal can synchronously
+    // cause the child close event.
+    this.expectedCloseReason = normalizedReason;
     if (this.stdin && !this.stdin.destroyed) {
       this.stdin.end();
     }

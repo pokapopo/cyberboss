@@ -2,7 +2,6 @@ const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { SessionStore } = require("../adapters/runtime/codex/session-store");
 const { createTimelineIntegration } = require("../integrations/timeline");
 const { ExperienceStore } = require("../core/experience-store");
-const { MemorySemanticService } = require("../core/memory-semantic-service");
 const { WorkLogStore } = require("../core/work-log-store");
 const { BackgroundContinuityStore } = require("../core/background-continuity-store");
 const { ChannelFileService } = require("../services/channel-file-service");
@@ -35,7 +34,6 @@ function createProjectTooling(config, options = {}) {
     experience: options.experienceStore || new ExperienceStore({
       filePath: config.experienceFile,
     }),
-    memory: options.memoryService || new MemorySemanticService({ config }),
     diary: new DiaryService({ config }),
     reminder: new ReminderService({ config, sessionStore }),
     system: new SystemMessageService({ config, sessionStore }),

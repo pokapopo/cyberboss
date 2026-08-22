@@ -60,6 +60,7 @@ test("timeline incremental turns are cancelled after crossing their per-task tok
     threadId: "thread-timeline",
     turnId: "turn-timeline",
     workspaceRoot: "/workspace",
+    reason: "token_hard_limit",
   }]);
   assert.equal(lifecycle[0].status, "cancel_requested");
 });

@@ -56,7 +56,6 @@ function assembleRuntimeTurnText({
   prepared,
   config = {},
   visionContext = {},
-  memoryContext = {},
 }) {
   const lines = [];
   const localTime = formatWechatLocalTime(prepared?.receivedAt);
@@ -75,41 +74,6 @@ function assembleRuntimeTurnText({
       lines.push("");
     }
     lines.push(originalText);
-  }
-
-  const recalledMemories = Array.isArray(memoryContext.recalled)
-    ? memoryContext.recalled.filter((item) => normalizeText(item?.body))
-    : [];
-  const recentMemories = Array.isArray(memoryContext.recent)
-    ? memoryContext.recent.filter((item) => normalizeText(item?.body ?? item?.summary))
-    : [];
-  const memoryNotices = Array.isArray(memoryContext.notices)
-    ? memoryContext.notices.map(normalizeText).filter(Boolean)
-    : [];
-  if (recalledMemories.length) {
-    pushSectionBreak(lines);
-    lines.push("Relevant long-term memory (internal context; use only when it helps, and do not mention retrieval mechanics):");
-    for (const item of recalledMemories) {
-      const label = normalizeText(item.description) || normalizeText(item.file) || "memory";
-      lines.push(`- ${label}`);
-      lines.push(`  ${normalizeText(item.body)}`);
-    }
-  }
-  if (recentMemories.length) {
-    pushSectionBreak(lines);
-    lines.push("Relevant recent memory (internal companion context; use naturally when helpful and do not mention memory mechanics):");
-    for (const item of recentMemories) {
-      const kind = normalizeText(item.kind) || "recent";
-      const body = normalizeText(item.body ?? item.summary);
-      lines.push(`- [${kind}] ${body}`);
-    }
-  }
-  if (memoryNotices.length) {
-    pushSectionBreak(lines);
-    lines.push("Memory maintenance notices (briefly tell the user naturally when relevant):");
-    for (const notice of memoryNotices) {
-      lines.push(`- ${notice}`);
-    }
   }
 
   if (attachments.length) {

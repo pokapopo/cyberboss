@@ -8,6 +8,7 @@ const {
   WeixinDeliveryOutboxStore,
   WeixinDeliveryService,
 } = require("../src/core/weixin-delivery-outbox");
+const { CyberbossApp } = require("../src/core/app");
 
 function createTempFile() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-outbox-"));
@@ -172,6 +173,94 @@ test("outbox reports one confirmed final delivery after every chunk succeeds", a
   assert.equal(confirmed[0].kind, "final");
   assert.equal(confirmed[0].bindingKey, "binding::background:diary_incremental");
   assert.equal(confirmed[0].text, "刚才给你发过一条后台消息。");
+  await service.close();
+});
+
+test("pending terminal delivery blocks the next turn until the final chunk is confirmed", async () => {
+  const filePath = createTempFile();
+  const sent = [];
+  const flushes = [];
+  let releaseLastChunk;
+  let firstChunkDelivered;
+  const firstChunkPromise = new Promise((resolve) => { firstChunkDelivered = resolve; });
+  const lastChunkGate = new Promise((resolve) => { releaseLastChunk = resolve; });
+  let service;
+  const appLike = {
+    recordDeliveredBackgroundReply() {},
+    resolveWorkspaceRoot() { return "/workspace"; },
+    runtimeAdapter: {
+      getSessionStore() {
+        return { getThreadIdForWorkspace() { return ""; } };
+      },
+    },
+    threadStateStore: { getThreadState() { return null; } },
+    turnGateStore: { isPending() { return false; } },
+    turnBoundaryScopeKeys: new Set(),
+    async flushPendingInboundMessages(options) {
+      const blocked = CyberbossApp.prototype.isTurnDispatchBlocked.call(
+        this,
+        options.bindingKey,
+        options.workspaceRoot,
+        { ignoreBoundary: options.ignoreBoundary },
+      );
+      flushes.push({ ...options, blocked });
+    },
+  };
+  service = new WeixinDeliveryService({
+    filePath,
+    onDeliveryConfirmed: (delivery) => CyberbossApp.prototype.handleWeixinDeliveryConfirmed.call(appLike, delivery),
+    channelAdapter: {
+      prepareTextDelivery() { return ["旧 final 第一段", "旧 final 第二段"]; },
+      getKnownContextTokens() { return { "user-1": "ctx-1" }; },
+      async sendTextChunk(payload) {
+        if (sent.length === 1) {
+          await lastChunkGate;
+        }
+        sent.push(payload.text);
+        if (sent.length === 1) firstChunkDelivered();
+      },
+    },
+  });
+  appLike.weixinDeliveryService = service;
+  service.registerRun({
+    runKey: "thread-1:turn-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    target: createTarget(),
+  });
+
+  await service.enqueueTaskDelivery({
+    runKey: "thread-1:turn-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    bindingKey: "binding-1",
+    target: createTarget(),
+    kind: "final",
+    text: "旧 final",
+  });
+  await firstChunkPromise;
+
+  assert.equal(service.hasPendingTerminalDeliveryForBinding("binding-1"), true);
+  await appLike.flushPendingInboundMessages({
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    ignoreBoundary: true,
+  });
+  assert.equal(flushes.at(-1).blocked, true);
+  assert.deepEqual(sent, ["旧 final 第一段"]);
+
+  releaseLastChunk();
+  await service.drain();
+
+  assert.equal(service.hasPendingTerminalDeliveryForBinding("binding-1"), false);
+  assert.deepEqual(sent, ["旧 final 第一段", "旧 final 第二段"]);
+  assert.deepEqual(flushes.at(-1), {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    ignoreBoundary: true,
+    blocked: false,
+  });
+  assert.equal(sent.some((text) => /stopped|superseded|已停止/.test(text)), false);
   await service.close();
 });
 

@@ -127,6 +127,19 @@ class WeixinDeliveryOutboxStore {
     return due ? clone(due) : null;
   }
 
+  hasPendingTerminalDeliveryForBinding(bindingKey) {
+    this.load();
+    const normalizedBindingKey = normalizeText(bindingKey);
+    if (!normalizedBindingKey) {
+      return false;
+    }
+    return this.state.deliveries.some(
+      (delivery) =>
+        delivery.bindingKey === normalizedBindingKey
+        && TERMINAL_KINDS.has(delivery.kind)
+    );
+  }
+
   markChunkDelivered(deliveryId, nextChunkIndex, nowIso) {
     return this.updateLocked(() => {
       const delivery = this.state.deliveries.find((item) => item.id === deliveryId);
@@ -339,6 +352,10 @@ class WeixinDeliveryService {
 
   suppressRunProgress(runKey) {
     return this.store.removeProgressForRun(runKey);
+  }
+
+  hasPendingTerminalDeliveryForBinding(bindingKey) {
+    return this.store.hasPendingTerminalDeliveryForBinding(bindingKey);
   }
 
   async enqueue({

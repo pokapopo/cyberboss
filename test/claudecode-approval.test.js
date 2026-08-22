@@ -603,6 +603,7 @@ test("cancelling a background turn leaves the live chat process running", async 
       threadId: backgroundTurn.threadId,
       turnId: backgroundTurn.turnId,
       workspaceRoot,
+      reason: "test_cancel",
     });
     await adapter.sendTurn({ bindingKey: "binding-chat", workspaceRoot, text: "MAIN_TWO" });
     await waitUntil(() => completions.filter((threadId) => threadId === mainTurn.threadId).length === 2);
@@ -682,6 +683,40 @@ test("claudecode process client delivers assistant text items and supports dual 
   );
   assert.equal(resultMapped.type, "runtime.turn.completed");
   assert.equal(resultMapped.payload.text, "done");
+});
+
+test("claudecode close installs its reason before child close and emits one cancellation", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-close-reason-"));
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    "process.stdin.resume();",
+    "process.stdin.on('end', () => process.exit(0));",
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+  const client = new ClaudeCodeProcessClient({ command: commandFile, cwd: tempDir, env: process.env });
+  const events = [];
+  client.onMessage((event) => events.push(event));
+  await client.connect();
+  client.pendingTurnId = "turn-limit";
+  client.sessionId = "11111111-1111-4111-8111-111111111111";
+  client.activeThreadId = client.sessionId;
+  const originalEnd = client.stdin.end.bind(client.stdin);
+  let reasonObservedBeforeEnd = "";
+  client.stdin.end = (...args) => {
+    reasonObservedBeforeEnd = client.expectedCloseReason;
+    return originalEnd(...args);
+  };
+
+  await client.close({ reason: "token_hard_limit" });
+
+  assert.equal(reasonObservedBeforeEnd, "token_hard_limit");
+  assert.deepEqual(events, [{
+    type: "turn.cancelled",
+    reason: "token_hard_limit",
+    sessionId: "11111111-1111-4111-8111-111111111111",
+    turnId: "turn-limit",
+  }]);
 });
 
 test("claudecode process client interrupts and resumes steering under one logical turn", async () => {
@@ -1074,7 +1109,7 @@ test("handleStopCommand passes workspaceRoot through to runtime cancellation", a
     },
     runtimeAdapter: {
       async cancelTurn(payload) {
-        calls.push(["cancel", payload.threadId, payload.turnId, payload.workspaceRoot]);
+        calls.push(["cancel", payload.threadId, payload.turnId, payload.workspaceRoot, payload.reason]);
       },
       getSessionStore() {
         return {
@@ -1103,7 +1138,7 @@ test("handleStopCommand passes workspaceRoot through to runtime cancellation", a
 
   assert.deepEqual(calls, [
     ["state", "thread-1"],
-    ["cancel", "thread-1", "turn-1", "/workspace"],
+    ["cancel", "thread-1", "turn-1", "/workspace", "user_stop"],
     ["send", "⏹️ Stop request sent\nthread: thread-1"],
   ]);
 });
@@ -1153,6 +1188,7 @@ test("handleStopCommand allows stopping while waiting for approval", async () =>
   });
 
   assert.equal(calls[0].workspaceRoot, "/workspace");
+  assert.equal(calls[0].reason, "user_stop");
   assert.equal(calls[1], "⏹️ Stop request sent\nthread: thread-1");
 });
 

@@ -1,6 +1,7 @@
 const fs = require("fs");
 function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
   const reader = createMessageReader(process.stdin);
+  const writer = createMessageWriter({ stream: process.stdout });
   const toolCatalog = toolHost.listTools();
   const resources = buildToolResources(toolCatalog);
 
@@ -14,7 +15,7 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
 
     try {
       if (method === "initialize") {
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           protocolVersion: params.protocolVersion || "2024-11-05",
           capabilities: {
             tools: {
@@ -40,19 +41,19 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
       }
 
       if (method === "ping") {
-        writeRpcResponse(id, {}, reader.getMode());
+        writer.writeRpcResponse(id, {}, reader.getMode());
         return;
       }
 
       if (method === "tools/list") {
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           tools: toolHost.listTools(),
         }, reader.getMode());
         return;
       }
 
       if (method === "resources/list") {
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           resources: resources.map((resource) => ({
             uri: resource.uri,
             name: resource.name,
@@ -67,10 +68,10 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
         const uri = typeof params.uri === "string" ? params.uri.trim() : "";
         const resource = resources.find((entry) => entry.uri === uri);
         if (!resource) {
-          writeRpcError(id, -32602, `Unknown resource: ${uri}`, reader.getMode());
+          writer.writeRpcError(id, -32602, `Unknown resource: ${uri}`, reader.getMode());
           return;
         }
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           contents: [
             {
               uri: resource.uri,
@@ -83,7 +84,7 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
       }
 
       if (method === "prompts/list") {
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           prompts: [],
         }, reader.getMode());
         return;
@@ -98,7 +99,7 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
           runtimeId,
           workspaceRoot,
         });
-        writeRpcResponse(id, {
+        writer.writeRpcResponse(id, {
           content: [
             {
               type: "text",
@@ -109,9 +110,15 @@ function runToolMcpServer({ toolHost, runtimeId = "", workspaceRoot = "" }) {
         return;
       }
 
-      writeRpcError(id, -32601, `Method not found: ${method}`, reader.getMode());
+      writer.writeRpcError(id, -32601, `Method not found: ${method}`, reader.getMode());
     } catch (error) {
-      writeRpcResponse(id, {
+      if (writer.isClosed()) {
+        return;
+      }
+      if (error?.mcpTransportWriteError) {
+        throw error;
+      }
+      writer.writeRpcResponse(id, {
         content: [
           {
             type: "text",
@@ -269,33 +276,44 @@ function findHeaderBoundary(buffer) {
   return buffer.indexOf("\n\n");
 }
 
-function writeRpcResponse(id, result, mode = "content-length") {
-  writeMessage({
-    jsonrpc: "2.0",
-    id,
-    result,
-  }, mode);
-}
+function createMessageWriter({ stream, writeSync = fs.writeSync }) {
+  let closed = false;
 
-function writeRpcError(id, code, message, mode = "content-length") {
-  writeMessage({
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code,
-      message,
-    },
-  }, mode);
-}
-
-function writeMessage(payload, mode = "content-length") {
-  const body = Buffer.from(JSON.stringify(payload), "utf8");
-  if (mode === "jsonl") {
-    fs.writeSync(process.stdout.fd, Buffer.concat([body, Buffer.from("\n", "utf8")]));
-    return;
+  function writeMessage(payload, mode = "content-length") {
+    if (closed) return false;
+    const body = Buffer.from(JSON.stringify(payload), "utf8");
+    const output = mode === "jsonl"
+      ? Buffer.concat([body, Buffer.from("\n", "utf8")])
+      : Buffer.concat([
+          Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8"),
+          body,
+        ]);
+    try {
+      writeSync(stream.fd, output);
+      return true;
+    } catch (error) {
+      if (isClosedPipeError(error)) {
+        closed = true;
+        return false;
+      }
+      error.mcpTransportWriteError = true;
+      throw error;
+    }
   }
-  const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8");
-  fs.writeSync(process.stdout.fd, Buffer.concat([header, body]));
+
+  return {
+    isClosed() { return closed; },
+    writeRpcResponse(id, result, mode = "content-length") {
+      return writeMessage({ jsonrpc: "2.0", id, result }, mode);
+    },
+    writeRpcError(id, code, message, mode = "content-length") {
+      return writeMessage({ jsonrpc: "2.0", id, error: { code, message } }, mode);
+    },
+  };
 }
 
-module.exports = { runToolMcpServer };
+function isClosedPipeError(error) {
+  return new Set(["EPIPE", "EBADF", "ERR_STREAM_DESTROYED"]).has(error?.code);
+}
+
+module.exports = { createMessageWriter, isClosedPipeError, runToolMcpServer };

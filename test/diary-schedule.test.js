@@ -21,7 +21,6 @@ test("nightly diary prompt carries the canonical four-period contract directly",
     config: {
       workspaceId: "default",
       workspaceRoot: "/workspace",
-      memoryDir: "/state/memory",
     },
     accountId: "account-1",
   });
@@ -42,8 +41,9 @@ test("nightly diary prompt carries the canonical four-period contract directly",
   assert.match(prepared.text, /If finalize succeeds with warnings, treat them as reminders only/);
   assert.match(prepared.text, /Do not revise the\s+saved diary or call finalize again for warnings/);
   assert.match(prepared.text, /tool description and this system prompt are authoritative/);
-  assert.match(prepared.text, /preference-diary-writing\.md/);
-  assert.match(prepared.text, /missing memory must never block diary finalization/);
+  assert.doesNotMatch(prepared.text, /preference-diary-writing\.md/);
+  assert.match(prepared.text, /use Ombré Brain/);
+  assert.match(prepared.text, /missing memory\s+must never block diary finalization/);
   assert.doesNotMatch(prepared.text, /cyberboss_timeline_reconcile/);
   assert.match(prepared.text, /Timeline finalization is a separate pipeline/);
 });

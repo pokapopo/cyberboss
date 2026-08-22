@@ -1,24 +1,14 @@
 const { createProjectTooling } = require("../tools/create-project-tooling");
-const { ConversationMemoryCoordinator } = require("../core/conversation-memory-coordinator");
 const { createApiServer } = require("./server");
 
 async function startApiServer(config) {
   const projectTooling = createProjectTooling(config);
-  const memoryService = projectTooling.services?.memory;
-  const memoryCoordinator = memoryService
-    ? new ConversationMemoryCoordinator({
-        memoryService,
-        extractionEveryTurns: config.memoryExtractionEveryTurns,
-        recallEveryTurns: config.memoryRecallEveryTurns,
-      })
-    : null;
   const { app, sessionPool, filesDir } = createApiServer({
     config: {
       ...config,
       workspaceRoot: config.workspaceRoot || process.cwd(),
     },
     toolHost: projectTooling.toolHost,
-    memoryCoordinator,
   });
 
   const port = config.apiPort || 3456;

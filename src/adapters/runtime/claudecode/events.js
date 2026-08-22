@@ -52,6 +52,15 @@ function mapClaudeCodeMessageToRuntimeEvent(message, raw) {
           text: typeof message.text === "string" ? message.text : "",
         },
       };
+    case "turn.cancelled":
+      return {
+        type: "runtime.turn.cancelled",
+        payload: {
+          threadId: message.sessionId,
+          turnId: message.turnId,
+          reason: normalizeString(message.reason) || "cancelled",
+        },
+      };
     case "approval.requested":
       const readableToolName = formatReadableToolName(message.toolName);
       return {

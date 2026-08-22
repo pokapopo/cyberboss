@@ -98,7 +98,7 @@ test("frontend compression summaries keep the implicit conversation key when the
   assert.equal(compressed.scopeKey, original.scopeKey);
 });
 
-test("client prompt, memory, history, and current user remain separate structured fields", () => {
+test("client prompt, history, and current user remain separate structured fields", () => {
   const payload = JSON.parse(formatConversationForAgent([
     { role: "system", content: "frontend persona" },
     { role: "user", content: "first question" },
@@ -108,10 +108,6 @@ test("client prompt, memory, history, and current user remain separate structure
   ], {
     latestUserText: "captioned latest image",
     currentDate: "2026-08-08",
-    memoryContext: {
-      recalled: [{ description: "preference", body: "likes concise replies" }],
-      recent: [{ description: "recent plan", body: "testing the API" }],
-    },
   }));
 
   assert.equal(payload.protocol, "cyberboss.turn.v1");
@@ -119,10 +115,7 @@ test("client prompt, memory, history, and current user remain separate structure
   assert.deepEqual(payload.frontend_instructions, [
     { role: "system", content: "frontend persona" },
   ]);
-  assert.deepEqual(payload.memory_context, {
-    long_term: [{ label: "preference", content: "likes concise replies" }],
-    recent: [{ label: "recent plan", content: "testing the API" }],
-  });
+  assert.equal(payload.memory_context, undefined);
   assert.deepEqual(payload.conversation_history, [
     { role: "user", content: "first question" },
     { role: "assistant", content: "first answer" },
@@ -213,7 +206,6 @@ test("streaming handler exposes server-executed tools and replays frontend histo
   const handler = createOpenAiHandler({
     sessionPool,
     config: { workspaceRoot: process.cwd() },
-    memoryCoordinator: null,
   });
   const req = {
     body: {
@@ -244,7 +236,7 @@ test("streaming handler exposes server-executed tools and replays frontend histo
     "tool.started",
     "tool.completed",
   ]);
-  assert.equal(events[1].name, "mcp__cyberboss_tools__cyberboss_memory_search");
+  assert.equal(events[1].name, "mcp__cyberboss_tools__cyberboss_worklog_search");
   assert.equal(events[2].tool_call_id, "tool-1");
   assert.equal(events[2].content, "memory result");
   assert.equal(events[2].is_error, false);
@@ -280,7 +272,6 @@ test("continuous requests without a client conversation ID reuse one runtime and
   const handler = createOpenAiHandler({
     sessionPool: pool,
     config: { workspaceRoot: process.cwd() },
-    memoryCoordinator: null,
   });
 
   const firstMessages = [{ role: "user", content: "opening" }];
@@ -316,8 +307,6 @@ test("compressed frontend history destroys the stale runtime and replays authori
   const clients = [];
   const clientOptions = [];
   const destroyed = [];
-  const prepared = [];
-  const completed = [];
   const sessions = new Map();
   const sessionPool = {
     async getOrCreate(id, options) {
@@ -339,13 +328,6 @@ test("compressed frontend history destroys the stale runtime and replays authori
   const handler = createOpenAiHandler({
     sessionPool,
     config: { workspaceRoot: process.cwd() },
-    memoryCoordinator: {
-      async prepareTurn(turn) {
-        prepared.push(turn);
-        return { recalled: [], recent: [], notices: [], reason: "" };
-      },
-      completeTurn(turn) { completed.push(turn); },
-    },
   });
 
   const first = new FakeResponse();
@@ -386,14 +368,6 @@ test("compressed frontend history destroys the stale runtime and replays authori
   assert.equal(clientOptions.length, 2);
   assert.match(clientOptions[0].systemPrompt, /current_user_message/);
   assert.deepEqual(destroyed, ["rikka-chat-1"]);
-  assert.deepEqual(prepared.map(({ scopeKey, text }) => ({ scopeKey, text })), [
-    { scopeKey: "api:rikka-chat-1", text: "opening" },
-    { scopeKey: "api:rikka-chat-1", text: "follow up" },
-  ]);
-  assert.deepEqual(completed.map(({ scopeKey, userText }) => ({ scopeKey, userText })), [
-    { scopeKey: "api:rikka-chat-1", userText: "opening" },
-    { scopeKey: "api:rikka-chat-1", userText: "follow up" },
-  ]);
 });
 
 test("handler destroys the request runtime when a turn fails before streaming", async () => {
@@ -406,7 +380,6 @@ test("handler destroys the request runtime when a turn fails before streaming", 
       async destroy(id) { destroyed.push(id); },
     },
     config: { workspaceRoot: process.cwd() },
-    memoryCoordinator: null,
   });
   const res = new FakeResponse();
 
@@ -539,7 +512,7 @@ class FakeClaudeClient {
         this.emit({
           type: "tool_use",
           toolUseId: "tool-1",
-          toolName: "mcp__cyberboss_tools__cyberboss_memory_search",
+          toolName: "mcp__cyberboss_tools__cyberboss_worklog_search",
           input: { query: "context" },
         });
         this.emit({ type: "approval", requestId: "approval-1" });

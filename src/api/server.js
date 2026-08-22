@@ -9,7 +9,7 @@ const { SessionPool } = require("./session-pool");
 const { ModelGateway } = require("../model-gateway");
 const { UsageLedger } = require("../model-gateway/usage-ledger");
 
-function createApiServer({ config, toolHost, memoryCoordinator }) {
+function createApiServer({ config, toolHost }) {
   const app = express();
   app.set("trust proxy", 1);
 
@@ -73,7 +73,7 @@ function createApiServer({ config, toolHost, memoryCoordinator }) {
   app.use(apiKeyAuth(config));
 
   // OpenAI-compatible routes
-  const openAiHandler = createOpenAiHandler({ sessionPool, config, memoryCoordinator, modelGateway });
+  const openAiHandler = createOpenAiHandler({ sessionPool, config, modelGateway });
   const modelsHandler = createModelsHandler({ config });
   app.post("/v1/chat/completions", openAiHandler);
   app.get("/v1/models", modelsHandler);

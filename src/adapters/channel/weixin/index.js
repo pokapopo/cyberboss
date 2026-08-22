@@ -17,6 +17,7 @@ const WEIXIN_MAX_DELIVERY_MESSAGES = 10;
 function createWeixinChannelAdapter(config) {
   let selectedAccount = null;
   let contextTokenCache = null;
+  let connectionState = { status: "connected", lastError: "", updatedAt: "" };
   const inboundFilter = createInboundFilter();
   let minWeixinChunk = loadWeixinConfig(config).minChunkChars;
 
@@ -141,6 +142,9 @@ function createWeixinChannelAdapter(config) {
     getKnownContextTokens() {
       return { ...ensureContextTokenCache() };
     },
+    getConnectionStatus() {
+      return { ...connectionState };
+    },
     prepareTextDelivery,
     sendTextChunk,
     loadSyncBuffer() {
@@ -154,12 +158,27 @@ function createWeixinChannelAdapter(config) {
     rememberContextToken,
     async getUpdates({ syncBuffer = "", timeoutMs = LONG_POLL_TIMEOUT_MS } = {}) {
       const account = ensureAccount();
-      const response = await getUpdates({
-        baseUrl: account.baseUrl,
-        token: account.token,
-        getUpdatesBuf: syncBuffer,
-        timeoutMs,
-      });
+      if (connectionState.status !== "session_expired") {
+        connectionState = { status: "polling", lastError: "", updatedAt: new Date().toISOString() };
+      }
+      let response;
+      try {
+        response = await getUpdates({
+          baseUrl: account.baseUrl,
+          token: account.token,
+          getUpdatesBuf: syncBuffer,
+          timeoutMs,
+        });
+        connectionState = { status: "connected", lastError: "", updatedAt: new Date().toISOString() };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "unknown error");
+        connectionState = {
+          status: /(?:401|403|session|token|expired)/i.test(message) ? "session_expired" : "error",
+          lastError: message,
+          updatedAt: new Date().toISOString(),
+        };
+        throw error;
+      }
       // Persist context tokens BEFORE advancing the sync buffer so a crash
       // between the two doesn't lose tokens for messages already consumed.
       const messages = Array.isArray(response?.msgs) ? response.msgs : [];

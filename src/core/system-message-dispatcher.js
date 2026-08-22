@@ -139,19 +139,15 @@ function formatIncrementalEvents(events, hasMore = false) {
 }
 
 function buildDiaryFinalizePrompt(timeHeader, config = {}) {
-  const memoryDir = normalizeText(config.memoryDir) || "~/.cyberboss/memory";
-  const diaryWritingPreference = `${memoryDir}/preference-diary-writing.md`;
   return [...timeHeader,
     "DIARY FINALIZE — end-of-day wrap-up.",
     "",
     "Your task. Do these in order:",
     "",
     "1. The tool description and this system prompt are authoritative for current",
-    "   diary structure and operations. If available, use Read to load the COMPLETE",
-    "   supplemental writing preference below for uu's voice/content preferences:",
-    `   - ${diaryWritingPreference}`,
-    "   If that supplemental file is absent or unreadable, continue with this prompt;",
-    "   missing memory must never block diary finalization.",
+    "   diary structure and operations. Do not depend on any retired local memory",
+    "   file. If past context is genuinely needed, use Ombré Brain; missing memory",
+    "   must never block diary finalization.",
     "2. Read today's incremental diary fragments only. Do not open or",
     "   reconstruct the main chat transcript and do not reread historical conversation.",
     "3. Merge and polish them into a single cohesive diary entry for today. Write it",

@@ -279,6 +279,14 @@ class StreamDelivery {
         this.disposeRunState(buildRunKey(threadId, turnId));
         return;
       }
+      case "runtime.turn.cancelled": {
+        const state = this.stateByRunKey.get(buildRunKey(threadId, turnId));
+        if (state) {
+          this.clearTaskProgressTimer(state);
+        }
+        this.disposeRunState(buildRunKey(threadId, turnId));
+        return;
+      }
       default:
         return;
     }

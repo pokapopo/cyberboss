@@ -551,38 +551,6 @@ test("tool host exposes agent-visible work-log and verified experience tools", a
   assert.equal(recorded.data.entry.id, "exp-2");
 });
 
-test("tool host exposes semantic memory search and explicit candidate review", async () => {
-  const host = createHost();
-  const tools = host.listTools();
-  const memorySearch = tools.find((tool) => tool.name === "cyberboss_memory_search");
-  const memoryCandidates = tools.find((tool) => tool.name === "cyberboss_memory_candidates");
-  const memoryReview = tools.find((tool) => tool.name === "cyberboss_memory_candidate_review");
-  const memoryRefresh = tools.find((tool) => tool.name === "cyberboss_memory_index_refresh");
-
-  assert.match(memorySearch.description, /Semantically search/i);
-  assert.match(memoryCandidates.description, /No changes were made|pending long-term memory/i);
-  assert.match(memoryReview.description, /only after the user explicitly confirms/i);
-  assert.match(memoryRefresh.description, /after directly creating, editing, renaming, or deleting/i);
-
-  const search = await host.invokeTool("cyberboss_memory_search", {
-    query: "怎么回复技术问题",
-    limit: 3,
-  });
-  const candidates = await host.invokeTool("cyberboss_memory_candidates", {
-    limit: 5,
-  });
-  const reviewed = await host.invokeTool("cyberboss_memory_candidate_review", {
-    candidateId: "memory-candidate-1",
-    action: "approve",
-  });
-  const refreshed = await host.invokeTool("cyberboss_memory_index_refresh", {});
-
-  assert.equal(search.data.entries[0].file, "preference-tone.md");
-  assert.equal(candidates.data.candidates[0].id, "memory-candidate-1");
-  assert.equal(reviewed.data.saved.file, "preference-reply-style.md");
-  assert.equal(refreshed.data.total, 92);
-});
-
 test("tool host exposes whereabouts tools from the external dependency", async () => {
   const host = createHost();
   const tools = host.listTools();
