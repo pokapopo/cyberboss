@@ -14,6 +14,7 @@ class BackgroundContinuityBridge {
     return this.store?.consume?.(ids) || 0;
   }
   failThread(threadId) { this.pendingIdsByThread.delete(threadId); }
+  clearScope(scope) { return this.store?.consumeScope?.(scope) || 0; }
   recordDelivered({ bindingKey = "", workspaceRoot = "", threadId = "", text = "" } = {}) {
     if (!bindingKey.includes("::background:") || !text) return null;
     return this.store?.record?.({ scope: `${bindingKey}::${workspaceRoot}`, kind: "outbound_message", triggerKind: bindingKey.split("::background:")[1] || "system", threadId, text });

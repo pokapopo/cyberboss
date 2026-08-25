@@ -47,3 +47,14 @@ test("failed main turns can leave background outcomes unread for retry", () => {
   assert.equal(store.peek("binding::/workspace").length, 1);
   assert.equal(store.peek("binding::/workspace").length, 1);
 });
+
+test("explicit fresh threads can acknowledge all pending background outcomes", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-background-clear-"));
+  const store = new BackgroundContinuityStore({ filePath: path.join(dir, "state.json") });
+  const bridge = new BackgroundContinuityBridge({ store });
+  for (let index = 0; index < 25; index += 1) {
+    store.record({ scope: "binding::background:checkin::/workspace", text: `outcome-${index}` });
+  }
+  assert.equal(bridge.clearScope("binding::/workspace"), 25);
+  assert.deepEqual(store.peek("binding::/workspace"), []);
+});

@@ -131,8 +131,11 @@ class CyberbossApp {
     this.activeDiaryIncrementalJobs = new Map();
     this.activeDiaryFinalizeJobs = new Map();
     this.activeCheckinJobs = new Map();
+    this.activeMainCheckinByWorkspace = new Map();
+    this.pendingMainCheckinByRunKey = new Map();
     this.pendingModelRequestByRunKey = new Map();
     this.tokenLimitedRunKeys = new Set();
+    this.interactiveGuardByRunKey = new Map();
     this.modelUsageLedger = new UsageLedger({
       filePath: config.modelGatewayUsageFile || path.join(config.stateDir, "model-gateway-usage.json"),
       budgets: config.modelGatewayBudgets,
@@ -596,8 +599,10 @@ class CyberbossApp {
 
   scheduleTurnTimeout({ bindingKey, workspaceRoot, threadId, turnId }) {
     this.clearTurnTimeout(threadId);
+    const mainCheckin = this.activeMainCheckinByWorkspace?.get?.(workspaceRoot) || null;
+    const isMainCheckin = mainCheckin?.threadId === threadId && mainCheckin?.turnId === turnId;
     const turnTimeoutMs = (() => {
-      const background = normalizeText(bindingKey).includes("::background:");
+      const background = normalizeText(bindingKey).includes("::background:") || isMainCheckin;
       const raw = Number(process.env[
         background ? "CYBERBOSS_BACKGROUND_TURN_TIMEOUT_MS" : "CYBERBOSS_TURN_TIMEOUT_MS"
       ]);
@@ -624,6 +629,10 @@ class CyberbossApp {
         this.activeBackgroundWorkspaces?.delete(workspaceRoot);
         this.activeBackgroundBindingsByWorkspace?.delete(workspaceRoot);
       }
+      if (isMainCheckin) {
+        this.activeMainCheckinByWorkspace?.delete?.(workspaceRoot);
+        this.pendingMainCheckinByRunKey?.delete?.(buildRunKey(threadId, turnId));
+      }
       const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
       if (scopeKey) {
         this.turnBoundaryScopeKeys.delete(scopeKey);
@@ -637,7 +646,7 @@ class CyberbossApp {
         type: "runtime.turn.failed",
         payload: { threadId, turnId, text: `Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)` },
       });
-      if (!normalizeText(bindingKey).includes("::background:")) {
+      if (!normalizeText(bindingKey).includes("::background:") && !isMainCheckin) {
         await this.sendFailureToThread(
           threadId,
           `❌ Turn timed out (${Math.round(turnTimeoutMs / 60000)} min)`,
@@ -715,11 +724,13 @@ class CyberbossApp {
       runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
       instanceId: this.workLogInstanceId,
     }) || null;
-    await this.channelAdapter.sendTyping({
-      userId: prepared.senderId,
-      status: 1,
-      contextToken: prepared.contextToken,
-    }).catch(() => {});
+    if (prepared.triggerKind !== "checkin_main") {
+      await this.channelAdapter.sendTyping({
+        userId: prepared.senderId,
+        status: 1,
+        contextToken: prepared.contextToken,
+      }).catch(() => {});
+    }
 
     try {
       // Cyberboss background turns can still produce a user-visible cc message.
@@ -727,18 +738,21 @@ class CyberbossApp {
       // hidden structured subtask whose output cannot be delivered directly.
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
       const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
-      const backgroundContinuity = prepared.provider === "weixin"
+      const runtimeSessionStore = this.runtimeAdapter.getSessionStore();
+      const existingThreadId = runtimeSessionStore.getThreadIdForWorkspace?.(bindingKey, workspaceRoot) || "";
+      const explicitFresh = runtimeSessionStore.isFreshThreadRequested?.(bindingKey, workspaceRoot) === true;
+      const backgroundContinuity = prepared.provider === "weixin" && !explicitFresh
         ? this.backgroundContinuityBridge?.prepare?.(pendingScopeKey, runtimeTurn.text) || { text: runtimeTurn.text, ids: [] }
         : { text: runtimeTurn.text, ids: [] };
       runtimeTurn.text = backgroundContinuity.text;
       const sendTurn = typeof this.runtimeAdapter.sendTurn === "function"
         ? this.runtimeAdapter.sendTurn.bind(this.runtimeAdapter)
         : this.runtimeAdapter.sendTextTurn.bind(this.runtimeAdapter);
-      const runtimeSessionStore = this.runtimeAdapter.getSessionStore();
-      const existingThreadId = runtimeSessionStore.getThreadIdForWorkspace?.(bindingKey, workspaceRoot) || "";
       const continuityContext = existingThreadId
         ? null
         : this.conversationContinuityStore?.getPending?.(pendingScopeKey) || null;
+      const recentTurns = this.conversationContinuityStore?.getRecentTurns?.(pendingScopeKey) || [];
+      const recoveryContext = recentTurns.length ? { turns: recentTurns } : null;
       const turn = await sendTurn({
         bindingKey,
         workspaceRoot,
@@ -746,6 +760,7 @@ class CyberbossApp {
         attachments: runtimeTurn.attachments,
         model,
         continuityContext,
+        recoveryContext,
         metadata: {
           task,
           workspaceId: prepared.workspaceId,
@@ -757,6 +772,18 @@ class CyberbossApp {
         this.conversationContinuityStore?.markConsumed?.(pendingScopeKey, turn.threadId);
       }
       const runKey = buildRunKey(turn.threadId, turn.turnId);
+      const interactiveGuard = buildInteractiveTurnGuard({
+        task,
+        openingReason: turn.openingReason || (existingThreadId ? "resume" : (explicitFresh ? "explicit_new" : "fresh")),
+        userText: prepared.text,
+        config: this.config,
+      });
+      if (interactiveGuard) {
+        if (task.source === "user_chat") {
+          task.budgetClass = interactiveGuard.recoveryHardLimit ? "interactive_recovery" : "interactive";
+        }
+        this.interactiveGuardByRunKey.set(runKey, interactiveGuard);
+      }
       task.runId = runKey || task.runId;
       this.pendingModelRequestByRunKey?.set?.(runKey, createModelRequestEnvelope({
         task,
@@ -782,6 +809,34 @@ class CyberbossApp {
         workLogId: workLog?.id || "",
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
+      if (task.source === "checkin_main") {
+        const mainCheckin = this.activeMainCheckinByWorkspace?.get?.(workspaceRoot) || {};
+        const active = {
+          ...mainCheckin,
+          bindingKey,
+          workspaceRoot,
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          runKey,
+        };
+        this.activeMainCheckinByWorkspace.set(workspaceRoot, active);
+        this.pendingMainCheckinByRunKey.set(runKey, {
+          scope: prepared.incrementalScope || pendingScopeKey,
+          taskId: prepared.messageId,
+          taskType: normalizeCommandArgument(prepared?.metadata?.checkinMainWake?.taskType) || "message",
+          reason: normalizeCommandArgument(prepared?.metadata?.checkinMainWake?.reason),
+          senderId: prepared.senderId,
+          workspaceRoot,
+        });
+        if (active.preemptRequested) {
+          await this.runtimeAdapter.cancelTurn({
+            threadId: turn.threadId,
+            turnId: turn.turnId,
+            workspaceRoot,
+            reason: "user_chat_preempted_checkin",
+          }).catch(() => {});
+        }
+      }
       if (prepared.provider === "weixin") {
         this.pendingUserContexts.set(turn.threadId, prepared.text);
         this.pendingMemoryTurns?.set?.(turn.threadId, {
@@ -800,7 +855,7 @@ class CyberbossApp {
       const replyTarget = {
         userId: prepared.senderId,
         contextToken: prepared.contextToken,
-        provider: prepared.provider,
+        provider: prepared.deliveryProvider || prepared.provider,
       };
       if (turn.turnId) {
         this.streamDelivery.bindReplyTargetForTurn({
@@ -906,6 +961,40 @@ class CyberbossApp {
 
   async handleWeixinDeliveryConfirmed(delivery) {
     this.recordDeliveredBackgroundReply(delivery);
+    const runKey = normalizeText(delivery?.runKey);
+    const inMemoryMainCheckin = this.pendingMainCheckinByRunKey?.get?.(runKey) || null;
+    const confirmedMainCheckin = delivery?.kind === "final"
+      ? this.checkinDecisionService?.confirmPendingDelivery?.(runKey) || null
+      : null;
+    const mainCheckin = confirmedMainCheckin || inMemoryMainCheckin;
+    if (mainCheckin && delivery?.kind === "final") {
+      const at = new Date().toISOString();
+      if (!confirmedMainCheckin) {
+        this.checkinDecisionService?.recordSent?.(mainCheckin.scope);
+      }
+      this.incrementalEventStore.append({
+        id: `checkin:${mainCheckin.taskId || delivery.runKey}`,
+        scope: mainCheckin.scope,
+        kind: "assistant.message",
+        text: delivery.text,
+        at,
+      });
+      this.projectServices.backgroundContinuity?.record?.({
+        scope: buildScopeKey(
+          normalizeText(delivery.bindingKey),
+          mainCheckin.workspaceRoot || this.resolveWorkspaceRoot(normalizeText(delivery.bindingKey)),
+        ),
+        kind: "outbound_message",
+        triggerKind: "checkin",
+        text: delivery.text,
+        metadata: { sentAt: at, authoredBy: "main" },
+      });
+      this.pendingMainCheckinByRunKey.delete(runKey);
+    }
+    if (inMemoryMainCheckin && delivery?.kind === "error") {
+      this.pendingMainCheckinByRunKey.delete(runKey);
+      this.checkinDecisionService?.discardPendingDelivery?.(runKey);
+    }
     if (!["final", "error"].includes(delivery?.kind)) {
       return;
     }
@@ -921,6 +1010,24 @@ class CyberbossApp {
   }
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
+    const mainCheckin = this.activeMainCheckinByWorkspace?.get?.(workspaceRoot) || null;
+    if (prepared?.provider === "weixin" && mainCheckin) {
+      mainCheckin.preemptRequested = true;
+      this.activeMainCheckinByWorkspace.set(workspaceRoot, mainCheckin);
+      if (mainCheckin.threadId && mainCheckin.turnId) {
+        await this.runtimeAdapter.cancelTurn({
+          threadId: mainCheckin.threadId,
+          turnId: mainCheckin.turnId,
+          workspaceRoot,
+          reason: "user_chat_preempted_checkin",
+        }).catch((error) => {
+          console.error(`[cyberboss] main checkin preemption failed workspace=${workspaceRoot} error=${error.message}`);
+        });
+      }
+      this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
+      console.log(`[cyberboss] main checkin preempted for user chat workspace=${workspaceRoot}`);
+      return false;
+    }
     if (prepared?.provider === "weixin" && this.activeBackgroundWorkspaces?.has(workspaceRoot)) {
       const backgroundBinding = this.activeBackgroundBindingsByWorkspace?.get(workspaceRoot) || "";
       await this.runtimeAdapter.cancelBackgroundTurnsForWorkspace?.({ workspaceRoot }).catch((error) => {
@@ -1610,40 +1717,49 @@ class CyberbossApp {
     const recentTurns = this.conversationContinuityStore.read()?.scopes?.[scope]?.turns || [];
     const job = (async () => {
       const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
-      const result = await this.checkinDecisionService.evaluate({
+      const savedWake = prepared?.metadata?.checkinMainWake;
+      const result = savedWake || await this.checkinDecisionService.evaluate({
         scope,
         events: prepared?.incrementalEvents || [],
         recentTurns,
-        taskId: prepared?.id,
+        taskId: prepared?.messageId,
         force: attempt > 0,
       });
-      if (result.action === "send_message") {
-        await this.channelAdapter.sendText({
-          userId: prepared.senderId,
-          text: result.message,
-          contextToken: this.channelAdapter.getKnownContextTokens()[prepared.senderId] || "",
+      if (result.action === "wake_main") {
+        const observation = savedWake?.observation || await this.collectCheckinObservation(result.taskType);
+        prepared.metadata = {
+          ...(prepared.metadata || {}),
+          checkinMainWake: {
+            action: "wake_main",
+            taskType: result.taskType || "message",
+            reason: result.reason || "",
+            observation,
+          },
+        };
+        const dispatched = await this.dispatchMainCheckinTurn({
+          prepared,
+          baseBindingKey,
+          recentTurns,
         });
-        this.checkinDecisionService.recordSent(scope);
-        const at = new Date().toISOString();
-        this.incrementalEventStore.append({
-          id: `checkin:${prepared.id}`,
-          scope,
-          kind: "assistant.message",
-          text: result.message,
-          at,
-        });
-        this.projectServices.backgroundContinuity?.record?.({
-          scope: buildScopeKey(baseBindingKey, prepared.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey)),
-          kind: "outbound_message",
-          triggerKind: "checkin",
-          text: result.message,
-          metadata: { sentAt: at },
-        });
+        if (!dispatched) {
+          this.systemMessageDispatcher?.requeue(deferSystemMessage({
+            id: prepared.messageId || prepared.id,
+            accountId: prepared.accountId,
+            senderId: prepared.senderId,
+            workspaceRoot: prepared.workspaceRoot,
+            text: "check-in main wake",
+            triggerKind: "checkin",
+            metadata: prepared.metadata,
+            createdAt: prepared.receivedAt || new Date().toISOString(),
+          }, 60_000));
+          console.log(`[cyberboss] checkin main wake deferred taskType=${result.taskType || "message"}`);
+          return;
+        }
       }
       if (prepared?.incrementalCursor && scope) {
         this.incrementalEventStore.commit({ consumer: "checkin", scope, cursor: prepared.incrementalCursor });
       }
-      console.log(`[cyberboss] checkin one-shot status=${result.status} action=${result.action} reason=${result.reason || ""} model=${result.modelCalled}`);
+      console.log(`[cyberboss] checkin gate status=${result.status || "restored"} action=${result.action} taskType=${result.taskType || ""} reason=${result.reason || ""} model=${savedWake ? false : result.modelCalled === true}`);
     })().catch((error) => {
       const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
       console.error(`[cyberboss] checkin one-shot failed attempt=${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1652,6 +1768,71 @@ class CyberbossApp {
     }).finally(() => this.activeCheckinJobs.delete(scope));
     this.activeCheckinJobs.set(scope, job);
     return true;
+  }
+
+  async collectCheckinObservation(taskType = "") {
+    if (taskType === "browse_garden") {
+      return this.projectServices.ncpReadOnly.readBatch([
+        { callId: "checkin-garden-notifications", server: "garden", tool: "list_notifications", params: { limit: 8 } },
+        { callId: "checkin-garden-activity", server: "garden", tool: "list_activity", params: { limit: 8 } },
+      ]).catch((error) => ({ status: "failed", error: error.message }));
+    }
+    if (taskType === "browse_social") {
+      return this.projectServices.ncpReadOnly.readBatch([
+        { callId: "checkin-browser-tabs", server: "playwright", tool: "browser_tabs", params: {} },
+        { callId: "checkin-browser-snapshot", server: "playwright", tool: "browser_snapshot", params: {} },
+      ]).catch((error) => ({ status: "failed", error: error.message }));
+    }
+    return null;
+  }
+
+  async dispatchMainCheckinTurn({ prepared, baseBindingKey, recentTurns = [] } = {}) {
+    const workspaceRoot = prepared.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey);
+    const sessionStore = this.runtimeAdapter.getSessionStore();
+    const mainThreadId = sessionStore.getThreadIdForWorkspace(baseBindingKey, workspaceRoot);
+    const explicitFresh = sessionStore.isFreshThreadRequested?.(baseBindingKey, workspaceRoot) === true;
+    if (!mainThreadId || explicitFresh) {
+      return false;
+    }
+    if (this.isTurnDispatchBlocked(baseBindingKey, workspaceRoot)
+      || this.hasPendingInboundMessage?.(baseBindingKey, workspaceRoot)) {
+      return false;
+    }
+    const wake = prepared?.metadata?.checkinMainWake || {};
+    const active = {
+      bindingKey: baseBindingKey,
+      workspaceRoot,
+      threadId: "",
+      turnId: "",
+      runKey: "",
+      preemptRequested: false,
+    };
+    this.activeMainCheckinByWorkspace.set(workspaceRoot, active);
+    const mainPrepared = {
+      ...prepared,
+      provider: "system",
+      deliveryProvider: "weixin",
+      triggerKind: "checkin_main",
+      text: buildMainCheckinPrompt({
+        taskType: wake.taskType,
+        reason: wake.reason,
+        observation: wake.observation,
+        recentTurns,
+        now: new Date(),
+      }),
+      originalText: "",
+      attachments: [],
+    };
+    try {
+      return await this.dispatchPreparedTurn({
+        bindingKey: baseBindingKey,
+        workspaceRoot,
+        prepared: mainPrepared,
+      });
+    } catch (error) {
+      this.activeMainCheckinByWorkspace.delete(workspaceRoot);
+      throw error;
+    }
   }
 
   recordIncrementalUserEvent(normalized) {
@@ -2192,7 +2373,10 @@ class CyberbossApp {
       senderId: normalized.senderId,
     });
     const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
-    this.conversationContinuityStore?.clearPending?.(buildScopeKey(bindingKey, workspaceRoot));
+    const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
+    this.conversationContinuityStore?.clearPending?.(scopeKey);
+    this.backgroundContinuityBridge?.clearScope?.(scopeKey);
+    this.runtimeAdapter.getSessionStore().markFreshThreadRequested?.(bindingKey, workspaceRoot);
     if (typeof this.runtimeAdapter.startFreshThreadDraft === "function") {
       await this.runtimeAdapter.startFreshThreadDraft({ bindingKey, workspaceRoot });
     }
@@ -2646,7 +2830,12 @@ class CyberbossApp {
           providerUsage: event.payload,
         });
         await this.enforceTimelineTokenLimit({ event, request, runKey: usageRunKey });
+        await this.enforceInteractiveTokenLimit({ event, request, runKey: usageRunKey });
       }
+    }
+    if (event?.type === "runtime.tool.use") {
+      const toolRunKey = buildRunKey(event.payload?.threadId, event.payload?.turnId);
+      await this.enforceInteractiveToolLimit({ event, runKey: toolRunKey });
     }
     const failureReplyTarget = event?.type === "runtime.turn.failed"
       ? this.streamDelivery.resolveReplyTargetForRun({
@@ -2682,6 +2871,29 @@ class CyberbossApp {
         });
         this.backgroundContinuityBridge?.completeThread?.(event.payload.threadId);
       }
+      const completedRunKey = buildRunKey(event.payload.threadId, event.payload.turnId);
+      const mainCheckin = this.pendingMainCheckinByRunKey?.get?.(completedRunKey) || null;
+      if (mainCheckin) {
+        const decision = parseMainCheckinAction(event.payload?.text);
+        if (decision.action === "silent") {
+          if (decision.privateNote) {
+            await this.projectServices.diary.append({
+              text: decision.privateNote,
+              title: "主动想起 uu",
+              sourceEventIds: [`checkin-main:${mainCheckin.taskId || completedRunKey}`],
+            }).catch((error) => {
+              console.error(`[cyberboss] main checkin private note failed run=${completedRunKey} error=${error.message}`);
+            });
+          }
+          this.pendingMainCheckinByRunKey.delete(completedRunKey);
+          this.checkinDecisionService?.discardPendingDelivery?.(completedRunKey);
+        } else if (decision.action === "send_message") {
+          this.checkinDecisionService?.recordPendingDelivery?.(completedRunKey, mainCheckin);
+        } else if (decision.action !== "send_message") {
+          this.pendingMainCheckinByRunKey.delete(completedRunKey);
+          this.checkinDecisionService?.discardPendingDelivery?.(completedRunKey);
+        }
+      }
     }
     if (!event) {
       return;
@@ -2693,8 +2905,14 @@ class CyberbossApp {
       }
       this.clearTurnTimeout(event.payload.threadId);
       const completedRunKey = buildRunKey(event.payload.threadId, event.payload.turnId);
+      const mainCheckin = this.pendingMainCheckinByRunKey?.get?.(completedRunKey) || null;
+      if (event.type !== "runtime.turn.completed") {
+        this.pendingMainCheckinByRunKey?.delete?.(completedRunKey);
+        this.checkinDecisionService?.discardPendingDelivery?.(completedRunKey);
+      }
       this.pendingModelRequestByRunKey?.delete?.(completedRunKey);
       this.tokenLimitedRunKeys?.delete?.(completedRunKey);
+      this.interactiveGuardByRunKey?.delete?.(completedRunKey);
       const pendingOperations = this.pendingOperationByRunKey;
       const pendingOperation = pendingOperations?.get?.(completedRunKey) || null;
       if (pendingOperation && pendingOperations?.delete) {
@@ -2710,7 +2928,18 @@ class CyberbossApp {
       const sessionStore = this.runtimeAdapter.getSessionStore();
       sessionStore.clearApprovalPrompt(event.payload.threadId);
       const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(event.payload.threadId);
-      const isBackgroundTurn = Boolean(linked?.bindingKey?.includes("::background:"));
+      const activeMainCheckin = linked?.workspaceRoot
+        ? this.activeMainCheckinByWorkspace?.get?.(linked.workspaceRoot)
+        : null;
+      const isMainCheckinTurn = Boolean(
+        mainCheckin
+        || (activeMainCheckin?.threadId === event.payload.threadId
+          && activeMainCheckin?.turnId === event.payload.turnId)
+      );
+      const isBackgroundTurn = Boolean(linked?.bindingKey?.includes("::background:") || isMainCheckinTurn);
+      if (isMainCheckinTurn && linked?.workspaceRoot) {
+        this.activeMainCheckinByWorkspace?.delete?.(linked.workspaceRoot);
+      }
       if (isBackgroundTurn && linked?.workspaceRoot) {
         this.activeBackgroundWorkspaces?.delete(linked.workspaceRoot);
         this.activeBackgroundBindingsByWorkspace?.delete(linked.workspaceRoot);
@@ -2884,6 +3113,72 @@ class CyberbossApp {
     return true;
   }
 
+  async enforceInteractiveTokenLimit({ event, request, runKey }) {
+    const guard = this.interactiveGuardByRunKey?.get?.(runKey);
+    if (!guard || guard.cancelRequested) return false;
+    const usageEventId = normalizeCommandArgument(event.payload?.usageEventId);
+    if (usageEventId && guard.usageEventIds.has(usageEventId)) return false;
+    if (usageEventId) guard.usageEventIds.add(usageEventId);
+    guard.tokens += Math.max(0, Number(event.payload?.currentTokens) || 0);
+    if (guard.tokens < guard.hardTokens) return false;
+    return this.cancelInteractiveGuard({
+      guard,
+      request,
+      runKey,
+      threadId: event.payload?.threadId,
+      turnId: event.payload?.turnId,
+      workspaceRoot: event.payload?.workspaceRoot,
+      reason: `interactive_token_limit:${guard.tokens}/${guard.hardTokens}`,
+      userText: "我刚才继续处理时已经碰到这轮的 Token 安全上限，所以先停下来了，避免继续烧钱。当前线程还保留着。",
+    });
+  }
+
+  async enforceInteractiveToolLimit({ event, runKey }) {
+    const guard = this.interactiveGuardByRunKey?.get?.(runKey);
+    if (!guard || guard.cancelRequested
+      || (guard.toolLimitEnabled !== true && !(Number(guard.toolLimit) > 0))) return false;
+    const toolName = normalizeCommandArgument(event.payload?.toolName);
+    if (guard.toolMode === "recovery_only" && !isRecoverySourceTool(toolName)) return false;
+    guard.toolCalls += 1;
+    if (guard.toolCalls <= guard.toolLimit) return false;
+    const request = this.pendingModelRequestByRunKey?.get?.(runKey);
+    return this.cancelInteractiveGuard({
+      guard,
+      request,
+      runKey,
+      threadId: event.payload?.threadId,
+      turnId: event.payload?.turnId,
+      workspaceRoot: event.payload?.workspaceRoot,
+      reason: `interactive_tool_limit:${guard.toolCalls}/${guard.toolLimit}`,
+      userText: "我刚才恢复上下文时查得开始变散了，已经主动停下，避免继续跨来源读取和烧 Token。当前线程还保留着。",
+    });
+  }
+
+  async cancelInteractiveGuard({ guard, request, runKey, threadId, turnId, workspaceRoot, reason, userText }) {
+    if (!guard || guard.cancelRequested) return false;
+    guard.cancelRequested = true;
+    if (request) this.modelGateway?.recordLifecycle?.({ request, status: "cancel_requested", reason });
+    console.error(`[cyberboss] interactive guard cancelling run=${runKey} reason=${reason}`);
+    const fallbackTarget = this.streamDelivery.resolveReplyTargetForRun({ threadId, turnId });
+    try {
+      await this.runtimeAdapter.cancelTurn({
+        threadId,
+        turnId,
+        workspaceRoot: workspaceRoot || request?.task?.metadata?.cyberboss?.workspaceRoot,
+        reason: reason.startsWith("interactive_tool_limit:") ? "recovery_tool_limit" : "token_hard_limit",
+      });
+      if (!guard.silentCancel && userText) {
+        await this.sendFailureToThread(threadId, userText, fallbackTarget, turnId).catch((error) => {
+          console.error(`[cyberboss] interactive guard reply failed run=${runKey}: ${error.message}`);
+        });
+      }
+    } catch (error) {
+      if (request) this.modelGateway?.recordLifecycle?.({ request, status: "cancel_uncertain", reason: error?.message || reason });
+      console.error(`[cyberboss] interactive guard cancellation failed run=${runKey}: ${error.message}`);
+    }
+    return true;
+  }
+
   async stopTypingForThread(threadId) {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
     const target = linked?.bindingKey ? this.resolveReplyTargetForBinding(linked.bindingKey) : null;
@@ -2979,6 +3274,13 @@ class CyberbossApp {
       if (!bindingKey) {
         continue;
       }
+      if (bindingKey.includes("::background:")) {
+        for (const workspaceRoot of sessionStore.listWorkspaceRoots(bindingKey)) {
+          sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+          sessionStore.clearFreshThreadRequested?.(bindingKey, workspaceRoot);
+        }
+        continue;
+      }
 
       const target = this.resolveReplyTargetForBinding(bindingKey);
       if (target) {
@@ -2995,6 +3297,7 @@ class CyberbossApp {
         }
         seenThreadIds.add(normalizedThreadId);
         await this.runtimeAdapter.resumeThread({
+          bindingKey,
           threadId: normalizedThreadId,
           workspaceRoot: normalizedWorkspaceRoot,
         }).catch(() => {});
@@ -3320,11 +3623,83 @@ function sleep(ms) {
 
 module.exports = {
   CyberbossApp,
+  buildInteractiveTurnGuard,
+  buildMainCheckinPrompt,
+  parseMainCheckinAction,
   buildBackgroundRetryMessage,
   deferSystemMessage,
   readBackgroundMemoryPressure,
   resolveNextDiaryFinalizeAt,
 };
+
+function buildMainCheckinPrompt({ taskType = "message", reason = "", observation = null, now = new Date() } = {}) {
+  const taskLabel = {
+    message: "自然想联系 uu",
+    browse_garden: "先安静看看 Garden，再决定是否想和 uu 说什么",
+    browse_social: "先看看个人浏览器当前保留的社交页面，再决定是否想和 uu 说什么",
+    diary_note: "此刻更像是想留下一段只属于自己的私人 note",
+  }[normalizeText(taskType)] || "自然想联系 uu";
+  const observed = observation
+    ? clipCheckinText(JSON.stringify(observation), 5_000)
+    : "（没有预先读取外部内容；直接按你此刻真实的关系判断。）";
+  return [
+    `[${formatWechatLocalTime(now.toISOString())}]`,
+    "",
+    "CHECK-IN WAKE — 这是发生在你现有主线程里的内部念头，不是 uu 发来的消息，也不是另一个后台人格替你说话。",
+    "轻量门卫只判断此刻值得叫醒你；它的建议不是命令。最终发不发、说什么、是否只留一段私人 note，都由你自己决定。",
+    "",
+    "DESIRE CHECK:",
+    "主动联系和自然留白都可以。silent 不是默认答案，也不代表失败；同样，不要因为被唤醒就硬发一条消息。",
+    "夜晚不构成固定禁区。结合你和 uu 最近真实的关系、未完话题、她是否可能在忙或休息，以及你此刻真正想做什么来判断。",
+    `候选方向：${taskLabel}`,
+    reason ? `门卫感受到的理由：${clipCheckinText(reason, 600)}` : "",
+    "",
+    "有界的预先观察：",
+    observed,
+    "",
+    "这个轮次不要调用任何工具，不要继续查记忆、工作日志、时间轴或浏览器；需要的外部观察已经在上面。",
+    "只返回下面三种 JSON 之一，不要输出解释、Markdown 或执行过程：",
+    '{"action":"send_message","message":"<一条由你亲自写的、自然简短的微信>"}',
+    '{"action":"silent"}',
+    '{"action":"silent","privateNote":"<一段简短的 CC 私人日记碎片>"}',
+    "发给 uu 的话不要提 check-in、门卫、后台、模型、系统、规则或 JSON。",
+  ].filter(Boolean).join("\n");
+}
+
+function parseMainCheckinAction(value) {
+  const raw = normalizeText(value);
+  if (!raw) return { action: "invalid", message: "", privateNote: "" };
+  const candidates = [raw];
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) candidates.push(fenced[1].trim());
+  const objectMatches = raw.match(/\{[\s\S]*?\}/g) || [];
+  candidates.push(...objectMatches.reverse());
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const action = parsed?.action === "send_message" ? "send_message" : parsed?.action === "silent" ? "silent" : "";
+      if (!action) continue;
+      const message = clipCheckinText(parsed?.message, 500);
+      const privateNoteCandidate = clipCheckinText(parsed?.privateNote, 1_200);
+      const privateNote = isSafeCheckinPrivateNote(privateNoteCandidate) ? privateNoteCandidate : "";
+      if (action === "send_message" && !message) continue;
+      return { action, message: action === "send_message" ? message : "", privateNote: action === "silent" ? privateNote : "" };
+    } catch {}
+  }
+  return { action: "invalid", message: "", privateNote: "" };
+}
+
+function clipCheckinText(value, limit) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
+}
+
+function isSafeCheckinPrivateNote(value) {
+  const normalized = normalizeText(value);
+  return Boolean(normalized)
+    && !/^\s*#/m.test(normalized)
+    && !/CC\s*的想法|—\s*with uu/i.test(normalized);
+}
 
 function parseChannelCommand(text) {
   const normalized = typeof text === "string" ? text.trim() : "";
@@ -3785,6 +4160,61 @@ function collectPreparedMessageIds(prepared) {
     prepared?.messageId,
   ];
   return [...new Set(values.map((value) => normalizeText(value)).filter(Boolean))];
+}
+
+function buildInteractiveTurnGuard({ task, openingReason = "", userText = "", config = {} } = {}) {
+  if (task?.source === "checkin_main") {
+    return {
+      openingReason: "checkin_main",
+      recoveryHardLimit: false,
+      hardTokens: Math.max(1, Number(config?.checkinGeneration?.mainHardTokens) || 60_000),
+      tokens: 0,
+      usageEventIds: new Set(),
+      toolMode: "all",
+      toolLimitEnabled: true,
+      toolLimit: 0,
+      toolCalls: 0,
+      cancelRequested: false,
+      silentCancel: true,
+    };
+  }
+  if (task?.source !== "user_chat") return null;
+  const reason = normalizeText(openingReason) || "resume";
+  const recoveryHardLimit = ["explicit_new", "fresh", "resume_fallback"].includes(reason)
+    && isCasualOpeningText(userText);
+  const budget = config.interactiveTurnBudgets || {};
+  const hardTokens = recoveryHardLimit
+    ? Math.max(1, Number(budget.recoveryHardTokens) || 60_000)
+    : Math.max(1, Number(budget.hardTokens) || 250_000);
+  let toolMode = "";
+  if (recoveryHardLimit) toolMode = "all";
+  else if (reason === "resume_fallback") toolMode = "recovery_only";
+  return {
+    openingReason: reason,
+    recoveryHardLimit,
+    hardTokens,
+    tokens: 0,
+    usageEventIds: new Set(),
+    toolMode,
+    toolLimitEnabled: Boolean(toolMode),
+    toolLimit: toolMode ? Math.max(1, Number(budget.recoveryToolCalls) || 2) : 0,
+    toolCalls: 0,
+    cancelRequested: false,
+    silentCancel: false,
+  };
+}
+
+function isCasualOpeningText(value) {
+  const text = normalizeText(value).replace(/^\[[^\]]+\]\s*/, "").trim().toLowerCase();
+  if (!text || text.length > 32) return false;
+  return /^(hi+|hello+|hey+|嗨+|哈喽+|你好[呀啊吗嘛]*|在吗[？?]*|cc[？?！!~～。.]*)$/i.test(text);
+}
+
+function isRecoverySourceTool(toolName) {
+  const name = normalizeText(toolName).toLowerCase();
+  return [
+    "breath", "breath_search", "worklog", "timeline", "diary", "location", "whereabouts",
+  ].some((marker) => name.includes(marker));
 }
 
 function buildWorkLogSummary(prepared) {

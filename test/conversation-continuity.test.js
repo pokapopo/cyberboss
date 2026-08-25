@@ -22,6 +22,7 @@ test("continuity store keeps six recent visible turns under the character cap", 
   assert.equal(pending.turns[0].user, "user-2");
   assert.equal(pending.turns.at(-1).assistant, "reply-7");
   assert.ok(pending.turns.reduce((sum, turn) => sum + turn.user.length + turn.assistant.length, 0) <= MAX_TAIL_CHARS);
+  assert.deepEqual(store.getRecentTurns("scope"), pending.turns);
 });
 
 test("auto rollover starts at 85 percent and stages a fresh session without touching memory", async () => {

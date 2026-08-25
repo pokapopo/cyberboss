@@ -62,6 +62,23 @@ class BackgroundContinuityStore {
     return count;
   }
 
+  consumeScope(scope) {
+    const normalizedScope = baseScope(scope);
+    if (!normalizedScope) return 0;
+    let count = 0;
+    withFileLockSync(this.filePath, () => {
+      const state = this.read();
+      for (const item of state.items) {
+        if (item.scope === normalizedScope && !item.consumedAt) {
+          item.consumedAt = this.now().toISOString();
+          count += 1;
+        }
+      }
+      writeJsonFileAtomicSync(this.filePath, state);
+    });
+    return count;
+  }
+
   format(items = []) {
     if (!items.length) return "";
     return [

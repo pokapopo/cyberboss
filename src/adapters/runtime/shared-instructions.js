@@ -1,12 +1,11 @@
 const fs = require("fs");
 const { renderInstructionTemplate } = require("../../core/instructions-template");
-const { loadTurnContext } = require("../../core/recent-context");
 
 function buildOpeningTurnText(config, userText, { continuity = null, includeInstructions = true } = {}) {
   const instructions = includeInstructions ? loadWechatInstructions(config) : "";
-  const recent = loadTurnContext();
   const normalizedText = String(userText || "").trim();
-  if (!instructions && !continuity?.checkpoint) {
+  const turns = Array.isArray(continuity?.turns) ? continuity.turns : [];
+  if (!instructions && !continuity?.checkpoint && !turns.length) {
     return normalizedText;
   }
   const parts = [];
@@ -19,14 +18,6 @@ function buildOpeningTurnText(config, userText, { continuity = null, includeInst
       instructions,
     );
   }
-  if (recent && !continuity?.checkpoint) {
-    parts.push(
-      "",
-      recent,
-      "",
-      "(Use the above context to understand what was happening in the previous session. Reply naturally.)",
-    );
-  }
   if (continuity?.checkpoint) {
     parts.push(
       "",
@@ -34,18 +25,17 @@ function buildOpeningTurnText(config, userText, { continuity = null, includeInst
       "This is internal continuity context, not a new user statement. Continue naturally without mentioning this checkpoint.",
       continuity.checkpoint,
     );
-    const turns = Array.isArray(continuity.turns) ? continuity.turns : [];
-    if (turns.length) {
-      parts.push("", "RECENT VISIBLE WECHAT TURNS (verbatim where available)");
-      turns.forEach((turn, index) => {
-        parts.push(
-          `Turn ${index + 1} — uu:`,
-          String(turn?.user || "").trim(),
-          `Turn ${index + 1} — CC:`,
-          String(turn?.assistant || "").trim(),
-        );
-      });
-    }
+  }
+  if (turns.length) {
+    parts.push("", "RECENT VISIBLE WECHAT TURNS (verbatim where available)");
+    turns.forEach((turn, index) => {
+      parts.push(
+        `Turn ${index + 1} — uu:`,
+        String(turn?.user || "").trim(),
+        `Turn ${index + 1} — CC:`,
+        String(turn?.assistant || "").trim(),
+      );
+    });
   }
   parts.push(
     "",

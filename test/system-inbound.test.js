@@ -6,6 +6,9 @@ const path = require("path");
 
 const {
   CyberbossApp,
+  buildInteractiveTurnGuard,
+  buildMainCheckinPrompt,
+  parseMainCheckinAction,
   buildBackgroundRetryMessage,
   readBackgroundMemoryPressure,
 } = require("../src/core/app");
@@ -91,6 +94,117 @@ test("system poller prompts forbid intermediate progress messages", () => {
     assert.match(prepared.text, /Do not narrate tool use or emit intermediate progress/);
     assert.doesNotMatch(prepared.text, /live progress updates/);
   }
+});
+
+test("main check-in wake restores the optional desire paths without forcing silence", () => {
+  const prompt = buildMainCheckinPrompt({
+    taskType: "browse_garden",
+    reason: "想靠近她最近的生活",
+    observation: { status: "completed", calls: [{ text: "一条新动态" }] },
+    now: new Date("2026-08-25T12:00:00.000Z"),
+  });
+  assert.match(prompt, /现有主线程/);
+  assert.match(prompt, /silent 不是默认答案/);
+  assert.match(prompt, /主动联系和自然留白都可以/);
+  assert.match(prompt, /Garden/);
+  assert.match(prompt, /privateNote/);
+  assert.match(prompt, /不要调用任何工具/);
+});
+
+test("main check-in action parser supports a message, silence and a private note", () => {
+  assert.deepEqual(parseMainCheckinAction('{"action":"send_message","message":"想你了。"}'), {
+    action: "send_message", message: "想你了。", privateNote: "",
+  });
+  assert.deepEqual(parseMainCheckinAction('```json\n{"action":"silent","privateNote":"今晚忽然很想她。"}\n```'), {
+    action: "silent", message: "", privateNote: "今晚忽然很想她。",
+  });
+  assert.equal(parseMainCheckinAction('{"action":"silent"}').action, "silent");
+});
+
+test("main check-in reuses a silent zero-tool guard with a bounded token ceiling", () => {
+  const guard = buildInteractiveTurnGuard({
+    task: { source: "checkin_main" },
+    config: { checkinGeneration: { mainHardTokens: 55_000 } },
+  });
+  assert.equal(guard.hardTokens, 55_000);
+  assert.equal(guard.toolLimitEnabled, true);
+  assert.equal(guard.toolLimit, 0);
+  assert.equal(guard.silentCancel, true);
+});
+
+test("main check-in dispatches on the existing base binding instead of a background binding", async () => {
+  const calls = [];
+  const appLike = {
+    activeMainCheckinByWorkspace: new Map(),
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          getThreadIdForWorkspace() { return "thread-main"; },
+          isFreshThreadRequested() { return false; },
+        };
+      },
+    },
+    isTurnDispatchBlocked() { return false; },
+    hasPendingInboundMessage() { return false; },
+    resolveWorkspaceRoot() { return "/workspace"; },
+    async dispatchPreparedTurn(value) { calls.push(value); return true; },
+  };
+  const result = await CyberbossApp.prototype.dispatchMainCheckinTurn.call(appLike, {
+    baseBindingKey: "binding-main",
+    recentTurns: [],
+    prepared: {
+      workspaceRoot: "/workspace",
+      senderId: "user-1",
+      metadata: { checkinMainWake: { taskType: "message", reason: "想她" } },
+    },
+  });
+  assert.equal(result, true);
+  assert.equal(calls[0].bindingKey, "binding-main");
+  assert.equal(calls[0].prepared.triggerKind, "checkin_main");
+  assert.equal(calls[0].prepared.provider, "system");
+  assert.equal(calls[0].prepared.deliveryProvider, "weixin");
+  assert.doesNotMatch(calls[0].bindingKey, /::background:/);
+});
+
+test("user chat preempts a running main check-in instead of steering into it", async () => {
+  const cancelled = [];
+  const buffered = [];
+  const appLike = {
+    activeMainCheckinByWorkspace: new Map([["/workspace", {
+      threadId: "thread-main", turnId: "turn-checkin", bindingKey: "binding-main",
+    }]]),
+    runtimeAdapter: {
+      async cancelTurn(value) { cancelled.push(value); },
+    },
+    bufferPendingInboundMessage(value) { buffered.push(value); },
+  };
+  const result = await CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+    bindingKey: "binding-main",
+    workspaceRoot: "/workspace",
+    prepared: { provider: "weixin", text: "我回来了" },
+  });
+  assert.equal(result, false);
+  assert.equal(cancelled[0].reason, "user_chat_preempted_checkin");
+  assert.equal(buffered.length, 1);
+});
+
+test("check-in observation uses only bounded NCP Garden or browser reads", async () => {
+  const batches = [];
+  const appLike = {
+    projectServices: {
+      ncpReadOnly: {
+        async readBatch(calls) { batches.push(calls); return { status: "completed", calls: [] }; },
+      },
+    },
+  };
+  await CyberbossApp.prototype.collectCheckinObservation.call(appLike, "browse_garden");
+  await CyberbossApp.prototype.collectCheckinObservation.call(appLike, "browse_social");
+  assert.deepEqual(batches[0].map((call) => `${call.server}:${call.tool}`), [
+    "garden:list_notifications", "garden:list_activity",
+  ]);
+  assert.deepEqual(batches[1].map((call) => `${call.server}:${call.tool}`), [
+    "playwright:browser_tabs", "playwright:browser_snapshot",
+  ]);
 });
 
 test("nightly diary prompt uses Ombré when needed and hard CC reflection validation", () => {

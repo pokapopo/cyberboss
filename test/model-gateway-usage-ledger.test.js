@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 
 const { UsageLedger } = require("../src/model-gateway/usage-ledger");
+const { normalizeProviderUsage } = require("../src/model-gateway/usage");
 const { AdaptiveThrottleStore } = require("../src/runtime/optimization/adaptive-throttle-store");
 
 test("usage ledger deduplicates provider events and exposes reusable budget state", () => {
@@ -26,6 +27,21 @@ test("usage ledger deduplicates provider events and exposes reusable budget stat
   assert.equal(budgetState.windows.hour.hardExceeded, true);
   assert.deepEqual(ledger.aggregateBySource().map((item) => item.source), ["scheduler"]);
   assert.equal(ledger.aggregateBySource()[0].cacheReadRatio, 0);
+});
+
+test("usage normalization supports OpenAI-compatible totals without double-counting cached prompts", () => {
+  assert.deepEqual(normalizeProviderUsage({
+    prompt_tokens: 120,
+    completion_tokens: 30,
+    total_tokens: 150,
+    prompt_tokens_details: { cached_tokens: 80 },
+  }), {
+    inputTokens: 40,
+    cacheReadInputTokens: 80,
+    cacheCreationInputTokens: 0,
+    outputTokens: 30,
+    totalTokens: 150,
+  });
 });
 
 test("adaptive throttle persists exponential empty backoff and resets on activity", () => {

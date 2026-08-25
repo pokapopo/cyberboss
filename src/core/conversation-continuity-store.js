@@ -58,6 +58,12 @@ class ConversationContinuityStore {
     };
   }
 
+  getRecentTurns(scopeKey) {
+    const scope = normalizeText(scopeKey);
+    if (!this.filePath || !scope) return [];
+    return boundTurns(normalizeScope(this.read().scopes[scope]).turns);
+  }
+
   markConsumed(scopeKey, newThreadId) {
     const scope = normalizeText(scopeKey);
     if (!this.filePath || !scope) return;

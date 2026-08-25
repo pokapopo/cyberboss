@@ -6,12 +6,15 @@ function handleRuntimeEventForTest(appLike, event) {
   appLike.turnTimeouts ||= new Map();
   appLike.turnBoundaryScopeKeys ||= new Set();
   appLike.tokenLimitedRunKeys ||= new Set();
+  appLike.interactiveGuardByRunKey ||= new Map();
   appLike.threadStateStore ||= {};
   appLike.threadStateStore.getThreadState ||= () => null;
   appLike.clearTurnTimeout ||= CyberbossApp.prototype.clearTurnTimeout.bind(appLike);
   appLike.scheduleTurnTimeout ||= () => {};
   appLike._autoCompactIfNeeded ||= async () => {};
   appLike.enforceTimelineTokenLimit ||= CyberbossApp.prototype.enforceTimelineTokenLimit.bind(appLike);
+  appLike.enforceInteractiveTokenLimit ||= CyberbossApp.prototype.enforceInteractiveTokenLimit.bind(appLike);
+  appLike.enforceInteractiveToolLimit ||= CyberbossApp.prototype.enforceInteractiveToolLimit.bind(appLike);
   return CyberbossApp.prototype.handleRuntimeEvent.call(appLike, event);
 }
 

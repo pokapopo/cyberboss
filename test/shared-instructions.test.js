@@ -50,6 +50,25 @@ test("Claude WeChat opening turn can omit stable instructions already loaded as 
   assert.match(result, /Current user message:\nhello/);
 });
 
+test("fresh opening turns do not implicitly inject the legacy recent-context file", () => {
+  const result = buildOpeningTurnText({}, "hi", {
+    includeInstructions: false,
+    continuity: null,
+  });
+  assert.equal(result, "hi");
+  assert.doesNotMatch(result, /RECENT TURN CONTEXT/);
+});
+
+test("resume fallback can inject bounded recent visible turns without a checkpoint", () => {
+  const result = buildOpeningTurnText({}, "继续", {
+    includeInstructions: false,
+    continuity: { turns: [{ user: "上一句", assistant: "上一条回复" }] },
+  });
+  assert.match(result, /RECENT VISIBLE WECHAT TURNS/);
+  assert.match(result, /上一句/);
+  assert.match(result, /Current user message:\n继续/);
+});
+
 test("WeChat operations positively reinforce proactive action before promises", () => {
   const operations = fs.readFileSync(
     path.resolve(__dirname, "..", "templates", "weixin-operations.md"),
@@ -65,6 +84,7 @@ test("WeChat operations positively reinforce proactive action before promises", 
   assert.match(operations, /当前 turn 调用对应工具、拿到结果/);
   assert.match(operations, /reminder、队列或后台任务/);
   assert.match(operations, /如实说明当前状态和下一个可行步骤/);
+  assert.match(operations, /不要为了普通寒暄进行跨来源探索/);
 });
 
 test("WeChat operations require main-model judgment and advance notice before NCP bypass", () => {

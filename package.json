@@ -30,7 +30,8 @@
     "usage:report": "node ./scripts/token-usage-report.js",
     "check:syntax": "node ./scripts/check-syntax.js",
     "test": "node --test",
-    "check": "npm run check:syntax && npm test"
+    "check": "npm run check:syntax && npm test",
+    "baseline:check": "npm run check"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

@@ -26,3 +26,11 @@ Use the smallest relevant route while iterating, then run `npm test` before hand
 5. Live behavior: manually verify WeChat/runtime behavior when mocks cannot cover transport, credentials, process lifecycle, or UI delivery.
 
 Tests prove only the scenarios they encode. Do not weaken an assertion merely to make a failure disappear; first decide whether the implementation or the expected behavior is wrong.
+
+## Architecture baseline
+
+For changes crossing runtime/session ownership, turn lifecycle, delivery,
+background scheduling, or model budgets, read `docs/BASELINE.md` before editing
+and run `npm run baseline:check` before deployment. A passing narrow route does
+not authorize changing a baseline invariant or deploying a cross-boundary
+change without the documented risk and rollback review.

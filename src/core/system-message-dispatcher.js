@@ -58,6 +58,7 @@ class SystemMessageDispatcher {
       contextToken,
       receivedAt: normalizeIsoTime(message?.createdAt) || new Date().toISOString(),
       workspaceRoot: this.resolveWorkspaceRoot(message),
+      metadata: message?.metadata && typeof message.metadata === "object" ? message.metadata : {},
       incrementalScope: normalizeText(message?.incrementalScope),
       incrementalCursor: Number(message?.incrementalCursor) || 0,
     };

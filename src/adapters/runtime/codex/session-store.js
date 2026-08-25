@@ -203,6 +203,47 @@ class SessionStore {
     return this.updateBinding(bindingKey, nextBinding);
   }
 
+  markFreshThreadRequested(bindingKey, workspaceRoot, runtimeId = this.runtimeId) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) return this.getBinding(bindingKey);
+    const current = this.getBinding(bindingKey) || {};
+    const normalizedRuntimeId = normalizeValue(runtimeId) || "default";
+    return this.updateBinding(bindingKey, {
+      ...current,
+      freshThreadRequestedByWorkspaceRootByRuntime: {
+        ...getFreshThreadRuntimeMap(current),
+        [normalizedRuntimeId]: {
+          ...getFreshThreadMapForRuntime(current, normalizedRuntimeId),
+          [normalizedWorkspaceRoot]: new Date().toISOString(),
+        },
+      },
+    });
+  }
+
+  isFreshThreadRequested(bindingKey, workspaceRoot, runtimeId = this.runtimeId) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) return false;
+    const binding = this.getBinding(bindingKey) || {};
+    return Boolean(getFreshThreadMapForRuntime(binding, runtimeId)[normalizedWorkspaceRoot]);
+  }
+
+  clearFreshThreadRequested(bindingKey, workspaceRoot, runtimeId = this.runtimeId) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) return this.getBinding(bindingKey);
+    const current = this.getBinding(bindingKey) || {};
+    const normalizedRuntimeId = normalizeValue(runtimeId) || "default";
+    return this.updateBinding(bindingKey, {
+      ...current,
+      freshThreadRequestedByWorkspaceRootByRuntime: {
+        ...getFreshThreadRuntimeMap(current),
+        [normalizedRuntimeId]: {
+          ...getFreshThreadMapForRuntime(current, normalizedRuntimeId),
+          [normalizedWorkspaceRoot]: "",
+        },
+      },
+    });
+  }
+
   setActiveWorkspaceRoot(bindingKey, workspaceRoot) {
     const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
@@ -397,6 +438,10 @@ function mergeBindingState(current = {}, incoming = {}) {
     current?.runtimeParamsByWorkspaceRootByRuntime,
     incoming?.runtimeParamsByWorkspaceRootByRuntime,
   );
+  next.freshThreadRequestedByWorkspaceRootByRuntime = mergeRuntimeScopedMap(
+    current?.freshThreadRequestedByWorkspaceRootByRuntime,
+    incoming?.freshThreadRequestedByWorkspaceRootByRuntime,
+  );
   return next;
 }
 
@@ -433,6 +478,16 @@ function getThreadRuntimeMap(binding) {
   return binding?.threadIdByWorkspaceRootByRuntime && typeof binding.threadIdByWorkspaceRootByRuntime === "object"
     ? binding.threadIdByWorkspaceRootByRuntime
     : {};
+}
+
+function getFreshThreadRuntimeMap(binding) {
+  const value = binding?.freshThreadRequestedByWorkspaceRootByRuntime;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function getFreshThreadMapForRuntime(binding, runtimeId) {
+  const value = getFreshThreadRuntimeMap(binding)[normalizeValue(runtimeId) || "default"];
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 function getThreadMapForRuntime(binding, runtimeId) {

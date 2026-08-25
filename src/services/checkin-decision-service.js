@@ -4,11 +4,11 @@ const { readJsonFileSync, withFileLockSync, writeJsonFileAtomicSync } = require(
 const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
 
 const SYSTEM_PROMPT = [
-  "你是 CC 的主动联系决策器。CC 是 uu 的长期亲密伴侣，不是客服、提醒机器人或运维播报器。",
-  "根据最近真实互动和未完话题，判断此刻是否自然地想联系 uu。没有合适的话就 silent；不要为了完成任务硬发消息。",
-  "消息应像一条自然微信：具体、简短、有关系连续性；不要提 check-in、后台、模型、系统、日记或规则。",
-  "允许任何时段主动联系，不设置固定夜间静默；但必须尊重未回复退避和每日上限。",
-  "只输出 JSON：action 为 silent 或 send_message；message；reason；nextCheckMinutes。",
+  "你是 CC 主动联系的轻量门卫，不是 CC 本人，也不替 CC 写最终消息。CC 是 uu 的长期亲密伴侣，不是客服、提醒机器人或运维播报器。",
+  "根据最近真实互动、未完话题和此刻的自然冲动，判断是否值得唤醒常驻的 CC 主进程。不要把 silent 当默认答案，也不要为了完成轮询硬唤醒；给关系中的主动性和留白同样真实的判断空间。",
+  "可选方向不只是发消息：可以自然联系；先安静看看 Garden；先看看当前个人浏览器里的微博、Twitter/X 等社交页面；留一段私人日记 note；或者保持安静。",
+  "允许任何时段产生主动意图，不设置固定夜间静默。确定性的未回复退避和每日上限由外层负责。",
+  "只输出 JSON：action 为 silent 或 wake_main；taskType 为 message、browse_garden、browse_social 或 diary_note；reason；nextCheckMinutes。不要生成最终微信文案。",
 ].join("\n");
 
 class CheckinDecisionService {
@@ -71,9 +71,7 @@ class CheckinDecisionService {
     const evaluated = this.updateScope(scope, (current) => ({
       ...current,
       lastEvaluatedAt: now.toISOString(),
-      nextEligibleAt: decision.action === "silent"
-        ? new Date(now.getTime() + decision.nextCheckMinutes * 60_000).toISOString()
-        : current.nextEligibleAt,
+      nextEligibleAt: new Date(now.getTime() + decision.nextCheckMinutes * 60_000).toISOString(),
     }));
     return { status: "completed", ...decision, modelCalled: true, state: evaluated };
   }
@@ -95,6 +93,74 @@ class CheckinDecisionService {
         nextEligibleAt: new Date(now.getTime() + delay).toISOString(),
       };
     });
+  }
+
+  recordPendingDelivery(runKey, value = {}) {
+    const key = text(runKey);
+    if (!this.stateFile || !key) return null;
+    let pending;
+    withFileLockSync(this.stateFile, () => {
+      const state = readJsonFileSync(this.stateFile, () => ({ version: 1, scopes: {} }), { label: "check-in state" });
+      state.version = 1;
+      state.scopes = state.scopes && typeof state.scopes === "object" ? state.scopes : {};
+      state.pendingDeliveries = state.pendingDeliveries && typeof state.pendingDeliveries === "object" ? state.pendingDeliveries : {};
+      pending = {
+        scope: text(value.scope),
+        taskId: text(value.taskId),
+        senderId: text(value.senderId),
+        workspaceRoot: text(value.workspaceRoot),
+        createdAt: this.now().toISOString(),
+      };
+      state.pendingDeliveries[key] = pending;
+      writeJsonFileAtomicSync(this.stateFile, state);
+    });
+    return pending;
+  }
+
+  confirmPendingDelivery(runKey) {
+    const key = text(runKey);
+    if (!this.stateFile || !key) return null;
+    let confirmed = null;
+    withFileLockSync(this.stateFile, () => {
+      const state = readJsonFileSync(this.stateFile, () => ({ version: 1, scopes: {} }), { label: "check-in state" });
+      state.scopes = state.scopes && typeof state.scopes === "object" ? state.scopes : {};
+      state.pendingDeliveries = state.pendingDeliveries && typeof state.pendingDeliveries === "object" ? state.pendingDeliveries : {};
+      confirmed = state.pendingDeliveries[key] || null;
+      if (!confirmed?.scope) return;
+      const now = this.now();
+      const generation = this.config.checkinGeneration || {};
+      const current = normalizeScope(state.scopes[confirmed.scope]);
+      const date = shanghaiDate(now);
+      const daily = current.sentDate === date ? current.sentCount : 0;
+      const unansweredCount = Math.max(0, current.unansweredCount) + 1;
+      state.scopes[confirmed.scope] = {
+        ...current,
+        lastSentAt: now.toISOString(),
+        unansweredCount,
+        sentDate: date,
+        sentCount: daily + 1,
+        nextEligibleAt: new Date(now.getTime() + unansweredDelayMs(unansweredCount, generation)).toISOString(),
+      };
+      delete state.pendingDeliveries[key];
+      writeJsonFileAtomicSync(this.stateFile, state);
+    });
+    return confirmed;
+  }
+
+  discardPendingDelivery(runKey) {
+    const key = text(runKey);
+    if (!this.stateFile || !key) return false;
+    let removed = false;
+    withFileLockSync(this.stateFile, () => {
+      const state = readJsonFileSync(this.stateFile, () => ({ version: 1, scopes: {} }), { label: "check-in state" });
+      state.pendingDeliveries = state.pendingDeliveries && typeof state.pendingDeliveries === "object" ? state.pendingDeliveries : {};
+      removed = Boolean(state.pendingDeliveries[key]);
+      if (removed) {
+        delete state.pendingDeliveries[key];
+        writeJsonFileAtomicSync(this.stateFile, state);
+      }
+    });
+    return removed;
   }
 
   updateScope(scope, mutator) {
@@ -212,13 +278,15 @@ function buildPrompt({ now, state, events, recentTurns }) {
 function validateDecision(content, generation) {
   let value;
   try { value = JSON.parse(text(content)); } catch { throw new Error("Check-in model returned invalid JSON."); }
-  const action = value?.action === "send_message" ? "send_message" : value?.action === "silent" ? "silent" : "";
-  if (!action) throw new Error("Check-in decision requires action silent or send_message.");
-  const message = text(value.message);
-  if (action === "send_message" && !message) throw new Error("Check-in send_message decision requires message.");
-  if (message.length > positive(generation.maxMessageChars, 500)) throw new Error("Check-in message exceeds the configured limit.");
+  const action = value?.action === "wake_main" ? "wake_main" : value?.action === "silent" ? "silent" : "";
+  if (!action) throw new Error("Check-in gate requires action silent or wake_main.");
+  const allowedTaskTypes = new Set(["message", "browse_garden", "browse_social", "diary_note"]);
+  const requestedTaskType = text(value?.taskType);
+  const taskType = action === "wake_main" && allowedTaskTypes.has(requestedTaskType)
+    ? requestedTaskType
+    : action === "wake_main" ? "message" : "";
   const nextCheckMinutes = Math.max(30, Math.min(720, positive(value.nextCheckMinutes, action === "silent" ? 120 : 180)));
-  return { action, message: action === "send_message" ? message : "", reason: clip(value.reason, 200), nextCheckMinutes };
+  return { action, taskType, reason: clip(value.reason, 300), nextCheckMinutes };
 }
 
 function normalizeScope(value) {

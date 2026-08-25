@@ -15,12 +15,15 @@ const CLAUDE_RESUME_SESSION_TIMEOUT_MS = 8000;
 function createClaudeCodeRuntimeAdapter(config) {
   const sessionStore = new SessionStore({ filePath: config.sessionsFile, runtimeId: "claudecode" });
   const clientsByWorkspace = new Map();
+  const ownerBindingByWorkspace = new Map();
   const backgroundClientsByScope = new Map();
   const pendingApprovals = new Map();
   const pendingModelByWorkspaceRoot = new Map();
   const internalTurnsByWorkspace = new Map();
   const idleTimersByWorkspace = new Map();
-  const idleTimeoutMs = normalizeIdleTimeoutMs(config.claudeIdleTimeoutMs);
+  const idleTimeoutMs = config.claudeKeepMainResident === false
+    ? normalizeIdleTimeoutMs(config.claudeIdleTimeoutMs)
+    : 0;
   const configuredModel = normalizeText(config.claudeModel);
   let globalListener = null;
   const IS_WINDOWS = os.platform() === "win32";
@@ -102,10 +105,9 @@ function createClaudeCodeRuntimeAdapter(config) {
         return;
       }
       if (event.type === "session.id") {
-        for (const binding of sessionStore.listBindings()) {
-          if (binding.activeWorkspaceRoot === workspaceRoot) {
-            sessionStore.setThreadIdForWorkspace(binding.bindingKey, workspaceRoot, event.sessionId);
-          }
+        const ownerBindingKey = ownerBindingByWorkspace.get(workspaceRoot);
+        if (ownerBindingKey) {
+          sessionStore.setThreadIdForWorkspace(ownerBindingKey, workspaceRoot, event.sessionId);
         }
         return;
       }
@@ -126,9 +128,8 @@ function createClaudeCodeRuntimeAdapter(config) {
         // Resume/startup failure (no active turn) — clear bad thread IDs so
         // restarts don't retry the same broken session.
         if (!mapped.payload?.turnId) {
-          for (const binding of sessionStore.listBindings()) {
-            sessionStore.clearThreadIdForWorkspace(binding.bindingKey, workspaceRoot);
-          }
+          const ownerBindingKey = ownerBindingByWorkspace.get(workspaceRoot);
+          if (ownerBindingKey) sessionStore.clearThreadIdForWorkspace(ownerBindingKey, workspaceRoot);
           return; // nothing to forward — no user is waiting on this
         }
       }
@@ -145,12 +146,15 @@ function createClaudeCodeRuntimeAdapter(config) {
     return client;
   }
 
-  async function attachClientToThread(workspaceRoot, threadId = "", model = "") {
+  async function attachClientToThread(bindingKey, workspaceRoot, threadId = "", model = "") {
     const normalizedWorkspaceRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : "";
     const normalizedThreadId = normalizeThreadId(threadId);
     const desiredModel = resolveModel(model);
     if (!normalizedWorkspaceRoot) {
       throw new Error("workspaceRoot is required");
+    }
+    if (normalizeText(bindingKey)) {
+      ownerBindingByWorkspace.set(normalizedWorkspaceRoot, normalizeText(bindingKey));
     }
 
     const existingClient = clientsByWorkspace.get(normalizedWorkspaceRoot);
@@ -166,10 +170,16 @@ function createClaudeCodeRuntimeAdapter(config) {
       await closeWorkspaceClient(normalizedWorkspaceRoot, "fresh_session");
     }
 
+    if (normalizeText(bindingKey)) {
+      ownerBindingByWorkspace.set(normalizedWorkspaceRoot, normalizeText(bindingKey));
+    }
     let client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
     if (!client.alive || (normalizedThreadId && !clientMatchesThread(client, normalizedThreadId))) {
       if (client.alive && normalizedThreadId && !clientMatchesThread(client, normalizedThreadId)) {
         await closeWorkspaceClient(normalizedWorkspaceRoot, "session_switch");
+        if (normalizeText(bindingKey)) {
+          ownerBindingByWorkspace.set(normalizedWorkspaceRoot, normalizeText(bindingKey));
+        }
         client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
       }
       await client.connect(normalizedThreadId);
@@ -188,6 +198,7 @@ function createClaudeCodeRuntimeAdapter(config) {
     }
     cancelIdleTimer(normalizedWorkspaceRoot);
     clientsByWorkspace.delete(normalizedWorkspaceRoot);
+    ownerBindingByWorkspace.delete(normalizedWorkspaceRoot);
     await client.close({ reason });
     for (const [requestId, pending] of pendingApprovals.entries()) {
       if (pending?.client === client) {
@@ -389,6 +400,7 @@ function createClaudeCodeRuntimeAdapter(config) {
         await client.close({ reason: "runtime_shutdown" });
       }
       clientsByWorkspace.clear();
+      ownerBindingByWorkspace.clear();
       for (const scopeKey of [...backgroundClientsByScope.keys()]) {
         await closeBackgroundClient(scopeKey, "runtime_shutdown");
       }
@@ -455,16 +467,17 @@ function createClaudeCodeRuntimeAdapter(config) {
       }
       return { threadId, turnId };
     },
-    async resumeThread({ threadId, workspaceRoot, model = "" }) {
+    async resumeThread({ bindingKey, threadId, workspaceRoot, model = "" }) {
       if (!workspaceRoot) {
         return { threadId };
       }
-      const attached = await attachClientToThread(workspaceRoot, threadId, model);
+      const attached = await attachClientToThread(bindingKey, workspaceRoot, threadId, model);
       return { threadId: attached.threadId };
     },
     async compactThread({ threadId, workspaceRoot, model = "", silent = false }) {
       cancelIdleTimer(workspaceRoot);
-      const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
+      const ownerBindingKey = ownerBindingByWorkspace.get(normalizeText(workspaceRoot)) || "";
+      const { client, threadId: activeThreadId } = await attachClientToThread(ownerBindingKey, workspaceRoot, threadId, model);
       if (silent) {
         await runInternalTurn(workspaceRoot, client, "/compact", activeThreadId);
         return { threadId: activeThreadId, turnId: "" };
@@ -474,7 +487,8 @@ function createClaudeCodeRuntimeAdapter(config) {
     },
     async generateContinuityCheckpoint({ threadId, workspaceRoot, model = "" }) {
       cancelIdleTimer(workspaceRoot);
-      const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
+      const ownerBindingKey = ownerBindingByWorkspace.get(normalizeText(workspaceRoot)) || "";
+      const { client, threadId: activeThreadId } = await attachClientToThread(ownerBindingKey, workspaceRoot, threadId, model);
       const text = await runInternalTurn(
         workspaceRoot,
         client,
@@ -485,7 +499,8 @@ function createClaudeCodeRuntimeAdapter(config) {
     },
     async refreshThreadInstructions({ threadId, workspaceRoot, model = "" }) {
       cancelIdleTimer(workspaceRoot);
-      const { client, threadId: activeThreadId } = await attachClientToThread(workspaceRoot, threadId, model);
+      const ownerBindingKey = ownerBindingByWorkspace.get(normalizeText(workspaceRoot)) || "";
+      const { client, threadId: activeThreadId } = await attachClientToThread(ownerBindingKey, workspaceRoot, threadId, model);
       const refreshText = buildInstructionRefreshText(config);
       await client.sendUserMessage({ text: refreshText, threadId: activeThreadId });
       return { threadId: activeThreadId };
@@ -499,7 +514,9 @@ function createClaudeCodeRuntimeAdapter(config) {
       if (!normalizedTurnId) {
         throw new Error("turnId is required for claudecode steering");
       }
+      const ownerBindingKey = ownerBindingByWorkspace.get(normalizeText(workspaceRoot)) || "";
       const { client, threadId: activeThreadId } = await attachClientToThread(
+        ownerBindingKey,
         workspaceRoot,
         threadId,
         resolveModel(model),
@@ -516,13 +533,15 @@ function createClaudeCodeRuntimeAdapter(config) {
         turnId: normalizedTurnId,
       };
     },
-    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null }) {
+    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null, recoveryContext = null }) {
       if (isBackgroundBindingKey(bindingKey)) {
         return sendBackgroundTurn({ bindingKey, workspaceRoot, text, model, continuityContext });
       }
       cancelIdleTimer(workspaceRoot);
+      ownerBindingByWorkspace.set(normalizeText(workspaceRoot), normalizeText(bindingKey));
       const desiredModel = resolveModel(model);
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+      const explicitFresh = sessionStore.isFreshThreadRequested?.(bindingKey, workspaceRoot) === true;
       if (!threadId) {
         sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
       }
@@ -533,9 +552,10 @@ function createClaudeCodeRuntimeAdapter(config) {
         });
       }
       let openingTurn = !threadId;
+      let openingReason = openingTurn ? (explicitFresh ? "explicit_new" : (continuityContext ? "rollover" : "fresh")) : "resume";
       let attached;
       try {
-        attached = await attachClientToThread(workspaceRoot, threadId, desiredModel);
+        attached = await attachClientToThread(bindingKey, workspaceRoot, threadId, desiredModel);
       } catch (error) {
         if (!threadId) {
           throw error;
@@ -543,12 +563,16 @@ function createClaudeCodeRuntimeAdapter(config) {
         sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
         threadId = "";
         openingTurn = true;
-        attached = await attachClientToThread(workspaceRoot, "", desiredModel);
+        openingReason = "resume_fallback";
+        attached = await attachClientToThread(bindingKey, workspaceRoot, "", desiredModel);
       }
       const { client, threadId: activeThreadId } = attached;
+      const openingContinuity = openingReason === "explicit_new"
+        ? null
+        : (openingReason === "resume_fallback" ? recoveryContext : continuityContext);
       const outboundText = openingTurn
         ? buildOpeningTurnText(config, text, {
-          continuity: continuityContext,
+          continuity: openingContinuity,
           includeInstructions: false,
         })
         : text;
@@ -575,16 +599,19 @@ function createClaudeCodeRuntimeAdapter(config) {
         returnedThreadId,
         metadata,
       );
+      if (explicitFresh) sessionStore.clearFreshThreadRequested?.(bindingKey, workspaceRoot);
       rememberModelForBinding(bindingKey, workspaceRoot, pendingModelByWorkspaceRoot.get(normalizeText(workspaceRoot)));
       return {
         threadId: returnedThreadId,
         turnId: client.pendingTurnId,
+        openingReason,
       };
     },
   };
 
   function hydrateRuntimeModelsFromClaudeProjects() {
     for (const binding of sessionStore.listBindings()) {
+      if (isBackgroundBindingKey(binding.bindingKey)) continue;
       const workspaceRoots = new Set([
         normalizeText(binding.activeWorkspaceRoot),
         ...sessionStore.listWorkspaceRoots(binding.bindingKey),
@@ -607,14 +634,10 @@ function createClaudeCodeRuntimeAdapter(config) {
     if (!normalizedWorkspaceRoot || !normalizedModel) {
       return;
     }
-    let remembered = false;
-    for (const binding of sessionStore.listBindings()) {
-      if (normalizeText(binding.activeWorkspaceRoot) === normalizedWorkspaceRoot) {
-        rememberModelForBinding(binding.bindingKey, normalizedWorkspaceRoot, normalizedModel);
-        remembered = true;
-      }
-    }
-    if (!remembered) {
+    const ownerBindingKey = ownerBindingByWorkspace.get(normalizedWorkspaceRoot);
+    if (ownerBindingKey) {
+      rememberModelForBinding(ownerBindingKey, normalizedWorkspaceRoot, normalizedModel);
+    } else {
       pendingModelByWorkspaceRoot.set(normalizedWorkspaceRoot, normalizedModel);
     }
   }

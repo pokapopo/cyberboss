@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 
-const { CyberbossApp } = require("../src/core/app");
+const { CyberbossApp, buildInteractiveTurnGuard } = require("../src/core/app");
 const { mapClaudeCodeMessageToRuntimeEvent } = require("../src/adapters/runtime/claudecode/events");
 const { createClaudeCodeRuntimeAdapter } = require("../src/adapters/runtime/claudecode");
 const { ClaudeCodeProcessClient } = require("../src/adapters/runtime/claudecode/process-client");
@@ -297,6 +297,7 @@ test("claudecode adapter dispatches turns only after a real session id is availa
   });
 
   try {
+    adapter.getSessionStore().markFreshThreadRequested("binding-1", workspaceRoot);
     const turn = await adapter.sendTurn({
       bindingKey: "binding-1",
       workspaceRoot,
@@ -305,9 +306,11 @@ test("claudecode adapter dispatches turns only after a real session id is availa
         senderId: "user-1",
       },
       model: "claude-sonnet",
+      recoveryContext: { turns: [{ user: "OLD USER", assistant: "OLD ASSISTANT" }] },
     });
 
     assert.equal(turn.threadId, sessionId);
+    assert.equal(turn.openingReason, "explicit_new");
     assert.match(turn.turnId, /^turn-\d+$/);
     assert.equal(adapter.getSessionStore().getThreadIdForWorkspace("binding-1", workspaceRoot), sessionId);
     assert.deepEqual(adapter.getSessionStore().getRuntimeParamsForWorkspace("binding-1", workspaceRoot), {
@@ -317,6 +320,8 @@ test("claudecode adapter dispatches turns only after a real session id is availa
     assert.doesNotMatch(turn.threadId, /^pending-/);
     const capturedInput = await waitForFileText(captureFile, /hello/);
     assert.match(capturedInput, /hello/);
+    assert.doesNotMatch(capturedInput, /OLD USER|OLD ASSISTANT/);
+    assert.equal(adapter.getSessionStore().isFreshThreadRequested("binding-1", workspaceRoot), false);
     const args = JSON.parse(await waitForFileText(argsFile, /]/));
     assert.equal(args.includes("--append-system-prompt"), false);
   } finally {
@@ -353,6 +358,7 @@ test("claudecode adapter hibernates an idle client and resumes the preserved ses
     claudeCommand: commandFile,
     claudeModel: "deepseek-v4-pro",
     claudeIdleTimeoutMs: 50,
+    claudeKeepMainResident: false,
     claudeDisableVerbose: true,
   });
   const events = [];
@@ -401,6 +407,48 @@ test("claudecode adapter hibernates an idle client and resumes the preserved ses
       ["--resume", sessionId],
     );
     assert.equal(events.some((event) => event.type === "runtime.turn.failed"), false);
+  } finally {
+    await adapter.close();
+  }
+});
+
+test("claudecode adapter keeps the main client resident by default", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-claude-resident-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  const stateDir = path.join(tempDir, "state");
+  const startsFile = path.join(tempDir, "starts.txt");
+  const commandFile = path.join(tempDir, "fake-claude.js");
+  const sessionId = "88888888-8888-4888-8888-888888888888";
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(commandFile, [
+    "#!/usr/bin/env node",
+    `const fs = require("node:fs");`,
+    `fs.appendFileSync(${JSON.stringify(startsFile)}, "start\\n");`,
+    `console.log(JSON.stringify({ type: "system", session_id: ${JSON.stringify(sessionId)} }));`,
+    `process.stdin.on("data", () => console.log(JSON.stringify({ type: "result", session_id: ${JSON.stringify(sessionId)}, result: "done" })));`,
+    "process.stdin.on(\"end\", () => process.exit(0));",
+  ].join("\n"));
+  fs.chmodSync(commandFile, 0o755);
+  const adapter = createClaudeCodeRuntimeAdapter({
+    stateDir,
+    sessionsFile: path.join(tempDir, "sessions.json"),
+    claudeCommand: commandFile,
+    claudeIdleTimeoutMs: 30,
+    claudeDisableVerbose: true,
+  });
+  let completions = 0;
+  adapter.onEvent((event) => {
+    if (event.type === "runtime.turn.completed") completions += 1;
+  });
+  try {
+    await adapter.sendTurn({ bindingKey: "binding-1", workspaceRoot, text: "first" });
+    await waitUntil(() => completions === 1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(adapter.getLifecycleStatus({ workspaceRoot }).status, "idle");
+    await adapter.sendTurn({ bindingKey: "binding-1", workspaceRoot, text: "second" });
+    await waitUntil(() => completions === 2);
+    assert.equal(fs.readFileSync(startsFile, "utf8").trim().split("\n").length, 1);
   } finally {
     await adapter.close();
   }
@@ -501,6 +549,11 @@ test("claudecode background turns use a separate process and route approvals wit
   const waitForEvent = (predicate) => new Promise((resolve) => waiters.push({ predicate, resolve }));
 
   try {
+    adapter.getSessionStore().setThreadIdForWorkspace(
+      "binding-chat::background:diary_incremental",
+      workspaceRoot,
+      "",
+    );
     const mainCompleted = waitForEvent((event) => event.type === "runtime.turn.completed");
     const mainTurn = await adapter.sendTurn({
       bindingKey: "binding-chat",
@@ -976,6 +1029,9 @@ test("handleNewCommand asks runtime to start a fresh draft before clearing the s
           clearThreadIdForWorkspace(bindingKey, workspaceRoot) {
             calls.push(["clear", bindingKey, workspaceRoot]);
           },
+          markFreshThreadRequested(bindingKey, workspaceRoot) {
+            calls.push(["mark-fresh", bindingKey, workspaceRoot]);
+          },
         };
       },
     },
@@ -994,10 +1050,104 @@ test("handleNewCommand asks runtime to start a fresh draft before clearing the s
   });
 
   assert.deepEqual(calls, [
+    ["mark-fresh", "binding-1", "/workspace"],
     ["fresh", "/workspace"],
     ["clear", "binding-1", "/workspace"],
     ["send", "✅ Switched to a fresh thread draft\nworkspace: /workspace"],
   ]);
+});
+
+test("session store persists and clears an explicit fresh-thread request", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-fresh-marker-"));
+  const filePath = path.join(dir, "sessions.json");
+  const store = new SessionStore({ filePath, runtimeId: "claudecode" });
+  store.markFreshThreadRequested("binding-1", "/workspace");
+  assert.equal(new SessionStore({ filePath, runtimeId: "claudecode" }).isFreshThreadRequested("binding-1", "/workspace"), true);
+  store.clearFreshThreadRequested("binding-1", "/workspace");
+  assert.equal(new SessionStore({ filePath, runtimeId: "claudecode" }).isFreshThreadRequested("binding-1", "/workspace"), false);
+});
+
+test("startup restore skips and clears legacy background Claude bindings", async () => {
+  const calls = [];
+  const threads = new Map([
+    ["binding-main", "thread-main"],
+    ["binding-main::background:checkin", "thread-stale"],
+  ]);
+  const sessionStore = {
+    listBindings: () => [...threads.keys()].map((bindingKey) => ({ bindingKey })),
+    listWorkspaceRoots: () => ["/workspace"],
+    getThreadIdForWorkspace: (bindingKey) => threads.get(bindingKey) || "",
+    clearThreadIdForWorkspace(bindingKey) { calls.push(["clear", bindingKey]); threads.set(bindingKey, ""); },
+    clearFreshThreadRequested(bindingKey) { calls.push(["clear-fresh", bindingKey]); },
+  };
+  const appLike = {
+    runtimeAdapter: {
+      getSessionStore: () => sessionStore,
+      async resumeThread(payload) { calls.push(["resume", payload.bindingKey, payload.threadId]); },
+    },
+    streamDelivery: { setReplyTarget() {} },
+    resolveReplyTargetForBinding: () => null,
+  };
+  await CyberbossApp.prototype.restoreBoundThreadSubscriptions.call(appLike);
+  assert.deepEqual(calls, [
+    ["resume", "binding-main", "thread-main"],
+    ["clear", "binding-main::background:checkin"],
+    ["clear-fresh", "binding-main::background:checkin"],
+  ]);
+});
+
+test("interactive guard limits only casual fresh recovery and recovery-source fallback reads", () => {
+  const config = { interactiveTurnBudgets: { recoveryHardTokens: 60_000, hardTokens: 250_000, recoveryToolCalls: 2 } };
+  const task = { source: "user_chat" };
+  const casual = buildInteractiveTurnGuard({ task, openingReason: "explicit_new", userText: "hi", config });
+  assert.equal(casual.recoveryHardLimit, true);
+  assert.equal(casual.hardTokens, 60_000);
+  assert.equal(casual.toolMode, "all");
+  assert.equal(casual.toolLimit, 2);
+  const explicitTask = buildInteractiveTurnGuard({ task, openingReason: "explicit_new", userText: "帮我查一下最近的项目日志", config });
+  assert.equal(explicitTask.hardTokens, 250_000);
+  assert.equal(explicitTask.toolLimit, 0);
+  const fallback = buildInteractiveTurnGuard({ task, openingReason: "resume_fallback", userText: "帮我修代码", config });
+  assert.equal(fallback.toolMode, "recovery_only");
+  assert.equal(fallback.toolLimit, 2);
+});
+
+test("interactive guard cancels on the third scoped recovery call and deduplicates usage events", async () => {
+  const runKey = "thread-1::turn-1";
+  const guard = {
+    hardTokens: 60,
+    tokens: 0,
+    usageEventIds: new Set(),
+    toolMode: "recovery_only",
+    toolLimit: 2,
+    toolCalls: 0,
+    cancelRequested: false,
+  };
+  const cancellations = [];
+  const appLike = {
+    interactiveGuardByRunKey: new Map([[runKey, guard]]),
+    pendingModelRequestByRunKey: new Map([[runKey, { task: { source: "user_chat" } }]]),
+    async cancelInteractiveGuard(payload) {
+      cancellations.push(payload.reason);
+      payload.guard.cancelRequested = true;
+      return true;
+    },
+  };
+  const toolEvent = (toolName) => ({ payload: { threadId: "thread-1", turnId: "turn-1", toolName } });
+  await CyberbossApp.prototype.enforceInteractiveToolLimit.call(appLike, { event: toolEvent("exec_command"), runKey });
+  await CyberbossApp.prototype.enforceInteractiveToolLimit.call(appLike, { event: toolEvent("breath_search"), runKey });
+  await CyberbossApp.prototype.enforceInteractiveToolLimit.call(appLike, { event: toolEvent("cyberboss_timeline_read"), runKey });
+  await CyberbossApp.prototype.enforceInteractiveToolLimit.call(appLike, { event: toolEvent("cyberboss_worklog_search"), runKey });
+  assert.deepEqual(cancellations, ["interactive_tool_limit:3/2"]);
+
+  guard.cancelRequested = false;
+  const request = { task: { source: "user_chat" } };
+  const usageEvent = (id, currentTokens) => ({ payload: { threadId: "thread-1", turnId: "turn-1", usageEventId: id, currentTokens } });
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, { event: usageEvent("one", 30), request, runKey });
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, { event: usageEvent("one", 30), request, runKey });
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, { event: usageEvent("two", 31), request, runKey });
+  assert.equal(guard.tokens, 61);
+  assert.deepEqual(cancellations, ["interactive_tool_limit:3/2", "interactive_token_limit:61/60"]);
 });
 
 test("handleCompactCommand invokes runtime compaction for the current thread", async () => {

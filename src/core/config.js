@@ -38,6 +38,9 @@ function readConfig() {
     modelGatewayUsageFile: path.join(stateDir, "model-gateway-usage.json"),
     optimizationThrottleFile: path.join(stateDir, "optimization-throttle.json"),
     modelGatewayBudgets: {
+      interactive: {
+        perTaskHardTokens: readIntEnv("CYBERBOSS_INTERACTIVE_HARD_TOKENS") ?? 250_000,
+      },
       background: {
         softMicros: readIntEnv("CYBERBOSS_BACKGROUND_BUDGET_SOFT_MICROS"),
         hardMicros: readIntEnv("CYBERBOSS_BACKGROUND_BUDGET_HARD_MICROS"),
@@ -60,6 +63,11 @@ function readConfig() {
     modelGatewayCacheMonitor: {
       minInputTokens: readIntEnv("CYBERBOSS_CACHE_ALERT_MIN_INPUT_TOKENS") || 20_000,
       minReadRatio: readNumberEnv("CYBERBOSS_CACHE_ALERT_MIN_READ_RATIO", 0.05),
+    },
+    interactiveTurnBudgets: {
+      recoveryHardTokens: readIntEnv("CYBERBOSS_RECOVERY_HARD_TOKENS") || 60_000,
+      hardTokens: readIntEnv("CYBERBOSS_INTERACTIVE_HARD_TOKENS") || 250_000,
+      recoveryToolCalls: readIntEnv("CYBERBOSS_RECOVERY_TOOL_CALLS") || 2,
     },
     experienceFile: path.join(stateDir, "experience-library.json"),
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
@@ -99,6 +107,7 @@ function readConfig() {
       timeoutMs: readIntEnv("CYBERBOSS_CHECKIN_TIMEOUT_MS") || 30_000,
       maxOutputTokens: readIntEnv("CYBERBOSS_CHECKIN_MAX_OUTPUT_TOKENS") || 400,
       maxMessageChars: readIntEnv("CYBERBOSS_CHECKIN_MAX_MESSAGE_CHARS") || 500,
+      mainHardTokens: readIntEnv("CYBERBOSS_CHECKIN_MAIN_HARD_TOKENS") || 60_000,
       minUserSilenceMs: readIntEnv("CYBERBOSS_CHECKIN_MIN_USER_SILENCE_MS") || 60 * 60_000,
       minEvaluationIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MIN_EVALUATION_INTERVAL_MS") || 30 * 60_000,
       unansweredBaseDelayMs: readIntEnv("CYBERBOSS_CHECKIN_UNANSWERED_BASE_DELAY_MS") || 3 * 60 * 60_000,
@@ -139,6 +148,7 @@ function readConfig() {
     claudeModel: readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "",
     claudeEffort: readTextEnv("CYBERBOSS_CLAUDE_EFFORT") || "high",
     claudeIdleTimeoutMs: readIntEnv("CYBERBOSS_CLAUDE_IDLE_TIMEOUT_MS"),
+    claudeKeepMainResident: readOptionalBoolEnv("CYBERBOSS_CLAUDE_KEEP_MAIN_RESIDENT") !== false,
     claudeContextWindow: readIntEnv("CYBERBOSS_CLAUDE_CONTEXT_WINDOW"),
     claudeMaxOutputTokens: readIntEnv("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
     autoCompactThresholdPercent: readIntEnv("CYBERBOSS_AUTO_COMPACT_THRESHOLD_PERCENT") || 85,
