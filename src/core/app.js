@@ -21,6 +21,9 @@ const {
   takeImageOnlyBatchMessages,
 } = require("./inbound-turn");
 const { resolveVisionContext } = require("../services/vision-context");
+const { DiaryIncrementalService } = require("../services/diary-incremental-service");
+const { DiaryFinalizeService } = require("../services/diary-finalize-service");
+const { CheckinDecisionService } = require("../services/checkin-decision-service");
 const { saveTurnContext, saveAssistantContext } = require("./recent-context");
 const {
   buildWeixinHelpText,
@@ -124,6 +127,10 @@ class CyberbossApp {
     this.backgroundContinuityBridge = new BackgroundContinuityBridge({ store: this.projectServices.backgroundContinuity });
     this.activeBackgroundWorkspaces = new Set();
     this.activeBackgroundBindingsByWorkspace = new Map();
+    this.activeTimelineNcpJobs = new Map();
+    this.activeDiaryIncrementalJobs = new Map();
+    this.activeDiaryFinalizeJobs = new Map();
+    this.activeCheckinJobs = new Map();
     this.pendingModelRequestByRunKey = new Map();
     this.tokenLimitedRunKeys = new Set();
     this.modelUsageLedger = new UsageLedger({
@@ -137,6 +144,20 @@ class CyberbossApp {
       budgetProvider: this.modelUsageLedger,
       alertSink: this.modelUsageLedger,
       cacheMonitor: config.modelGatewayCacheMonitor,
+    });
+    this.diaryIncrementalService = new DiaryIncrementalService({
+      config,
+      diaryService: this.projectServices.diary,
+      modelGateway: this.modelGateway,
+    });
+    this.diaryFinalizeService = new DiaryFinalizeService({
+      config,
+      diaryService: this.projectServices.diary,
+      modelGateway: this.modelGateway,
+    });
+    this.checkinDecisionService = new CheckinDecisionService({
+      config,
+      modelGateway: this.modelGateway,
     });
     this.optimizationThrottleStore = new AdaptiveThrottleStore({ filePath: config.optimizationThrottleFile || path.join(config.stateDir, "optimization-throttle.json") });
     this.cancellationCoordinator = new CancellationCoordinator();
@@ -229,8 +250,8 @@ class CyberbossApp {
       await this.ensureLocationServerStarted();
     }
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
-    if (this.config.startWithCheckin) {
-      console.log("[cyberboss] checkin: enabled");
+    const hasEnabledBackgroundPipeline = Object.values(this.config.backgroundPipelines || {}).some(Boolean);
+    if (this.config.startWithCheckin || hasEnabledBackgroundPipeline) {
       this._startBackgroundPollers();
     }
 
@@ -1362,9 +1383,20 @@ class CyberbossApp {
   }
 
   async flushPendingSystemMessages() {
+    // Safety net: force-release any turn gate scope that has been stuck for
+    // over 5 minutes. Without this, a background turn whose completion event
+    // never fired (crash, missing binding lookup) leaves a stale "busy" marker
+    // that blocks the whole background pipeline until the next restart.
+    this.turnGateStore?.releaseStuckScopes?.(300_000);
     const pendingMessages = this.systemMessageDispatcher?.drainPending() || [];
     for (const message of pendingMessages) {
       try {
+        if (!this.isBackgroundPipelineEnabled(message?.triggerKind)) {
+          const paused = deferSystemMessage(message, 24 * 60 * 60_000);
+          this.systemMessageDispatcher.requeue(paused);
+          console.log(`[cyberboss] background pipeline paused kind=${message.triggerKind || "system"} id=${message.id}`);
+          continue;
+        }
         const incremental = this.prepareIncrementalSystemMessage(message);
         if (incremental?.skip) {
           console.log(`[cyberboss] ${message.triggerKind} skipped: no incremental events`);
@@ -1374,6 +1406,30 @@ class CyberbossApp {
         const deferred = this.deferIncrementalMaintenanceUntilIdle(preparedMessage);
         if (deferred) {
           this.systemMessageDispatcher.requeue(deferred);
+          continue;
+        }
+        if (["timeline_incremental", "timeline_finalize"].includes(normalizeCommandArgument(preparedMessage.triggerKind))) {
+          const dispatched = await this.dispatchTimelineIncrementalViaNcp(preparedMessage);
+          if (!dispatched) {
+            this.systemMessageDispatcher.requeue(preparedMessage);
+          }
+          continue;
+        }
+        if (normalizeCommandArgument(preparedMessage.triggerKind) === "diary_incremental") {
+          const dispatched = await this.dispatchDiaryIncrementalOneShot(preparedMessage);
+          if (!dispatched) {
+            this.systemMessageDispatcher.requeue(deferSystemMessage(preparedMessage, 60_000));
+          }
+          continue;
+        }
+        if (normalizeCommandArgument(preparedMessage.triggerKind) === "diary_finalize") {
+          const dispatched = await this.dispatchDiaryFinalizeOneShot(preparedMessage);
+          if (!dispatched) this.systemMessageDispatcher.requeue(deferSystemMessage(preparedMessage, 60_000));
+          continue;
+        }
+        if (normalizeCommandArgument(preparedMessage.triggerKind) === "checkin") {
+          const dispatched = await this.dispatchCheckinOneShot(preparedMessage);
+          if (!dispatched) this.systemMessageDispatcher.requeue(deferSystemMessage(preparedMessage, 60_000));
           continue;
         }
         const dispatched = await this.dispatchSystemMessage(preparedMessage);
@@ -1391,6 +1447,211 @@ class CyberbossApp {
         this.systemMessageDispatcher?.requeue(retry);
       }
     }
+  }
+
+  async dispatchTimelineIncrementalViaNcp(prepared) {
+    // Lightweight timeline maintenance through NCP instead of a heavy
+    // background Claude session. The old path spawned a full session that
+    // loaded MCP tools and then hit the 3-minute turn timeout or the 60k
+    // token hard limit, leaving work-log entries stuck in `running` and
+    // blocking the whole checkin/timeline pipeline. This path runs the
+    // timeline-for-agent CLI via the NCP `timeline` profile (bounded,
+    // no model session, no token limit). The promise is deliberately not
+    // awaited by the Weixin poll loop; cursor commit happens only after the
+    // NCP tool has written, read back, and rebuilt the dashboard.
+    const workspaceRoot = normalizeText(prepared?.workspaceRoot)
+      || this.config.workspaceRoot
+      || process.cwd();
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: prepared?.workspaceId || this.config.workspaceId,
+      accountId: prepared?.accountId,
+      senderId: prepared?.senderId,
+    });
+    const jobKey = prepared?.incrementalScope || bindingKey;
+    if (this.activeTimelineNcpJobs.has(jobKey)) {
+      return false;
+    }
+    const workLog = safeWorkLogCall(this, "startExecution", {
+      source: "system",
+      triggerKind: prepared.triggerKind || "timeline_incremental",
+      summary: buildWorkLogSummary(prepared),
+      workspaceRoot,
+      bindingKey,
+      messageIds: collectPreparedMessageIds(prepared),
+      runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
+      instanceId: this.workLogInstanceId,
+    }) || null;
+    const job = (async () => {
+      const today = formatShanghaiDateOnly(new Date());
+      const finalize = normalizeCommandArgument(prepared?.triggerKind) === "timeline_finalize";
+      const dates = finalize
+        ? [today]
+        : [...new Set([
+          ...(Array.isArray(prepared?.incrementalEvents) ? prepared.incrementalEvents : [])
+            .map((event) => formatShanghaiDateOnly(event?.at)),
+          today,
+        ].filter(Boolean))];
+      const result = await this.projectServices.ncpReadOnly.runTimelineMaintenance({ dates, finalize });
+      if (prepared?.incrementalCursor && prepared?.incrementalScope) {
+        this.incrementalEventStore.commit({
+          consumer: "timeline_incremental",
+          scope: prepared.incrementalScope,
+          cursor: prepared.incrementalCursor,
+        });
+      }
+      if (workLog?.id) {
+        safeWorkLogCall(this, "finishExecution", workLog.id, {
+          status: "succeeded",
+          error: "",
+        });
+      }
+      console.log(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} via NCP status=verified dates=${dates.join(",")} finalize=${finalize}`);
+    })().catch((error) => {
+      if (workLog?.id) {
+        safeWorkLogCall(this, "finishExecution", workLog.id, {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error || "NCP timeline batch failed"),
+        });
+      }
+      console.error(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} via NCP failed: ${error instanceof Error ? error.message : String(error)}`);
+      const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
+      if (attempt < 1) {
+        this.systemMessageDispatcher?.requeue(buildBackgroundRetryMessage(prepared, { error }));
+      } else {
+        console.error(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} dead-lettered id=${prepared?.id || "unknown"} after ${attempt + 1} attempts`);
+      }
+    }).finally(() => {
+      this.activeTimelineNcpJobs.delete(jobKey);
+    });
+    this.activeTimelineNcpJobs.set(jobKey, job);
+    return true;
+  }
+
+  async dispatchDiaryIncrementalOneShot(prepared) {
+    const jobKey = prepared?.incrementalScope || `${prepared?.accountId || ""}:${prepared?.senderId || ""}`;
+    if (this.activeDiaryIncrementalJobs.has(jobKey)) return false;
+    const workspaceRoot = normalizeText(prepared?.workspaceRoot) || this.config.workspaceRoot || process.cwd();
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: prepared?.workspaceId || this.config.workspaceId,
+      accountId: prepared?.accountId,
+      senderId: prepared?.senderId,
+    });
+    const workLog = safeWorkLogCall(this, "startExecution", {
+      source: "system",
+      triggerKind: "diary_incremental",
+      summary: buildWorkLogSummary(prepared),
+      workspaceRoot,
+      bindingKey,
+      messageIds: collectPreparedMessageIds(prepared),
+      runtimeId: "openai-compatible-one-shot",
+      instanceId: this.workLogInstanceId,
+    }) || null;
+    const job = this.diaryIncrementalService.process({
+      events: prepared?.incrementalEvents,
+      scope: prepared?.incrementalScope,
+      taskId: prepared?.id,
+    }).then((result) => {
+      if (result.processedCursor > 0 && prepared?.incrementalScope) {
+        this.incrementalEventStore.commit({
+          consumer: "diary_incremental",
+          scope: prepared.incrementalScope,
+          cursor: result.processedCursor,
+        });
+      }
+      if (workLog?.id) safeWorkLogCall(this, "finishExecution", workLog.id, { status: "succeeded", error: "" });
+      console.log(`[cyberboss] diary_incremental one-shot status=${result.status} events=${result.processedEventCount || 0} appended=${result.appended}`);
+    }).catch((error) => {
+      if (workLog?.id) safeWorkLogCall(this, "finishExecution", workLog.id, {
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error || "diary one-shot failed"),
+      });
+      const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
+      console.error(`[cyberboss] diary_incremental one-shot failed attempt=${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      if (attempt < 1) {
+        this.systemMessageDispatcher?.requeue(buildBackgroundRetryMessage(prepared, { error }));
+      } else {
+        console.error(`[cyberboss] diary_incremental dead-lettered id=${prepared?.id || "unknown"} after ${attempt + 1} attempts`);
+      }
+    }).finally(() => {
+      this.activeDiaryIncrementalJobs.delete(jobKey);
+    });
+    this.activeDiaryIncrementalJobs.set(jobKey, job);
+    return true;
+  }
+
+  async dispatchDiaryFinalizeOneShot(prepared) {
+    const date = normalizeCommandArgument(prepared?.metadata?.diaryDate) || formatShanghaiDateOnly(new Date());
+    if (this.activeDiaryFinalizeJobs.has(date)) return false;
+    const job = (async () => {
+      const result = await this.diaryFinalizeService.process({ date, taskId: prepared?.id });
+      if (result.needsDelivery && result.screenshotPath) {
+        await this.sendLocalFileToCurrentChat({ senderId: prepared?.senderId, filePath: result.screenshotPath });
+        this.diaryFinalizeService.recordDelivered(date);
+      }
+      console.log(`[cyberboss] diary_finalize one-shot status=${result.status} delivered=${Boolean(result.needsDelivery && result.screenshotPath)}`);
+    })().catch((error) => {
+      const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
+      console.error(`[cyberboss] diary_finalize one-shot failed attempt=${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      if (attempt < 1) this.systemMessageDispatcher?.requeue(buildBackgroundRetryMessage(prepared, { error }));
+      else console.error(`[cyberboss] diary_finalize dead-lettered id=${prepared?.id || "unknown"} after ${attempt + 1} attempts`);
+    }).finally(() => this.activeDiaryFinalizeJobs.delete(date));
+    this.activeDiaryFinalizeJobs.set(date, job);
+    return true;
+  }
+
+  async dispatchCheckinOneShot(prepared) {
+    const scope = prepared?.incrementalScope;
+    if (!scope || this.activeCheckinJobs.has(scope)) return false;
+    const baseBindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: prepared?.workspaceId || this.config.workspaceId,
+      accountId: prepared?.accountId,
+      senderId: prepared?.senderId,
+    });
+    const recentTurns = this.conversationContinuityStore.read()?.scopes?.[scope]?.turns || [];
+    const job = (async () => {
+      const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
+      const result = await this.checkinDecisionService.evaluate({
+        scope,
+        events: prepared?.incrementalEvents || [],
+        recentTurns,
+        taskId: prepared?.id,
+        force: attempt > 0,
+      });
+      if (result.action === "send_message") {
+        await this.channelAdapter.sendText({
+          userId: prepared.senderId,
+          text: result.message,
+          contextToken: this.channelAdapter.getKnownContextTokens()[prepared.senderId] || "",
+        });
+        this.checkinDecisionService.recordSent(scope);
+        const at = new Date().toISOString();
+        this.incrementalEventStore.append({
+          id: `checkin:${prepared.id}`,
+          scope,
+          kind: "assistant.message",
+          text: result.message,
+          at,
+        });
+        this.projectServices.backgroundContinuity?.record?.({
+          scope: buildScopeKey(baseBindingKey, prepared.workspaceRoot || this.resolveWorkspaceRoot(baseBindingKey)),
+          kind: "outbound_message",
+          triggerKind: "checkin",
+          text: result.message,
+          metadata: { sentAt: at },
+        });
+      }
+      if (prepared?.incrementalCursor && scope) {
+        this.incrementalEventStore.commit({ consumer: "checkin", scope, cursor: prepared.incrementalCursor });
+      }
+      console.log(`[cyberboss] checkin one-shot status=${result.status} action=${result.action} reason=${result.reason || ""} model=${result.modelCalled}`);
+    })().catch((error) => {
+      const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
+      console.error(`[cyberboss] checkin one-shot failed attempt=${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      if (attempt < 1) this.systemMessageDispatcher?.requeue(buildBackgroundRetryMessage(prepared, { error }));
+      else console.error(`[cyberboss] checkin dead-lettered id=${prepared?.id || "unknown"} after ${attempt + 1} attempts`);
+    }).finally(() => this.activeCheckinJobs.delete(scope));
+    this.activeCheckinJobs.set(scope, job);
+    return true;
   }
 
   recordIncrementalUserEvent(normalized) {
@@ -1453,7 +1714,17 @@ class CyberbossApp {
           recordedAt: new Date().toISOString(),
         });
       }
-      return { skip: true };
+      if (consumer !== "checkin") return { skip: true };
+      return {
+        skip: false,
+        message: {
+          ...message,
+          incrementalScope: scope,
+          incrementalCursor: delta.cursor,
+          incrementalEvents: [],
+          incrementalHasMore: false,
+        },
+      };
     }
     this.optimizationThrottleStore?.recordOutcome?.(throttleKey, "activity");
     return {
@@ -1580,11 +1851,25 @@ class CyberbossApp {
   }
 
   _startBackgroundPollers() {
-    console.log("[cyberboss] background pollers enabled (diary + timeline + checkin)");
-    this._startPollerLoop(runDiaryPoller, "diary");
-    this._startPollerLoop(runTimelinePoller, "timeline");
-    this._startPollerLoop(runCheckinPoller, "checkin");
-    this._startDailyMaintenanceFinalizers();
+    const enabled = this.config.backgroundPipelines || {};
+    const names = Object.entries(enabled).filter(([, value]) => value).map(([name]) => name);
+    console.log(`[cyberboss] background pipelines enabled: ${names.join(", ") || "none (safe mode)"}`);
+    if (enabled.diary_incremental) this._startPollerLoop(runDiaryPoller, "diary");
+    if (enabled.timeline_incremental) this._startPollerLoop(runTimelinePoller, "timeline");
+    if (enabled.checkin) this._startPollerLoop(runCheckinPoller, "checkin");
+    if (enabled.diary_finalize || enabled.timeline_finalize) this._startDailyMaintenanceFinalizers();
+  }
+
+  isBackgroundPipelineEnabled(triggerKind) {
+    const kind = normalizeCommandArgument(triggerKind);
+    if (!["checkin", "diary_incremental", "timeline_incremental", "diary_finalize", "timeline_finalize"].includes(kind)) {
+      return true;
+    }
+    // Programmatic/test configurations created before per-pipeline controls
+    // retain their explicit legacy behavior. readConfig() always supplies this
+    // object, with production-safe false defaults.
+    if (!this.config.backgroundPipelines) return true;
+    return this.config.backgroundPipelines?.[kind] === true;
   }
 
   _startPollerLoop(pollerFn, name) {
@@ -1605,6 +1890,34 @@ class CyberbossApp {
   }
 
   _startDailyMaintenanceFinalizers() {
+    if (this.config.backgroundPipelines?.diary_finalize) {
+      const yesterday = formatShanghaiDateOnly(new Date(Date.now() - 24 * 60 * 60_000));
+      const diaryPath = path.join(this.config.diaryDir, `${yesterday}.md`);
+      const alreadyFinalized = fs.existsSync(diaryPath) && /^##\s+CC 的想法\s*$/m.test(fs.readFileSync(diaryPath, "utf8"));
+      if (!alreadyFinalized && !this.systemMessageQueue.hasPendingForPipeline(this.activeAccountId, "diary_finalize")) {
+        const account = resolveSelectedAccount(this.config);
+        const sessionStore = new SessionStore({ filePath: this.config.sessionsFile });
+        const senderId = resolvePreferredSenderId({
+          config: this.config,
+          accountId: account.accountId,
+          explicitUser: process.env.CYBERBOSS_CHECKIN_USER_ID || "",
+          sessionStore,
+        });
+        const workspaceRoot = resolvePreferredWorkspaceRoot({
+          config: this.config,
+          accountId: account.accountId,
+          senderId,
+          explicitWorkspace: process.env.CYBERBOSS_CHECKIN_WORKSPACE || "",
+          sessionStore,
+        });
+        const queued = this.systemMessageQueue.enqueue({
+          id: crypto.randomUUID(), accountId: account.accountId, senderId, workspaceRoot,
+          text: "DIARY_FINALIZE", triggerKind: "diary_finalize", createdAt: new Date().toISOString(),
+          metadata: { diaryDate: yesterday, catchUp: true },
+        });
+        console.log(`[cyberboss] diary finalize catch-up queued date=${yesterday} id=${queued.id}`);
+      }
+    }
     const schedule = () => {
       const now = new Date();
       const target = resolveNextDiaryFinalizeAt(now);
@@ -1630,27 +1943,23 @@ class CyberbossApp {
               explicitWorkspace: process.env.CYBERBOSS_CHECKIN_WORKSPACE || "",
               sessionStore,
             });
-            const queued = this.systemMessageQueue.enqueue({
-              id: crypto.randomUUID(),
-              accountId: account.accountId,
-              senderId,
-              workspaceRoot,
-              text: "DIARY_FINALIZE",
-              triggerKind: "diary_finalize",
-              createdAt: new Date().toISOString(),
-            });
-            console.log(`[cyberboss] diary summarize queued id=${queued.id}`);
-            const timelineQueued = this.systemMessageQueue.enqueue({
-              id: crypto.randomUUID(),
-              accountId: account.accountId,
-              senderId,
-              workspaceRoot,
-              text: "TIMELINE_FINALIZE",
-              triggerKind: "timeline_finalize",
-              createdAt: new Date().toISOString(),
-              notBefore: new Date(Date.now() + 1_000).toISOString(),
-            });
-            console.log(`[cyberboss] timeline finalize queued id=${timelineQueued.id}`);
+            if (this.config.backgroundPipelines?.diary_finalize) {
+              const diaryDate = formatShanghaiDateOnly(new Date());
+              const queued = this.systemMessageQueue.enqueue({
+                id: crypto.randomUUID(), accountId: account.accountId, senderId, workspaceRoot,
+                text: "DIARY_FINALIZE", triggerKind: "diary_finalize", createdAt: new Date().toISOString(),
+                metadata: { diaryDate },
+              });
+              console.log(`[cyberboss] diary summarize queued id=${queued.id}`);
+            }
+            if (this.config.backgroundPipelines?.timeline_finalize) {
+              const timelineQueued = this.systemMessageQueue.enqueue({
+                id: crypto.randomUUID(), accountId: account.accountId, senderId, workspaceRoot,
+                text: "TIMELINE_FINALIZE", triggerKind: "timeline_finalize", createdAt: new Date().toISOString(),
+                notBefore: new Date(Date.now() + 1_000).toISOString(),
+              });
+              console.log(`[cyberboss] timeline finalize queued id=${timelineQueued.id}`);
+            }
           }
         } catch (error) {
           console.error(`[cyberboss] diary summarize enqueue failed: ${error.message}`);
@@ -1687,7 +1996,26 @@ class CyberbossApp {
       return false;
     }
     if (this.activeBackgroundWorkspaces?.has(workspaceRoot)) {
-      return false;
+      // Self-heal a stale "background busy" marker. This marker is added right
+      // before a background turn is dispatched and normally removed when that
+      // turn completes, times out, or is preempted. If the turn's completion
+      // event fails its binding lookup, the marker can survive and block the
+      // entire background pipeline (diary/timeline/checkin) until a restart.
+      // Only clear it when the marked background turn is verifiably not live:
+      // its turn gate is no longer pending. (The gate is released on normal
+      // completion even when the binding lookup fails; releaseStuckScopes in
+      // flushPendingSystemMessages force-releases it if the turn itself hung.)
+      const backgroundBinding = this.activeBackgroundBindingsByWorkspace?.get(workspaceRoot) || "";
+      const backgroundLive = Boolean(
+        backgroundBinding && this.turnGateStore.isPending(backgroundBinding, workspaceRoot)
+      );
+      if (backgroundBinding && !backgroundLive) {
+        this.activeBackgroundWorkspaces.delete(workspaceRoot);
+        this.activeBackgroundBindingsByWorkspace?.delete(workspaceRoot);
+        console.log(`[cyberboss] cleared stale background marker workspace=${workspaceRoot}`);
+      } else {
+        return false;
+      }
     }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       return false;
@@ -2690,6 +3018,19 @@ class CyberbossApp {
       provider: "weixin",
     };
   }
+}
+
+function formatShanghaiDateOnly(value) {
+  const parsed = new Date(value instanceof Date ? value.getTime() : Date.parse(String(value || "")));
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(parsed);
 }
 
 function resolveNextDiaryFinalizeAt(now = new Date()) {

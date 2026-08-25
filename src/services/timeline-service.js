@@ -28,6 +28,31 @@ class TimelineService {
     };
   }
 
+  async maintain({ date = "", finalize = false } = {}) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizeText(date))) {
+      throw new Error("Timeline maintenance requires date in YYYY-MM-DD.");
+    }
+    const pending = this.observationStore.listPending({ date });
+    const plan = buildDeterministicMaintenancePlan(pending);
+    const result = await this.reconcile({
+      date,
+      events: plan.events,
+      resolvedObservationIds: plan.resolvedObservationIds,
+      finalize,
+    });
+    return {
+      schema: "cyberboss.timeline-maintenance.v1",
+      status: "verified",
+      date,
+      finalized: Boolean(finalize),
+      plannedEventCount: plan.events.length,
+      resolvedObservationCount: result.resolvedObservationCount,
+      pendingObservationCount: result.pendingObservations.length,
+      applied: result.applied,
+      warnings: result.warnings,
+    };
+  }
+
   async reconcile({
     date = "",
     events = [],
@@ -526,6 +551,81 @@ function buildReconcileWarnings(events, observations) {
   return warnings;
 }
 
+function buildDeterministicMaintenancePlan(observations) {
+  const pending = Array.isArray(observations) ? observations : [];
+  const events = [];
+  const resolvedObservationIds = [];
+  const consumed = new Set();
+
+  for (const observation of pending) {
+    const startAt = normalizeIso(observation?.startAt);
+    const endAt = normalizeIso(observation?.endAt);
+    if (observation?.status !== "completed"
+      || !["exact", "approximate"].includes(observation?.timePrecision)
+      || !startAt || !endAt || Date.parse(endAt) <= Date.parse(startAt)) {
+      continue;
+    }
+    events.push(buildEventFromObservations([observation], { startAt, endAt }));
+    resolvedObservationIds.push(observation.id);
+    consumed.add(observation.id);
+  }
+
+  const starts = pending.filter((item) => !consumed.has(item.id)
+    && item.boundaryType === "start"
+    && item.timePrecision !== "unknown"
+    && normalizeIso(item.boundaryAt || item.startAt));
+  const ends = pending.filter((item) => !consumed.has(item.id)
+    && item.status === "completed"
+    && item.boundaryType === "end"
+    && item.timePrecision !== "unknown"
+    && normalizeIso(item.boundaryAt || item.endAt || item.observedAt));
+  for (const start of starts) {
+    const startAt = normalizeIso(start.boundaryAt || start.startAt);
+    const activityType = normalizeText(start.activityType).toLowerCase();
+    const end = ends.find((candidate) => !consumed.has(candidate.id)
+      && normalizeText(candidate.activityType).toLowerCase() === activityType
+      && Date.parse(normalizeIso(candidate.boundaryAt || candidate.endAt || candidate.observedAt)) > Date.parse(startAt));
+    if (!end) continue;
+    const endAt = normalizeIso(end.boundaryAt || end.endAt || end.observedAt);
+    events.push(buildEventFromObservations([start, end], { startAt, endAt }));
+    resolvedObservationIds.push(start.id, end.id);
+    consumed.add(start.id);
+    consumed.add(end.id);
+  }
+  return { events, resolvedObservationIds: uniqueStrings(resolvedObservationIds) };
+}
+
+function buildEventFromObservations(observations, { startAt, endAt }) {
+  const observationIds = observations.map((item) => item.id);
+  const activityType = normalizeText(observations.find((item) => item.activityType)?.activityType).toLowerCase();
+  const classification = classifyActivity(activityType);
+  const note = uniqueStrings(observations.map((item) => normalizeText(item.text))).join("；");
+  return {
+    observationIds,
+    startAt,
+    endAt,
+    timePrecision: observations.every((item) => item.timePrecision === "exact") ? "exact" : "approximate",
+    title: classification.title || note.slice(0, 80) || "活动",
+    note,
+    categoryId: classification.categoryId,
+    subcategoryId: classification.subcategoryId,
+    eventNodeId: classification.eventNodeId,
+  };
+}
+
+function classifyActivity(activityType) {
+  const known = {
+    sleep: { title: "睡眠", categoryId: "rest", subcategoryId: "rest.sleep", eventNodeId: "evt.sleep" },
+    nap: { title: "午睡", categoryId: "rest", subcategoryId: "rest.nap", eventNodeId: "evt.nap" },
+    coding: { title: "写代码", categoryId: "work", subcategoryId: "work.coding", eventNodeId: "evt.focus_coding" },
+    chat: { title: "聊天", categoryId: "social", subcategoryId: "social.chat", eventNodeId: "evt.chatting" },
+    walk: { title: "散步", categoryId: "exercise", subcategoryId: "exercise.walk", eventNodeId: "evt.walk" },
+    workout: { title: "锻炼", categoryId: "exercise", subcategoryId: "exercise.workout", eventNodeId: "evt.workout" },
+    reading: { title: "阅读", categoryId: "entertainment", subcategoryId: "entertainment.reading", eventNodeId: "evt.reading" },
+  };
+  return known[activityType] || { title: activityType, categoryId: "", subcategoryId: "", eventNodeId: "" };
+}
+
 function normalizeIso(value) {
   const parsed = Date.parse(String(value || ""));
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : "";
@@ -622,4 +722,4 @@ function normalizeNonNegativeInteger(value) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-module.exports = { TimelineService };
+module.exports = { TimelineService, buildDeterministicMaintenancePlan };

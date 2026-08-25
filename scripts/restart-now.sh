@@ -63,7 +63,7 @@ for _ in $(seq 1 45); do
       logs="$(journalctl -u "${SERVICE}" _PID="${new_pid}" --since "${started_at}" --no-pager 2>/dev/null || true)"
       if grep -q "bootstrap ok" <<<"${logs}" \
         && grep -q "bridge loop started" <<<"${logs}" \
-        && grep -q "background pollers enabled" <<<"${logs}"; then
+        && grep -Eq "background (pollers|pipelines) enabled" <<<"${logs}"; then
         echo "${SERVICE} is healthy (new PID ${new_pid})."
         exit 0
       fi

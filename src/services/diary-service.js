@@ -7,6 +7,8 @@ const { resolveBodyInput } = require("./text-input");
 const { writeDiaryView } = require("../../scripts/diary-view");
 const { captureDiaryScreenshot } = require("../../scripts/diary-screenshot");
 
+const FRAGMENT_KEYS_FILE = ".fragment-keys.json";
+
 class DiaryService {
   constructor({ config, renderDiary = writeDiaryView, screenshotDiary = captureDiaryScreenshot }) {
     this.config = config;
@@ -38,14 +40,21 @@ class DiaryService {
     const idempotencyKey = normalizedSourceIds.length
       ? crypto.createHash("sha256").update(normalizedSourceIds.sort().join("\n")).digest("hex")
       : "";
-    const marker = idempotencyKey ? `<!-- cyberboss-diary-fragment:${idempotencyKey} -->` : "";
+    const keysFilePath = path.join(this.config.diaryDir, FRAGMENT_KEYS_FILE);
 
     fs.mkdirSync(this.config.diaryDir, { recursive: true });
-    const duplicate = withFileLockSync(filePath, () => {
+    // Idempotency markers live in a sidecar index file, never in the diary draft
+    // body, so raw drafts stay clean for uu to read.
+    const duplicate = withFileLockSync(keysFilePath, () => {
+      const keys = idempotencyKey ? readFragmentKeys(keysFilePath) : null;
+      if (idempotencyKey && keys.includes(idempotencyKey)) return true;
       const current = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
-      if (marker && current.includes(marker)) return true;
       const prefix = current.trim() ? "\n\n" : "";
-      writeTextFileAtomicSync(filePath, `${current}${prefix}${marker ? `${marker}\n` : ""}${entry}`);
+      writeTextFileAtomicSync(filePath, `${current}${prefix}${entry}`);
+      if (idempotencyKey) {
+        keys.push(idempotencyKey);
+        writeTextFileAtomicSync(keysFilePath, `${JSON.stringify({ keys }, null, 2)}\n`);
+      }
       return false;
     });
     return {
@@ -226,6 +235,15 @@ function formatTime(date) {
     minute: "2-digit",
     hour12: false,
   }).format(date);
+}
+
+function readFragmentKeys(filePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return Array.isArray(parsed?.keys) ? parsed.keys : [];
+  } catch {
+    return [];
+  }
 }
 
 module.exports = {

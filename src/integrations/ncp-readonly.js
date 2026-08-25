@@ -25,6 +25,13 @@ const ALLOWED_TOOLS = Object.freeze({
     "browser_select_option", "browser_fill_form", "browser_handle_dialog",
     "browser_close",
   ]),
+  timeline: new Set([
+    // read-only / maintenance: read, categories, proposals are fast and
+    // side-effect-free. `maintain` is the single authorized transactional
+    // mutation: it performs write + readback + build inside the isolated NCP
+    // process and only returns after verification.
+    "read", "categories", "proposals", "maintain",
+  ]),
 });
 
 const INTERACTION_TOOLS = new Set([
@@ -82,6 +89,46 @@ class NcpReadOnlyAdapter {
       calls: results,
       returnedChars: results.reduce((sum, item) => sum + item.returnedChars, 0),
     };
+  }
+
+  async runTimelineMaintenance(params = {}) {
+    const dateLabel = normalizeText(params.date)
+      || normalizeText(Array.isArray(params.dates) ? params.dates[0] : "")
+      || "unknown";
+    const [result] = await this.executeCalls([validateReadCall({
+      callId: `timeline-maintain-${dateLabel}`,
+      server: "timeline",
+      tool: "maintain",
+      params,
+    })], { timeoutMs: Math.max(this.timeoutMs, 10 * 60_000), maxChars: Math.max(this.maxChars, 8_000) });
+    if (result.status !== "completed") {
+      throw new Error(result.text || "NCP timeline maintenance failed");
+    }
+    return result;
+  }
+
+  async executeCalls(normalized, { timeoutMs = this.timeoutMs, maxChars = this.maxChars } = {}) {
+    return Promise.all(normalized.map(async (call) => {
+      const startedAt = Date.now();
+      try {
+        const result = await this.executor({
+          command: this.command, cwd: this.cwd, timeoutMs, call,
+          maxOutputChars: Math.max(16_000, maxChars * 4),
+        });
+        return compressToolResult({
+          callId: call.callId, tool: `${call.server}:${call.tool}`, status: "completed",
+          text: result.text, durationMs: Date.now() - startedAt,
+          evidenceIds: result.evidenceIds, metadata: { ncp: { server: call.server } },
+        }, { maxChars });
+      } catch (error) {
+        return compressToolResult({
+          callId: call.callId, tool: `${call.server}:${call.tool}`,
+          status: error?.code === "ETIMEDOUT" ? "cancelled" : "failed",
+          text: error?.message || "NCP call failed", durationMs: Date.now() - startedAt,
+          metadata: { ncp: { server: call.server } },
+        }, { maxChars });
+      }
+    }));
   }
 }
 

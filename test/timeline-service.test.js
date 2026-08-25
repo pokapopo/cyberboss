@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { TimelineService } = require("../src/services/timeline-service");
+const { TimelineService, buildDeterministicMaintenancePlan } = require("../src/services/timeline-service");
 
 function createService(options = {}) {
   const calls = [];
@@ -172,6 +172,44 @@ test("timeline capture preserves evidence without writing the timeline", () => {
     threadId: "thread-1",
   });
   assert.deepEqual(calls, []);
+});
+
+test("timeline maintenance deterministically consumes only complete timed evidence", () => {
+  const plan = buildDeterministicMaintenancePlan([
+    {
+      id: "obs-complete", text: "两点到三点写代码", activityType: "coding",
+      startAt: "2026-08-25T06:00:00.000Z", endAt: "2026-08-25T07:00:00.000Z",
+      timePrecision: "exact", status: "completed", boundaryType: "range",
+    },
+    {
+      id: "obs-unknown", text: "下午睡了一觉", activityType: "sleep",
+      startAt: "", endAt: "", timePrecision: "unknown", status: "completed", boundaryType: "unknown",
+    },
+  ]);
+
+  assert.equal(plan.events.length, 1);
+  assert.deepEqual(plan.resolvedObservationIds, ["obs-complete"]);
+  assert.equal(plan.events[0].eventNodeId, "evt.focus_coding");
+  assert.equal(plan.events[0].title, "写代码");
+});
+
+test("timeline maintenance pairs matching start/end boundaries without guessing", () => {
+  const plan = buildDeterministicMaintenancePlan([
+    {
+      id: "obs-start", text: "开始睡觉", activityType: "sleep",
+      boundaryType: "start", boundaryAt: "2026-08-24T17:00:00.000Z",
+      timePrecision: "approximate", status: "ongoing",
+    },
+    {
+      id: "obs-end", text: "睡醒了", activityType: "sleep",
+      boundaryType: "end", boundaryAt: "2026-08-25T01:00:00.000Z",
+      timePrecision: "approximate", status: "completed",
+    },
+  ]);
+
+  assert.equal(plan.events.length, 1);
+  assert.deepEqual(plan.events[0].observationIds, ["obs-start", "obs-end"]);
+  assert.deepEqual(plan.resolvedObservationIds, ["obs-start", "obs-end"]);
 });
 
 test("timeline reconcile inspects evidence then safely replaces and verifies the complete day", async () => {

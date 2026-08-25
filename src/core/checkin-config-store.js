@@ -6,8 +6,10 @@ const {
   writeJsonFileAtomicSync,
 } = require("./json-state-file");
 
-const DEFAULT_MIN_INTERVAL_MS = 3 * 60_000;
-const DEFAULT_MAX_INTERVAL_MS = 60 * 60_000;
+// Polling only creates a zero-token candidate check most of the time. Keep it
+// flexible but avoid the legacy three-minute churn.
+const DEFAULT_MIN_INTERVAL_MS = 15 * 60_000;
+const DEFAULT_MAX_INTERVAL_MS = 45 * 60_000;
 
 const DEFAULT_DIARY_MIN_INTERVAL_MS = 30 * 60_000;
 const DEFAULT_DIARY_MAX_INTERVAL_MS = 60 * 60_000;

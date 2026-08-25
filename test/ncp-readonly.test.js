@@ -110,3 +110,19 @@ setInterval(() => {}, 1000);
   assert.ok(result.text.length <= 1_000);
   assert.ok(Date.now() - startedAt < 3_000);
 });
+
+test("NCP timeline maintenance uses the long-running isolated tool contract", async () => {
+  const seen = [];
+  const adapter = new NcpReadOnlyAdapter({
+    timeoutMs: 1_000,
+    executor: async (input) => {
+      seen.push(input);
+      return { text: "verified receipt" };
+    },
+  });
+  const result = await adapter.runTimelineMaintenance({ date: "2026-08-25", finalize: true });
+  assert.equal(result.status, "completed");
+  assert.equal(seen[0].call.tool, "maintain");
+  assert.deepEqual(seen[0].call.params, { date: "2026-08-25", finalize: true });
+  assert.equal(seen[0].timeoutMs, 10 * 60_000);
+});
