@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const { TOOLS: READONLY_NCP_TOOLS } = require("./ncp-native-readonly-server");
+const { unlockNativeFallback } = require("./ncp-route-policy");
 
 const NCP_PUBLIC_SCHEMA = Object.freeze([
   { name: "find", version: 1 },
@@ -31,7 +32,9 @@ class NcpNativeAdapter {
   async find({ query = "", limit = 5, depth = 1, operationId } = {}) {
     const id = normalizeOperationId(operationId);
     ensureNativeProfile(this.cwd, this.mode);
-    const result = await this.executor({
+    let result;
+    try {
+      result = await this.executor({
       command: this.command,
       cwd: this.cwd,
       timeoutMs: this.timeoutMs,
@@ -39,7 +42,11 @@ class NcpNativeAdapter {
       operationId: id,
       mode: this.mode,
       args: ["--profile", this.profile, "find", "--limit", String(clampInteger(limit, 1, 8)), "--depth", String(clampInteger(depth, 0, 2)), normalizeText(query), "--no-color"].filter(Boolean),
-    });
+      });
+    } catch (error) {
+      unlockNativeFallback(`find: ${error?.message || String(error)}`);
+      throw error;
+    }
     const text = sanitizeFindOutput(result.text);
     return {
       ...result,
@@ -56,7 +63,9 @@ class NcpNativeAdapter {
     ensureNativeProfile(this.cwd, this.mode);
     const normalizedAuthorization = normalizeAuthorization(authorization);
     const effectiveTimeout = Math.min(Math.max(Number(timeoutMs) || this.timeoutMs, 1_000), this.timeoutMs);
-    const result = await this.executor({
+    let result;
+    try {
+      result = await this.executor({
       command: this.command,
       cwd: this.cwd,
       timeoutMs: effectiveTimeout,
@@ -65,7 +74,11 @@ class NcpNativeAdapter {
       mode: this.mode,
       authorization: normalizedAuthorization,
       args: ["--profile", this.profile, "code", "--timeout", String(effectiveTimeout), "--json", code],
-    });
+      });
+    } catch (error) {
+      unlockNativeFallback(`code: ${error?.message || String(error)}`);
+      throw error;
+    }
     return { ...result, publicSchemaFingerprint: NCP_PUBLIC_SCHEMA_FINGERPRINT, registryFingerprint: NCP_REGISTRY_FINGERPRINTS[this.mode] };
   }
 }

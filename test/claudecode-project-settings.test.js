@@ -7,6 +7,7 @@ const path = require("node:path");
 const {
   ensureClaudeProjectMcpConfig,
   buildClaudeProjectMcpServerConfig,
+  ensureClaudeProjectNcpRouteHook,
 } = require("../src/adapters/runtime/claudecode/project-settings");
 const { filterClaudeCodeEnv } = require("../src/adapters/runtime/claudecode");
 
@@ -40,6 +41,21 @@ test("ensureClaudeProjectMcpConfig upserts cyberboss MCP server into workspace .
     workspaceRoot,
     cyberbossHome,
   }));
+});
+
+test("NCP route hook is reproducible and preserves existing Claude hooks", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-ncp-hook-"));
+  const workspaceRoot = path.join(root, "workspace");
+  const cyberbossHome = path.join(root, "home");
+  fs.mkdirSync(path.join(workspaceRoot, ".claude"), { recursive: true });
+  fs.mkdirSync(path.join(cyberbossHome, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(cyberbossHome, "scripts", "ncp-route-hook.js"), "#!/usr/bin/env node\n");
+  fs.writeFileSync(path.join(workspaceRoot, ".claude", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Write", hooks: [] }] } }));
+  ensureClaudeProjectNcpRouteHook({ workspaceRoot, cyberbossHome });
+  ensureClaudeProjectNcpRouteHook({ workspaceRoot, cyberbossHome });
+  const saved = JSON.parse(fs.readFileSync(path.join(workspaceRoot, ".claude", "settings.json"), "utf8"));
+  assert.equal(saved.hooks.PreToolUse.filter((entry) => entry.cyberbossManaged === "ncp-route-v1").length, 1);
+  assert.equal(saved.hooks.PreToolUse.some((entry) => entry.matcher === "Write"), true);
 });
 
 test("ensureClaudeProjectMcpConfig rewrites stale cyberboss MCP server config", () => {

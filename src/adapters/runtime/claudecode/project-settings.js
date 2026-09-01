@@ -37,12 +37,36 @@ function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "", state
   if (!jsonEquals(current, next)) {
     writeJsonFileAtomicSync(configPath, next);
   }
+  if (stableCore && ["read-only", "guarded-write"].includes(normalizeText(process.env.CYBERBOSS_NCP_NATIVE))) {
+    ensureClaudeProjectNcpRouteHook({ workspaceRoot: normalizedWorkspaceRoot, cyberbossHome });
+  }
 
   return {
     configPath,
     serverName: "cyberboss_tools",
     config: next,
   };
+}
+
+function ensureClaudeProjectNcpRouteHook({ workspaceRoot, cyberbossHome = "" } = {}) {
+  const home = normalizeText(cyberbossHome) || process.env.CYBERBOSS_HOME || path.resolve(__dirname, "..", "..", "..", "..");
+  const hookScript = path.join(home, "scripts", "ncp-route-hook.js");
+  if (!fs.existsSync(hookScript)) throw new Error(`Cyberboss NCP route hook not found: ${hookScript}`);
+  const settingsPath = path.join(workspaceRoot, ".claude", "settings.json");
+  const current = readJsonObject(settingsPath);
+  const hooks = current.hooks && typeof current.hooks === "object" ? current.hooks : {};
+  const existing = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : [];
+  const command = `${process.execPath} ${hookScript}`;
+  const retained = existing.filter((entry) => entry?.cyberbossManaged !== "ncp-route-v1"
+    && !entry?.hooks?.some?.((hook) => normalizeText(hook?.command).endsWith("scripts/ncp-route-hook.js")));
+  const routeHook = {
+    cyberbossManaged: "ncp-route-v1",
+    matcher: "Bash|Grep|Glob|Read",
+    hooks: [{ type: "command", command, timeout: 5 }],
+  };
+  const next = { ...current, hooks: { ...hooks, PreToolUse: [...retained, routeHook] } };
+  if (!jsonEquals(current, next)) writeJsonFileAtomicSync(settingsPath, next);
+  return settingsPath;
 }
 
 function buildClaudeProjectMcpServerConfig({ workspaceRoot, cyberbossHome = "" } = {}) {
@@ -86,4 +110,5 @@ function normalizeText(value) {
 module.exports = {
   ensureClaudeProjectMcpConfig,
   buildClaudeProjectMcpServerConfig,
+  ensureClaudeProjectNcpRouteHook,
 };

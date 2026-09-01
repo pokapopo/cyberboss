@@ -90,6 +90,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       mcpConfigPaths: [projectSettings.configPath],
       ipcServer,
       workspaceRoot,
+      enableNcpRouting: true,
     });
     client.onMessage((event, raw) => {
       rememberObservedModelForWorkspace(workspaceRoot, extractClaudeMessageModel(raw));

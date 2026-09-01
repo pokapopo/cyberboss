@@ -1,7 +1,8 @@
 const { spawn } = require("child_process");
+const { writeRouteState } = require("../../../integrations/ncp-route-policy");
 
 class ClaudeCodeProcessClient {
-  constructor({ command = "claude", cwd, env, model = "", effort = "high", permissionMode = "default", disableVerbose = false, extraArgs = [], mcpConfigPaths = [], ipcServer = null, workspaceRoot = "" }) {
+  constructor({ command = "claude", cwd, env, model = "", effort = "high", permissionMode = "default", disableVerbose = false, extraArgs = [], mcpConfigPaths = [], ipcServer = null, workspaceRoot = "", enableNcpRouting = false }) {
     this.command = command;
     this.cwd = cwd;
     this.env = env;
@@ -13,6 +14,7 @@ class ClaudeCodeProcessClient {
     this.mcpConfigPaths = mcpConfigPaths;
     this.ipcServer = ipcServer;
     this.workspaceRoot = workspaceRoot;
+    this.enableNcpRouting = enableNcpRouting;
     this.child = null;
     this.stdin = null;
     this.stdoutBuffer = "";
@@ -380,6 +382,9 @@ class ClaudeCodeProcessClient {
     }
     this.pendingTurnId = normalizeTurnId(turnId) || `turn-${Date.now()}`;
     this.activeThreadId = threadId || this.sessionId;
+    if (this.enableNcpRouting) {
+      writeRouteState({ text, turnId: this.pendingTurnId, threadId: this.activeThreadId });
+    }
     if (this.ipcServer) {
       try {
         this.ipcServer.broadcast({
