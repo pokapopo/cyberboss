@@ -57,11 +57,16 @@ function createClaudeCodeRuntimeAdapter(config) {
     return configuredModel || normalizeText(model);
   }
 
-  async function ensureClient(workspaceRoot, model = "") {
+  function resolveEffort(effort = "") {
+    return normalizeEffort(effort) || normalizeEffort(config.claudeEffort) || "high";
+  }
+
+  async function ensureClient(workspaceRoot, model = "", effort = "") {
     const desiredModel = resolveModel(model);
+    const desiredEffort = resolveEffort(effort);
     const existing = clientsByWorkspace.get(workspaceRoot);
     if (existing) {
-      if (normalizeText(existing.model) === desiredModel) {
+      if (normalizeText(existing.model) === desiredModel && normalizeEffort(existing.effort) === desiredEffort) {
         return existing;
       }
       await closeWorkspaceClient(workspaceRoot, "model_switch");
@@ -78,7 +83,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       cwd: workspaceRoot,
       env: filterClaudeCodeEnv(process.env),
       model: desiredModel,
-      effort: config.claudeEffort || "high",
+      effort: desiredEffort,
       permissionMode: config.claudePermissionMode || "default",
       disableVerbose: Boolean(config.claudeDisableVerbose),
       extraArgs: config.claudeExtraArgs || [],
@@ -146,10 +151,11 @@ function createClaudeCodeRuntimeAdapter(config) {
     return client;
   }
 
-  async function attachClientToThread(bindingKey, workspaceRoot, threadId = "", model = "") {
+  async function attachClientToThread(bindingKey, workspaceRoot, threadId = "", model = "", effort = "") {
     const normalizedWorkspaceRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : "";
     const normalizedThreadId = normalizeThreadId(threadId);
     const desiredModel = resolveModel(model);
+    const desiredEffort = resolveEffort(effort);
     if (!normalizedWorkspaceRoot) {
       throw new Error("workspaceRoot is required");
     }
@@ -158,7 +164,7 @@ function createClaudeCodeRuntimeAdapter(config) {
     }
 
     const existingClient = clientsByWorkspace.get(normalizedWorkspaceRoot);
-    if (existingClient?.alive && normalizeText(existingClient.model) !== desiredModel) {
+    if (existingClient?.alive && (normalizeText(existingClient.model) !== desiredModel || normalizeEffort(existingClient.effort) !== desiredEffort)) {
       await closeWorkspaceClient(normalizedWorkspaceRoot, "model_switch");
     }
 
@@ -173,14 +179,14 @@ function createClaudeCodeRuntimeAdapter(config) {
     if (normalizeText(bindingKey)) {
       ownerBindingByWorkspace.set(normalizedWorkspaceRoot, normalizeText(bindingKey));
     }
-    let client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
+    let client = await ensureClient(normalizedWorkspaceRoot, desiredModel, desiredEffort);
     if (!client.alive || (normalizedThreadId && !clientMatchesThread(client, normalizedThreadId))) {
       if (client.alive && normalizedThreadId && !clientMatchesThread(client, normalizedThreadId)) {
         await closeWorkspaceClient(normalizedWorkspaceRoot, "session_switch");
         if (normalizeText(bindingKey)) {
           ownerBindingByWorkspace.set(normalizedWorkspaceRoot, normalizeText(bindingKey));
         }
-        client = await ensureClient(normalizedWorkspaceRoot, desiredModel);
+        client = await ensureClient(normalizedWorkspaceRoot, desiredModel, desiredEffort);
       }
       await client.connect(normalizedThreadId);
     }
@@ -410,6 +416,10 @@ function createClaudeCodeRuntimeAdapter(config) {
       await closeWorkspaceClient(workspaceRoot, "new_thread");
       return { workspaceRoot };
     },
+    async resetWorkspaceClient({ workspaceRoot, reason = "runtime_settings_changed" } = {}) {
+      await closeWorkspaceClient(workspaceRoot, reason);
+      return { workspaceRoot };
+    },
     async hibernateIdleClients(options = {}) {
       return hibernateIdleClients(options);
     },
@@ -533,13 +543,14 @@ function createClaudeCodeRuntimeAdapter(config) {
         turnId: normalizedTurnId,
       };
     },
-    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", continuityContext = null, recoveryContext = null }) {
+    async sendTurn({ bindingKey, workspaceRoot, text, metadata = {}, model = "", effort = "", continuityContext = null, recoveryContext = null }) {
       if (isBackgroundBindingKey(bindingKey)) {
         return sendBackgroundTurn({ bindingKey, workspaceRoot, text, model, continuityContext });
       }
       cancelIdleTimer(workspaceRoot);
       ownerBindingByWorkspace.set(normalizeText(workspaceRoot), normalizeText(bindingKey));
       const desiredModel = resolveModel(model);
+      const desiredEffort = resolveEffort(effort);
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
       const explicitFresh = sessionStore.isFreshThreadRequested?.(bindingKey, workspaceRoot) === true;
       if (!threadId) {
@@ -555,7 +566,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       let openingReason = openingTurn ? (explicitFresh ? "explicit_new" : (continuityContext ? "rollover" : "fresh")) : "resume";
       let attached;
       try {
-        attached = await attachClientToThread(bindingKey, workspaceRoot, threadId, desiredModel);
+        attached = await attachClientToThread(bindingKey, workspaceRoot, threadId, desiredModel, desiredEffort);
       } catch (error) {
         if (!threadId) {
           throw error;
@@ -564,7 +575,7 @@ function createClaudeCodeRuntimeAdapter(config) {
         threadId = "";
         openingTurn = true;
         openingReason = "resume_fallback";
-        attached = await attachClientToThread(bindingKey, workspaceRoot, "", desiredModel);
+        attached = await attachClientToThread(bindingKey, workspaceRoot, "", desiredModel, desiredEffort);
       }
       const { client, threadId: activeThreadId } = attached;
       const openingContinuity = openingReason === "explicit_new"
@@ -725,6 +736,11 @@ function normalizeThreadId(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeEffort(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return new Set(["low", "medium", "high", "max"]).has(normalized) ? normalized : "";
 }
 
 function normalizeIdleTimeoutMs(value) {

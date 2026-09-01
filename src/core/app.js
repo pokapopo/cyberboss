@@ -23,6 +23,7 @@ const {
 const { resolveVisionContext } = require("../services/vision-context");
 const { DiaryIncrementalService } = require("../services/diary-incremental-service");
 const { DiaryFinalizeService } = require("../services/diary-finalize-service");
+const { TimelineIncrementalService } = require("../services/timeline-incremental-service");
 const { CheckinDecisionService } = require("../services/checkin-decision-service");
 const { saveTurnContext, saveAssistantContext } = require("./recent-context");
 const {
@@ -93,15 +94,23 @@ class CyberbossApp {
     const projectTooling = createProjectTooling(config, {
       channelAdapter: this.channelAdapter,
       timelineIntegration: this.timelineIntegration,
+      toolSurface: process.env.CYBERBOSS_MAIN_TOOL_SURFACE === "core-v1" ? "core-v1" : "legacy",
     });
     this.projectServices = projectTooling.services;
     this.workLogStore = this.projectServices.workLog;
     this.workLogInstanceId = crypto.randomUUID();
     this.projectToolHost = projectTooling.toolHost;
-    this.fixedPrefixFingerprint = sha256Text(loadWechatInstructions(config));
-    this.toolCatalogFingerprint = sha256Text(JSON.stringify(
+    const fixedPrompt = loadWechatInstructions(config);
+    const toolCatalog = JSON.stringify(
       this.projectToolHost.listTools().map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })),
-    ));
+    );
+    this.fixedPrefixFingerprint = sha256Text(fixedPrompt);
+    this.toolCatalogFingerprint = sha256Text(toolCatalog);
+    this.staticContextBreakdown = {
+      systemPromptChars: fixedPrompt.length,
+      toolCatalogChars: toolCatalog.length,
+      toolCount: this.projectToolHost.listTools().length,
+    };
     this.runtimeContextStore = projectTooling.runtimeContextStore;
     this.runtimeAdapter = createRuntimeAdapter(config);
     this.threadStateStore = new ThreadStateStore();
@@ -127,7 +136,7 @@ class CyberbossApp {
     this.backgroundContinuityBridge = new BackgroundContinuityBridge({ store: this.projectServices.backgroundContinuity });
     this.activeBackgroundWorkspaces = new Set();
     this.activeBackgroundBindingsByWorkspace = new Map();
-    this.activeTimelineNcpJobs = new Map();
+    this.activeTimelineOneShotJobs = new Map();
     this.activeDiaryIncrementalJobs = new Map();
     this.activeDiaryFinalizeJobs = new Map();
     this.activeCheckinJobs = new Map();
@@ -151,6 +160,11 @@ class CyberbossApp {
     this.diaryIncrementalService = new DiaryIncrementalService({
       config,
       diaryService: this.projectServices.diary,
+      modelGateway: this.modelGateway,
+    });
+    this.timelineIncrementalService = new TimelineIncrementalService({
+      config,
+      timelineService: this.projectServices.timeline,
       modelGateway: this.modelGateway,
     });
     this.diaryFinalizeService = new DiaryFinalizeService({
@@ -737,6 +751,7 @@ class CyberbossApp {
       // Keep the cc session model here; economy routing is only safe for a future
       // hidden structured subtask whose output cannot be delivered directly.
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
+      const effort = this.runtimeAdapter.getSessionStore().getRuntimeEffortForWorkspace?.(bindingKey, workspaceRoot) || "";
       const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
       const runtimeSessionStore = this.runtimeAdapter.getSessionStore();
       const existingThreadId = runtimeSessionStore.getThreadIdForWorkspace?.(bindingKey, workspaceRoot) || "";
@@ -759,6 +774,7 @@ class CyberbossApp {
         text: runtimeTurn.text,
         attachments: runtimeTurn.attachments,
         model,
+        effort,
         continuityContext,
         recoveryContext,
         metadata: {
@@ -790,6 +806,7 @@ class CyberbossApp {
         requestedModel: model,
         fixedPrefixFingerprint: this.fixedPrefixFingerprint,
         toolCatalogFingerprint: this.toolCatalogFingerprint,
+        contextBreakdown: this.staticContextBreakdown,
       }));
       if (workLog?.id) {
         safeWorkLogCall(this, "bindRuntime", workLog.id, {
@@ -1516,7 +1533,7 @@ class CyberbossApp {
           continue;
         }
         if (["timeline_incremental", "timeline_finalize"].includes(normalizeCommandArgument(preparedMessage.triggerKind))) {
-          const dispatched = await this.dispatchTimelineIncrementalViaNcp(preparedMessage);
+          const dispatched = await this.dispatchTimelineOneShot(preparedMessage);
           if (!dispatched) {
             this.systemMessageDispatcher.requeue(preparedMessage);
           }
@@ -1556,16 +1573,12 @@ class CyberbossApp {
     }
   }
 
-  async dispatchTimelineIncrementalViaNcp(prepared) {
-    // Lightweight timeline maintenance through NCP instead of a heavy
-    // background Claude session. The old path spawned a full session that
-    // loaded MCP tools and then hit the 3-minute turn timeout or the 60k
-    // token hard limit, leaving work-log entries stuck in `running` and
-    // blocking the whole checkin/timeline pipeline. This path runs the
-    // timeline-for-agent CLI via the NCP `timeline` profile (bounded,
-    // no model session, no token limit). The promise is deliberately not
-    // awaited by the Weixin poll loop; cursor commit happens only after the
-    // NCP tool has written, read back, and rebuilt the dashboard.
+  async dispatchTimelineOneShot(prepared) {
+    // Timeline and diary consume independent cursors over the same bounded
+    // dialogue event store. Interpret timeline DELTA EVENTS through one
+    // OpenAI-compatible request, then let TimelineService own the verified
+    // write/readback/build boundary. No background Claude/Codex session is
+    // created, and the timeline cursor advances only after that boundary.
     const workspaceRoot = normalizeText(prepared?.workspaceRoot)
       || this.config.workspaceRoot
       || process.cwd();
@@ -1575,9 +1588,17 @@ class CyberbossApp {
       senderId: prepared?.senderId,
     });
     const jobKey = prepared?.incrementalScope || bindingKey;
-    if (this.activeTimelineNcpJobs.has(jobKey)) {
+    if (this.activeTimelineOneShotJobs.has(jobKey)) {
       return false;
     }
+    const finalize = normalizeCommandArgument(prepared?.triggerKind) === "timeline_finalize";
+    const date = finalize
+      ? (normalizeCommandArgument(prepared?.metadata?.timelineDate) || formatShanghaiDateOnly(new Date()))
+      : "";
+    const scope = prepared?.incrementalScope || buildScopeKey(bindingKey, workspaceRoot);
+    const sourceEvents = finalize
+      ? this.incrementalEventStore.readDate({ scope, date, limit: 1_000 })
+      : (Array.isArray(prepared?.incrementalEvents) ? prepared.incrementalEvents : []);
     const workLog = safeWorkLogCall(this, "startExecution", {
       source: "system",
       triggerKind: prepared.triggerKind || "timeline_incremental",
@@ -1585,25 +1606,22 @@ class CyberbossApp {
       workspaceRoot,
       bindingKey,
       messageIds: collectPreparedMessageIds(prepared),
-      runtimeId: this.runtimeAdapter.describe?.().id || this.config?.runtime || "",
+      runtimeId: "openai-compatible-one-shot",
       instanceId: this.workLogInstanceId,
     }) || null;
     const job = (async () => {
-      const today = formatShanghaiDateOnly(new Date());
-      const finalize = normalizeCommandArgument(prepared?.triggerKind) === "timeline_finalize";
-      const dates = finalize
-        ? [today]
-        : [...new Set([
-          ...(Array.isArray(prepared?.incrementalEvents) ? prepared.incrementalEvents : [])
-            .map((event) => formatShanghaiDateOnly(event?.at)),
-          today,
-        ].filter(Boolean))];
-      const result = await this.projectServices.ncpReadOnly.runTimelineMaintenance({ dates, finalize });
-      if (prepared?.incrementalCursor && prepared?.incrementalScope) {
+      const result = await this.timelineIncrementalService.process({
+        events: sourceEvents,
+        scope,
+        taskId: prepared?.id,
+        date,
+        finalize,
+      });
+      if (!finalize && result.processedCursor > 0 && prepared?.incrementalScope) {
         this.incrementalEventStore.commit({
           consumer: "timeline_incremental",
           scope: prepared.incrementalScope,
-          cursor: prepared.incrementalCursor,
+          cursor: result.processedCursor,
         });
       }
       if (workLog?.id) {
@@ -1612,15 +1630,15 @@ class CyberbossApp {
           error: "",
         });
       }
-      console.log(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} via NCP status=verified dates=${dates.join(",")} finalize=${finalize}`);
+      console.log(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} one-shot status=${result.status} date=${result.date || date} events=${result.processedEventCount || 0} written=${result.writtenEventCount || 0} finalize=${finalize}`);
     })().catch((error) => {
       if (workLog?.id) {
         safeWorkLogCall(this, "finishExecution", workLog.id, {
           status: "failed",
-          error: error instanceof Error ? error.message : String(error || "NCP timeline batch failed"),
+          error: error instanceof Error ? error.message : String(error || "timeline one-shot failed"),
         });
       }
-      console.error(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} via NCP failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} one-shot failed: ${error instanceof Error ? error.message : String(error)}`);
       const attempt = Math.max(0, Number(prepared?.metadata?.backgroundRetry?.attempt) || 0);
       if (attempt < 1) {
         this.systemMessageDispatcher?.requeue(buildBackgroundRetryMessage(prepared, { error }));
@@ -1628,9 +1646,9 @@ class CyberbossApp {
         console.error(`[cyberboss] ${prepared?.triggerKind || "timeline_incremental"} dead-lettered id=${prepared?.id || "unknown"} after ${attempt + 1} attempts`);
       }
     }).finally(() => {
-      this.activeTimelineNcpJobs.delete(jobKey);
+      this.activeTimelineOneShotJobs.delete(jobKey);
     });
-    this.activeTimelineNcpJobs.set(jobKey, job);
+    this.activeTimelineOneShotJobs.set(jobKey, job);
     return true;
   }
 
@@ -2253,6 +2271,9 @@ class CyberbossApp {
       case "model":
         await this.handleModelCommand(normalized, command);
         return;
+      case "effort":
+        await this.handleEffortCommand(normalized, command);
+        return;
       case "star":
         await this.handleStarCommand(normalized);
         return;
@@ -2790,6 +2811,41 @@ class CyberbossApp {
     });
   }
 
+  async handleEffortCommand(normalized, command) {
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: normalized.workspaceId,
+      accountId: normalized.accountId,
+      senderId: normalized.senderId,
+    });
+    const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    const sessionStore = this.runtimeAdapter.getSessionStore();
+    const requested = normalizeCommandArgument(command.args).toLowerCase();
+    const current = sessionStore.getRuntimeEffortForWorkspace?.(bindingKey, workspaceRoot) || this.config.claudeEffort || "high";
+    if (!requested) {
+      await this.channelAdapter.sendText({
+        userId: normalized.senderId,
+        text: `Current thinking effort: ${current}\nUse: /effort <low|medium|high|max>`,
+        contextToken: normalized.contextToken,
+      });
+      return;
+    }
+    if (!new Set(["low", "medium", "high", "max"]).has(requested)) {
+      await this.channelAdapter.sendText({
+        userId: normalized.senderId,
+        text: "❌ Unsupported thinking effort\nUse: low, medium, high, or max",
+        contextToken: normalized.contextToken,
+      });
+      return;
+    }
+    sessionStore.setRuntimeParamsForWorkspace(bindingKey, workspaceRoot, { effort: requested });
+    await this.runtimeAdapter.resetWorkspaceClient?.({ workspaceRoot, reason: "effort_switch" });
+    await this.channelAdapter.sendText({
+      userId: normalized.senderId,
+      text: `✅ Thinking effort switched\nworkspace: ${workspaceRoot}\neffort: ${requested}\nTakes effect on your next message.`,
+      contextToken: normalized.contextToken,
+    });
+  }
+
   async handleStarCommand(normalized) {
     await this.channelAdapter.sendText({
       userId: normalized.senderId,
@@ -3119,7 +3175,12 @@ class CyberbossApp {
     const usageEventId = normalizeCommandArgument(event.payload?.usageEventId);
     if (usageEventId && guard.usageEventIds.has(usageEventId)) return false;
     if (usageEventId) guard.usageEventIds.add(usageEventId);
-    guard.tokens += Math.max(0, Number(event.payload?.currentTokens) || 0);
+    const budgetTokens = resolveInteractiveBudgetTokens(event.payload);
+    if (normalizeText(event.payload?.runtimeId).toLowerCase() === "codex") {
+      guard.tokens = Math.max(guard.tokens, budgetTokens);
+    } else {
+      guard.tokens += budgetTokens;
+    }
     if (guard.tokens < guard.hardTokens) return false;
     return this.cancelInteractiveGuard({
       guard,
@@ -4160,6 +4221,15 @@ function collectPreparedMessageIds(prepared) {
     prepared?.messageId,
   ];
   return [...new Set(values.map((value) => normalizeText(value)).filter(Boolean))];
+}
+
+function resolveInteractiveBudgetTokens(payload = {}) {
+  const currentTokens = Math.max(0, Number(payload?.currentTokens) || 0);
+  const cachedTokens = Math.max(
+    0,
+    Number(payload?.cacheReadInputTokens ?? payload?.cachedInputTokens) || 0,
+  );
+  return Math.max(0, currentTokens - cachedTokens);
 }
 
 function buildInteractiveTurnGuard({ task, openingReason = "", userText = "", config = {} } = {}) {

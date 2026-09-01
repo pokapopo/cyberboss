@@ -122,6 +122,8 @@ class UsageLedger {
     }).length;
     aggregate.fixedPrefixFingerprints = Array.from(new Set(records.map((record) => record.fixedPrefixFingerprint).filter(Boolean)));
     aggregate.toolCatalogFingerprints = Array.from(new Set(records.map((record) => record.toolCatalogFingerprint).filter(Boolean)));
+    aggregate.contextBreakdowns = records.map((record) => record.contextBreakdown)
+      .filter((value, index, values) => value && values.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(value)) === index);
     return aggregate;
   }
 
@@ -184,7 +186,15 @@ function normalizeRecord(value) {
     },
     estimatedCostMicros: positive(value.estimatedCostMicros),
     fixedPrefixFingerprint: text(value.fixedPrefixFingerprint), toolCatalogFingerprint: text(value.toolCatalogFingerprint),
+    contextBreakdown: normalizeContextBreakdown(value.contextBreakdown),
     recordedAt: normalizeIso(value.recordedAt) || new Date().toISOString(),
+  };
+}
+function normalizeContextBreakdown(value = {}) {
+  return {
+    systemPromptChars: positive(value.systemPromptChars),
+    toolCatalogChars: positive(value.toolCatalogChars),
+    toolCount: positive(value.toolCount),
   };
 }
 function filterRecords(records, sinceMs, source) {

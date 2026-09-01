@@ -6,24 +6,27 @@ const {
 } = require("../services/sticker-service");
 
 class ProjectToolHost {
-  constructor({ services, runtimeContextStore }) {
+  constructor({ services, runtimeContextStore, surface = "legacy" }) {
     this.services = services;
     this.runtimeContextStore = runtimeContextStore;
+    this.surface = normalizeToolSurface(surface);
     this.extraToolHosts = createExtraToolHosts(services);
   }
 
   listTools() {
-    const builtIn = PROJECT_TOOLS.map((tool) => ({
+    const builtIn = this.getVisibleToolSpecs().map((tool) => ({
       name: tool.name,
       description: buildToolDescription(tool),
       inputSchema: tool.inputSchema,
     }));
-    const extra = this.extraToolHosts.flatMap((host) => host.listTools());
+    const extra = this.surface === "legacy"
+      ? this.extraToolHosts.flatMap((host) => host.listTools())
+      : [];
     return [...builtIn, ...extra];
   }
 
   async invokeTool(toolName, args = {}, context = {}) {
-    const spec = PROJECT_TOOLS.find((candidate) => candidate.name === toolName);
+    const spec = this.getVisibleToolSpecs().find((candidate) => candidate.name === toolName);
     const normalizedArgs = args && typeof args === "object" ? args : {};
     if (spec) {
       validateSchema(spec.inputSchema, normalizedArgs, toolName, "input");
@@ -43,12 +46,21 @@ class ProjectToolHost {
         context: resolvedContext,
       });
     }
-    for (const host of this.extraToolHosts) {
+    for (const host of this.surface === "legacy" ? this.extraToolHosts : []) {
       if (host.listTools().some((tool) => tool.name === toolName)) {
         return await host.invokeTool(toolName, normalizedArgs);
       }
     }
     throw new Error(`Unknown tool: ${toolName}`);
+  }
+
+  getVisibleToolSpecs() {
+    const available = (tool) => !tool.nativeOnly || this.services.ncpNativeEnabled;
+    if (this.surface === "core-v1") {
+      const reused = PROJECT_TOOLS.filter((tool) => CORE_V1_REUSED_TOOL_NAMES.has(tool.name));
+      return [...CORE_V1_TOOLS, ...reused].filter(available);
+    }
+    return PROJECT_TOOLS.filter(available);
   }
 
   resolveContext(context = {}) {
@@ -70,14 +82,245 @@ class ProjectToolHost {
   }
 }
 
-function listProjectToolNames() {
-  return [
-    ...PROJECT_TOOLS.map((tool) => tool.name),
-    ...STATIC_EXTRA_TOOL_NAMES,
-  ];
+function listProjectToolNames(surface = "legacy", { ncpNativeEnabled = true } = {}) {
+  const normalizedSurface = normalizeToolSurface(surface);
+  if (normalizedSurface === "core-v1") {
+    return [
+      ...CORE_V1_TOOLS.filter((tool) => !tool.nativeOnly || ncpNativeEnabled).map((tool) => tool.name),
+      ...PROJECT_TOOLS.filter((tool) => CORE_V1_REUSED_TOOL_NAMES.has(tool.name)
+        && (!tool.nativeOnly || ncpNativeEnabled)).map((tool) => tool.name),
+    ];
+  }
+  return [...PROJECT_TOOLS.map((tool) => tool.name), ...STATIC_EXTRA_TOOL_NAMES];
 }
 
+const CORE_V1_REUSED_TOOL_NAMES = new Set([
+  "cyberboss_ncp_find",
+  "cyberboss_ncp_code",
+  "cyberboss_reminder_create",
+  "cyberboss_channel_send_file",
+  "cyberboss_sticker_tags",
+  "cyberboss_sticker_pick",
+  "cyberboss_sticker_send",
+  "cyberboss_timeline_read",
+  "cyberboss_timeline_capture",
+  "cyberboss_timeline_patch_event",
+  "cyberboss_timeline_screenshot",
+]);
+
+const CORE_V1_TOOLS = [
+  {
+    name: "cyberboss_memory_recall",
+    description: "Recall personal memory through the stable Ombré facade. Use surface for natural resurfacing, search for explicit retrieval, source for exact evidence, letters for correspondence, and self for identity entries. This facade replaces dynamic Ombré tool discovery and never exposes lifecycle maintenance.",
+    shortHint: "Recall surfaced, searched, source, letter, or self memory through Ombré.",
+    topics: ["memory", "recall", "ombre"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["surface", "search", "source", "letters", "self"] },
+        query: { type: "string" }, targetId: { type: "string" }, expectedTitle: { type: "string" },
+        sourceScope: { type: "string", enum: ["event", "full_source"] }, author: { type: "string" },
+        domain: { type: "string" }, tags: { type: "string" }, dateFrom: { type: "string" }, dateTo: { type: "string" },
+        importanceMin: { type: "integer", minimum: 1, maximum: 10 }, catalog: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 50 }, maxTokens: { type: "integer", minimum: 100, maximum: 12000 },
+        cursor: { type: "integer", minimum: 0 },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ombreCore.recall(args);
+      return { text: `Memory recall completed through ${result.upstreamTool}.`, data: result };
+    },
+  },
+  {
+    name: "cyberboss_memory_record",
+    description: "Record long-term memory through the stable Ombré facade only when the conversation has established that it should be retained. memory stores one item, digest organizes a long text, plan records an open commitment, letter preserves correspondence, and self records a candidate self-understanding.",
+    shortHint: "Record a memory, digest, plan, letter, or self-understanding in Ombré.",
+    topics: ["memory", "record", "ombre"],
+    inputSchema: {
+      type: "object", required: ["kind"],
+      properties: {
+        kind: { type: "string", enum: ["memory", "digest", "plan", "letter", "self"] },
+        content: { type: "string" }, title: { type: "string" }, tags: { type: "string" },
+        importance: { type: "integer", minimum: 1, maximum: 10 }, pinned: { type: "boolean" }, feel: { type: "boolean" },
+        sourceBucket: { type: "string" }, valence: { type: "number", minimum: -1, maximum: 1 },
+        arousal: { type: "number", minimum: -1, maximum: 1 }, whyRemembered: { type: "string" }, meaning: { type: "string" },
+        media: { type: "array", maxItems: 8, items: {} }, items: { type: "array", maxItems: 12, items: {} },
+        status: { type: "string", enum: ["active", "resolved", "abandoned"] }, relatedBucket: { type: "string" },
+        weight: { type: "number", minimum: 0, maximum: 1 }, author: { type: "string" }, date: { type: "string" },
+        lockType: { type: "string" }, unlockDate: { type: "string" }, aspect: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ombreCore.record(args);
+      return { text: `Memory record completed through ${result.upstreamTool}.`, data: result };
+    },
+  },
+  {
+    name: "cyberboss_memory_revise",
+    description: "Revise an exact Ombré memory target. memory supports content/metadata changes and reversible archive/restore; anchor toggles cold-reference status; letter_lock changes only lock metadata; self_promotion promotes a witnessed self candidate. Hard deletion and lifecycle maintenance are unavailable.",
+    shortHint: "Revise, archive/restore, anchor, lock, or promote an exact Ombré item.",
+    topics: ["memory", "revise", "ombre"],
+    inputSchema: {
+      type: "object", required: ["kind", "targetId", "changes"],
+      properties: {
+        kind: { type: "string", enum: ["memory", "anchor", "letter_lock", "self_promotion"] },
+        targetId: { type: "string" },
+        changes: { type: "object", description: "Only fields valid for the selected kind; unknown, hard-delete, and test controls are rejected server-side." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ombreCore.revise(args);
+      return { text: `Memory revision completed through ${result.upstreamTool}.`, data: result };
+    },
+  },
+  {
+    name: "cyberboss_work_context",
+    description: "Recover bounded Cyberboss engineering context. Provide workLogId to inspect one execution, or query to search recent work logs and verified experience together. This is for project continuity and diagnosis, not personal memory.",
+    shortHint: "Recover one work log or search recent verified project context.",
+    topics: ["operations", "worklog", "experience"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        workLogId: { type: "string", description: "Exact work-log id to inspect." },
+        query: { type: "string", description: "Operational symptom, component, decision, or error fragment." },
+        source: { type: "string", description: "Optional work-log source filter." },
+        status: { type: "string", description: "Optional work-log status filter." },
+        limit: { type: "integer", description: "Maximum results, 1 to 10." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      if (normalizeText(args.workLogId)) {
+        const record = services.workLog.get(args.workLogId);
+        return {
+          text: record ? `Cyberboss work context loaded: ${record.id}.` : "Cyberboss work context not found.",
+          data: { record },
+        };
+      }
+      const limit = Math.max(1, Math.min(10, Number(args.limit) || 5));
+      const query = normalizeText(args.query);
+      const [records, experiences] = [
+        services.workLog.search({ query, source: args.source, status: args.status, limit }),
+        query ? services.experience.search({ query, limit }) : [],
+      ];
+      return {
+        text: `Cyberboss context found: ${records.length} work log(s), ${experiences.length} verified experience(s).`,
+        data: { records, experiences },
+      };
+    },
+  },
+  {
+    name: "cyberboss_diary_observe",
+    description: "Submit one factual diary observation grounded in current visible events. The diary pipeline remains the only formal writer; do not compose or finalize the daily diary here.",
+    shortHint: "Submit sourced factual diary evidence; never finalize or overwrite.",
+    topics: ["diary", "observation"],
+    inputSchema: {
+      type: "object",
+      required: ["text", "sourceEventIds"],
+      properties: {
+        text: { type: "string", description: "Concise factual fragment without invented reflection." },
+        title: { type: "string", description: "Optional short factual label." },
+        sourceEventIds: { type: "array", items: { type: "string" }, description: "Visible DELTA EVENT ids supporting this observation." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      if (!Array.isArray(args.sourceEventIds) || !args.sourceEventIds.some((id) => normalizeText(id))) {
+        throw new Error("cyberboss_diary_observe requires at least one sourceEventId.");
+      }
+      const result = await services.diary.append(args);
+      return { text: `Diary evidence accepted: ${result.filePath}`, data: result };
+    },
+  },
+  {
+    name: "cyberboss_whereabouts_read",
+    description: "Read bounded whereabouts state. Use current for the present stay, snapshot for current plus recent movement, or summary for a day/week/month aggregate.",
+    shortHint: "Read current, snapshot, or summarized whereabouts state.",
+    topics: ["whereabouts", "location", "read"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["current", "snapshot", "summary"] },
+        range: { type: "string", enum: ["day", "week", "month"] },
+        stayLimit: { type: "integer" },
+        moveLimit: { type: "integer" },
+        batteryBucketMinutes: { type: "integer" },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const mode = normalizeText(args.mode) || "current";
+      if (mode === "summary") {
+        const result = services.whereabouts.getSummary(args);
+        return { text: `Whereabouts ${result.range} summary loaded.`, data: result };
+      }
+      if (mode === "snapshot") {
+        const result = services.whereabouts.getSnapshot(args);
+        return { text: "Whereabouts snapshot loaded.", data: result };
+      }
+      const currentStay = services.whereabouts.getCurrentStayForOutput();
+      return { text: currentStay ? "Current stay loaded." : "No current stay available.", data: { currentStay } };
+    },
+  },
+];
+
 const PROJECT_TOOLS = [
+  {
+    name: "cyberboss_ncp_find",
+    nativeOnly: true,
+    description: "Discover audited capabilities in the fixed Cyberboss NCP profile. Discovery returns ordinary bounded data and never changes the top-level tool catalog. Prefer one NCP workflow when an investigation needs two or more operations or a dependent read/edit/test chain; known capabilities do not need rediscovery. Memory, diary, timeline and messaging remain direct Core tools.",
+    shortHint: "Discover audited NCP capabilities without changing the tool catalog.",
+    topics: ["ncp", "discovery", "workflow"],
+    inputSchema: {
+      type: "object",
+      required: ["operationId", "query"],
+      properties: {
+        operationId: { type: "string", description: "Stable identifier correlating this discovery with the current turn or task." },
+        query: { type: "string", description: "Short capability intent to search for." },
+        limit: { type: "integer", minimum: 1, maximum: 8 },
+        depth: { type: "integer", minimum: 0, maximum: 2 },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ncpNative.find(args);
+      return { text: `NCP discovery completed for ${result.operationId}; ${result.returnedChars} bounded characters returned.`, data: result };
+    },
+  },
+  {
+    name: "cyberboss_ncp_code",
+    nativeOnly: true,
+    description: "Execute one bounded TypeScript workflow against the audited Cyberboss NCP profile. Use Promise.all for independent operations and keep dependent search/read/edit/test steps in the same workflow. NCP inherits the main model's authority for the current task when authorization is supplied; it cannot expand or reuse that authority. The boundary allows at most 8 calls and 4 concurrent calls and still blocks arbitrary shell, filesystem, network, installation, scheduling, and internal lifecycle writers.",
+    shortHint: "Run one bounded, parallel-aware NCP workflow with the current task authority.",
+    topics: ["ncp", "workflow", "read", "action"],
+    inputSchema: {
+      type: "object",
+      required: ["operationId", "code"],
+      properties: {
+        operationId: { type: "string", description: "Stable identifier correlating the workflow and its downstream calls." },
+        code: { type: "string", description: "TypeScript workflow. Available tools are discovered through cyberboss_ncp_find." },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: 30000 },
+        authorization: {
+          type: "object",
+          description: "Required when the workflow has consequences. It records whether the current user request already authorizes the exact work or the user explicitly confirmed it.",
+          required: ["decision", "reason"],
+          properties: {
+            decision: { type: "string", enum: ["within_existing_authority", "user_confirmed"] },
+            reason: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.ncpNative.code(args);
+      return { text: `NCP workflow ${result.status} for ${result.operationId}; ${result.returnedChars} bounded characters returned.`, data: result };
+    },
+  },
   {
     name: "cyberboss_ncp_read_batch",
     description: "Use NCP only for Garden or Playwright browser operations; memory, diary, timeline, reminders, messaging, scheduling, shell, and project-file work belong to their own tools and must not probe NCP first. NCP loads and orchestrates its Garden/Playwright capabilities on demand. Plan from this contract and combine up to four independent calls in one batch instead of repeatedly rediscovering the catalog; split calls only when an earlier result determines the next action. Observation and navigation calls may run directly. Browser interaction calls such as click, type, key press, form fill, dialog handling, or close require an authorization object: the main model must decide either that the action is within the user's existing authority or that the user explicitly confirmed it, and explain the decision. If material outcome, target, publication, sending, purchase, deletion, credential use, or other consequential effect is unclear, tell the user what will happen and wait before calling. If NCP rejects or lacks a capability, do not silently bypass it with Bash, direct CDP/browser code, filesystem edits, or another tool: explain the proposed fallback to the user first. Scheduling remains unavailable and browser output may not be written to disk. Results are bounded and may be partial.",
@@ -930,6 +1173,10 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeToolSurface(value) {
+  return normalizeText(value) === "core-v1" ? "core-v1" : "legacy";
+}
+
 function buildToolDescription(tool) {
   const baseDescription = normalizeText(tool?.description);
   const signature = summarizeSchema(tool?.inputSchema);
@@ -1073,4 +1320,5 @@ function validateSchema(schema, value, toolName, path) {
 module.exports = {
   ProjectToolHost,
   listProjectToolNames,
+  normalizeToolSurface,
 };

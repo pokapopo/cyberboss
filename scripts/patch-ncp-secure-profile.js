@@ -78,6 +78,25 @@ const PATCHED_DIRECT_CALL = `            const invokeTool = () => connection.cli
             const result = process.env.NCP_DIRECT_RUN === 'true'
                 ? await invokeTool()
                 : await withFilteredOutput(invokeTool);`;
+const ORIGINAL_SKILLS_DISABLE = `        if (!enableMcpManagement) {
+            logger.info('MCP Management disabled via configuration');
+            await this.internalMCPManager.disableInternalMCP('mcp');
+        }
+        // Add internal MCPs immediately so they're always available`;
+const PATCHED_SKILLS_DISABLE = `        if (!enableMcpManagement) {
+            logger.info('MCP Management disabled via configuration');
+            await this.internalMCPManager.disableInternalMCP('mcp');
+        }
+        if (!enableSkills) {
+            logger.info('Skills management MCP disabled via configuration');
+            await this.internalMCPManager.disableInternalMCP('skills');
+        }
+        if (process.env.CYBERBOSS_NCP_EXTERNAL_ONLY === 'true') {
+            for (const internalName of ['analytics', 'marketplace', 'code']) {
+                await this.internalMCPManager.disableInternalMCP(internalName);
+            }
+        }
+        // Add internal MCPs immediately so they're always available`;
 
 function main() {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_FILE, "utf8"));
@@ -112,6 +131,9 @@ function main() {
   const directCallOccurrences = next.split(ORIGINAL_DIRECT_CALL).length - 1;
   if (directCallOccurrences !== 1) throw new Error(`NCP direct-call patch anchor count was ${directCallOccurrences}; expected exactly 1`);
   next = next.replace(ORIGINAL_DIRECT_CALL, PATCHED_DIRECT_CALL);
+  const skillsDisableOccurrences = next.split(ORIGINAL_SKILLS_DISABLE).length - 1;
+  if (skillsDisableOccurrences !== 1) throw new Error(`NCP skills-disable patch anchor count was ${skillsDisableOccurrences}; expected exactly 1`);
+  next = next.replace(ORIGINAL_SKILLS_DISABLE, PATCHED_SKILLS_DISABLE);
   if (next === source) {
     console.log(`NCP ${SUPPORTED_VERSION} secure-profile patch already applied.`);
     return;

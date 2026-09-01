@@ -14,8 +14,11 @@ const { RuntimeContextStore } = require("./runtime-context-store");
 const { ProjectToolHost } = require("./tool-host");
 const { WhereaboutsService } = require("whereabouts-mcp");
 const { NcpReadOnlyAdapter } = require("../integrations/ncp-readonly");
+const { NcpNativeAdapter } = require("../integrations/ncp-native");
+const { OmbreCoreAdapter } = require("../integrations/ombre-core");
 
 function createProjectTooling(config, options = {}) {
+  const ncpNativeMode = options.ncpNativeMode || process.env.CYBERBOSS_NCP_NATIVE || "off";
   const sessionStore = options.sessionStore || new SessionStore({
     filePath: config.sessionsFile,
     runtimeId: config.runtime || "codex",
@@ -41,6 +44,9 @@ function createProjectTooling(config, options = {}) {
     sticker: new StickerService({ config, channelAdapter, sessionStore, channelFileService: channelFile }),
     timeline: new TimelineService({ config, timelineIntegration, sessionStore }),
     ncpReadOnly: options.ncpReadOnly || new NcpReadOnlyAdapter({ cwd: config.workspaceRoot }),
+    ncpNative: options.ncpNative || new NcpNativeAdapter({ cwd: config.workspaceRoot, mode: ncpNativeMode }),
+    ncpNativeEnabled: ["read-only", "guarded-write"].includes(ncpNativeMode),
+    ombreCore: options.ombreCore || new OmbreCoreAdapter({ cwd: config.workspaceRoot }),
     whereabouts: new WhereaboutsService({
       config: {
         storeFile: config.locationStoreFile,
@@ -62,6 +68,7 @@ function createProjectTooling(config, options = {}) {
   const toolHost = new ProjectToolHost({
     services,
     runtimeContextStore,
+    surface: options.toolSurface || "legacy",
   });
   return {
     services,

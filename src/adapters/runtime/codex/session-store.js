@@ -146,12 +146,14 @@ class SessionStore {
       || {};
     const hasModel = Object.prototype.hasOwnProperty.call(params, "model");
     const hasModelProvider = Object.prototype.hasOwnProperty.call(params, "modelProvider");
+    const hasEffort = Object.prototype.hasOwnProperty.call(params, "effort");
     const nextEntry = {
       ...previousEntry,
       model: hasModel ? normalizeValue(params.model) : normalizeValue(previousEntry.model),
       modelProvider: hasModelProvider
         ? normalizeValue(params.modelProvider)
         : normalizeValue(previousEntry.modelProvider || previousEntry.model_provider),
+      effort: hasEffort ? normalizeEffort(params.effort) : normalizeEffort(previousEntry.effort),
     };
     const runtimeParamsByWorkspaceRootByRuntime = {
       ...getRuntimeParamsRuntimeMap(current),
@@ -174,6 +176,16 @@ class SessionStore {
       };
     }
     return this.updateBinding(bindingKey, nextBinding);
+  }
+
+  getRuntimeEffortForWorkspace(bindingKey, workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) return "";
+    const current = this.getBinding(bindingKey) || {};
+    const runtimeId = normalizeValue(this.runtimeId);
+    const entry = getRuntimeParamsMapForRuntime(current, runtimeId)[normalizedWorkspaceRoot]
+      || (runtimeId === "codex" ? getCodexParamsMap(current)[normalizedWorkspaceRoot] : null);
+    return normalizeEffort(entry?.effort);
   }
 
   clearThreadIdForWorkspace(bindingKey, workspaceRoot, runtimeId = this.runtimeId) {
@@ -462,6 +474,11 @@ function mergeRuntimeScopedMap(current, incoming) {
 
 function normalizeValue(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeEffort(value) {
+  const normalized = normalizeValue(value).toLowerCase();
+  return new Set(["low", "medium", "high", "max"]).has(normalized) ? normalized : "";
 }
 
 function normalizeThreadValue(value) {

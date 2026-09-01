@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const { ProjectToolHost } = require("../src/tools/tool-host");
 
-function createHost() {
+function createHost(serviceOverrides = {}, hostOptions = {}) {
   return new ProjectToolHost({
     services: {
       workLog: {
@@ -268,7 +268,9 @@ function createHost() {
           };
         },
       },
+      ...serviceOverrides,
     },
+    ...hostOptions,
     runtimeContextStore: {
       resolveActiveContext() {
         return {};
@@ -276,6 +278,100 @@ function createHost() {
     },
   });
 }
+
+test("native NCP tools stay hidden until the read-only surface is enabled", async () => {
+  const disabled = createHost();
+  assert.equal(disabled.listTools().some((tool) => tool.name === "cyberboss_ncp_find"), false);
+  await assert.rejects(() => disabled.invokeTool("cyberboss_ncp_code", {
+    operationId: "turn-1",
+    code: "return 1",
+  }), /Unknown tool/);
+
+  const calls = [];
+  const enabled = createHost({
+    ncpNativeEnabled: true,
+    ncpNative: {
+      async find(args) { calls.push(["find", args]); return { operationId: args.operationId, status: "completed", returnedChars: 2, text: "ok" }; },
+      async code(args) { calls.push(["code", args]); return { operationId: args.operationId, status: "completed", returnedChars: 2, text: "ok" }; },
+    },
+  });
+  assert.ok(enabled.listTools().some((tool) => tool.name === "cyberboss_ncp_find"));
+  await enabled.invokeTool("cyberboss_ncp_find", { operationId: "turn-1", query: "identity" });
+  await enabled.invokeTool("cyberboss_ncp_code", { operationId: "turn-1-code", code: "return 1" });
+  assert.deepEqual(calls.map(([kind]) => kind), ["find", "code"]);
+});
+
+test("core-v1 exposes the exact fixed conversational catalog and denies internal tools", async () => {
+  const host = createHost({ ncpNativeEnabled: true }, { surface: "core-v1" });
+  assert.deepEqual(host.listTools().map((tool) => tool.name).sort(), [
+    "cyberboss_channel_send_file",
+    "cyberboss_diary_observe",
+    "cyberboss_memory_recall",
+    "cyberboss_memory_record",
+    "cyberboss_memory_revise",
+    "cyberboss_ncp_code",
+    "cyberboss_ncp_find",
+    "cyberboss_reminder_create",
+    "cyberboss_sticker_pick",
+    "cyberboss_sticker_send",
+    "cyberboss_sticker_tags",
+    "cyberboss_timeline_capture",
+    "cyberboss_timeline_patch_event",
+    "cyberboss_timeline_read",
+    "cyberboss_timeline_screenshot",
+    "cyberboss_whereabouts_read",
+    "cyberboss_work_context",
+  ].sort());
+  for (const hidden of [
+    "cyberboss_diary_finalize",
+    "cyberboss_system_send",
+    "cyberboss_timeline_reconcile",
+    "cyberboss_timeline_write",
+    "cyberboss_timeline_build",
+    "cyberboss_timeline_serve",
+    "cyberboss_timeline_dev",
+    "cyberboss_sticker_delete",
+    "whereabouts_snapshot",
+  ]) {
+    await assert.rejects(() => host.invokeTool(hidden, {}), /Unknown tool/);
+  }
+});
+
+test("core-v1 memory facade exposes three stable tools and delegates without catalog expansion", async () => {
+  const calls = [];
+  const host = createHost({
+    ncpNativeEnabled: true,
+    ombreCore: {
+      async recall(args) { calls.push(["recall", args]); return { upstreamTool: "breath_search", text: "found" }; },
+      async record(args) { calls.push(["record", args]); return { upstreamTool: "hold", text: "saved" }; },
+      async revise(args) { calls.push(["revise", args]); return { upstreamTool: "trace", text: "updated" }; },
+    },
+  }, { surface: "core-v1" });
+  const namesBefore = host.listTools().map((tool) => tool.name);
+  await host.invokeTool("cyberboss_memory_recall", { kind: "search", query: "31号" });
+  await host.invokeTool("cyberboss_memory_record", { kind: "memory", content: "长期决定" });
+  await host.invokeTool("cyberboss_memory_revise", { kind: "memory", targetId: "bucket-1", changes: { resolved: true } });
+  assert.deepEqual(calls.map(([kind]) => kind), ["recall", "record", "revise"]);
+  assert.deepEqual(host.listTools().map((tool) => tool.name), namesBefore);
+});
+
+test("core-v1 adapters preserve work context, sourced diary, and bounded whereabouts", async () => {
+  const host = createHost({ ncpNativeEnabled: true }, { surface: "core-v1" });
+  const context = await host.invokeTool("cyberboss_work_context", { query: "timeout", limit: 3 });
+  assert.equal(context.data.records[0].id, "work-1");
+  assert.equal(context.data.experiences[0].id, "exp-1");
+  await assert.rejects(() => host.invokeTool("cyberboss_diary_observe", {
+    text: "今天修好了调用链。",
+    sourceEventIds: [],
+  }), /sourceEventId/);
+  const diary = await host.invokeTool("cyberboss_diary_observe", {
+    text: "今天修好了调用链。",
+    sourceEventIds: ["event-1"],
+  });
+  assert.equal(diary.data.sourceEventIds[0], "event-1");
+  const whereabouts = await host.invokeTool("cyberboss_whereabouts_read", { mode: "current" });
+  assert.equal(whereabouts.data.currentStay.address, "Office");
+});
 
 test("tool host rejects legacy timeline write CLI-shaped fields", async () => {
   const host = createHost();

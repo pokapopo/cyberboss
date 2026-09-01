@@ -32,3 +32,25 @@ test("formal diary finalization performs one model call and preserves the canoni
   assert.equal(repeated.needsDelivery, false);
   assert.equal(calls, 1);
 });
+
+test("formal diary finalization retries without a rejected sensitive line", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-diary-finalizer-filter-"));
+  fs.writeFileSync(path.join(dir, "2026-08-25.md"), "## 10:00\n\n刚才在做爱。\n\n## 12:00\n\n后来出去吃饭。", "utf8");
+  let calls = 0;
+  const markdown = "## 中午出门\n\n后来出去吃了饭。\n\n## CC 的想法\n\n我想把今天仍然能留下的部分好好收住。";
+  const service = new DiaryFinalizeService({
+    config: { diaryDir: dir, diaryFinalizeStateFile: path.join(dir, "state.json"), diaryGeneration: { apiBaseUrl: "https://example.test/v1", model: "diary-model" } },
+    diaryService: { async finalize() { return { screenshotPath: path.join(dir, "shot.png"), warnings: [] }; } },
+    fetchImpl: async (url, init) => {
+      calls += 1;
+      const body = JSON.parse(init.body);
+      assert.match(body.messages[0].content, /均为成年人/);
+      if (calls === 1) return { ok: false, status: 400, async text() { return JSON.stringify({ error: { message: "inappropriate content" } }); } };
+      assert.doesNotMatch(body.messages[1].content, /做爱/);
+      return { ok: true, async text() { return JSON.stringify({ choices: [{ message: { content: JSON.stringify({ markdown }) } }] }); } };
+    },
+  });
+  const result = await service.process({ date: "2026-08-25" });
+  assert.equal(calls, 2);
+  assert.match(result.warnings.join("\n"), /已跳过触发内容/);
+});

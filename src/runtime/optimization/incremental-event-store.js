@@ -79,6 +79,16 @@ class IncrementalEventStore {
     return Math.max(0, Number(this.state.cursors[cursorKey(consumer, scope)]) || 0);
   }
 
+  readDate({ scope = "", date = "", limit = 500 } = {}) {
+    this.load();
+    const normalizedScope = normalizeText(scope);
+    const normalizedDate = /^\d{4}-\d{2}-\d{2}$/.test(normalizeText(date)) ? normalizeText(date) : "";
+    if (!normalizedScope || !normalizedDate) return [];
+    return clone(this.state.events
+      .filter((event) => event.scope === normalizedScope && formatShanghaiDate(event.at) === normalizedDate)
+      .slice(-clampInteger(limit, 1, 1_000)));
+  }
+
   save() { writeJsonFileAtomicSync(this.filePath, this.state); }
 }
 
@@ -111,6 +121,7 @@ function normalizeMetadata(value) {
 }
 function cursorKey(consumer, scope) { const left = normalizeText(consumer); const right = normalizeText(scope); return left && right ? `${left}::${right}` : ""; }
 function normalizeIso(value) { const parsed = Date.parse(normalizeText(value)); return Number.isFinite(parsed) ? new Date(parsed).toISOString() : ""; }
+function formatShanghaiDate(value) { return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value)); }
 function normalizeText(value) { return typeof value === "string" ? value.trim() : ""; }
 function clampInteger(value, min, max) { const parsed = Number.parseInt(value, 10); return Math.max(min, Math.min(max, Number.isFinite(parsed) ? parsed : min)); }
 function clone(value) { return JSON.parse(JSON.stringify(value)); }

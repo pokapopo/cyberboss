@@ -38,8 +38,22 @@ function createModelRequestEnvelope(input = {}) {
     capabilities: normalizeStrings(input.capabilities),
     fixedPrefixFingerprint: text(input.fixedPrefixFingerprint),
     toolCatalogFingerprint: text(input.toolCatalogFingerprint),
+    contextBreakdown: normalizeContextBreakdown(input.contextBreakdown),
     retryPolicy: normalizeRetryPolicy(input.retryPolicy),
   };
+}
+
+function normalizeContextBreakdown(value = {}) {
+  return {
+    systemPromptChars: positiveInteger(value.systemPromptChars),
+    toolCatalogChars: positiveInteger(value.toolCatalogChars),
+    toolCount: positiveInteger(value.toolCount),
+  };
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
 }
 
 function normalizeRetryPolicy(value = {}) {

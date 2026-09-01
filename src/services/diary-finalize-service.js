@@ -2,12 +2,14 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { PRIVATE_ADULT_ARCHIVE_CONTEXT, filterSensitiveArchiveLines } = require("../core/private-archive-context");
 const { readJsonFileSync, withFileLockSync, writeJsonFileAtomicSync } = require("../core/json-state-file");
 const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
 const { validateFinalDiaryMarkdown } = require("./diary-service");
 
 const SYSTEM_PROMPT = [
   "你是 CC 的正式日记收尾器。把当天已有增量碎片整理成 CC 第一人称写给 uu 的完整日记。",
+  ...PRIVATE_ADULT_ARCHIVE_CONTEXT,
   "只能使用草稿里的事实；可以润色、合并和表达感受，不得虚构事件。草稿很少时也必须诚实地完成当天收尾。",
   "使用 1 到 4 个 `## <自然口语时段标题>`，正文连续，不保留时间戳标题。",
   "最后必须有且只有一个 `## CC 的想法`，内容具体、有第一人称反思并直接面向 uu；此后不得有内容。",
@@ -46,7 +48,7 @@ class DiaryFinalizeService {
       task, requestedModel: generation.model,
       fixedPrefixFingerprint: crypto.createHash("sha256").update(SYSTEM_PROMPT).digest("hex"), retryPolicy: { maxAttempts: 1 },
     });
-    const invoke = () => callModel({ fetchImpl: this.fetchImpl, generation, date: dateString, draft });
+    const invoke = () => callModelWithContentSkip({ fetchImpl: this.fetchImpl, generation, date: dateString, draft });
     const completed = this.modelGateway
       ? await this.modelGateway.invoke(request, invoke)
       : { status: "completed", result: await invoke() };
@@ -55,7 +57,9 @@ class DiaryFinalizeService {
     const markdown = validateModelResult(completed.result.content);
     const finalized = await this.diaryService.finalize({ date: dateString, markdown });
     this.writeReceipt(dateString, { status: "finalized", screenshotPath: finalized.screenshotPath, finalizedAt: this.now().toISOString(), deliveredAt: "" });
-    return { status: "finalized", date: dateString, screenshotPath: finalized.screenshotPath, needsDelivery: true, reused: false, warnings: finalized.warnings };
+    const warnings = [...(finalized.warnings || [])];
+    if (completed.result.skippedSensitiveContent) warnings.push("供应商拒绝敏感草稿后，收尾已跳过触发内容。");
+    return { status: "finalized", date: dateString, screenshotPath: finalized.screenshotPath, needsDelivery: true, reused: false, warnings };
   }
 
   recordDelivered(date) {
@@ -76,6 +80,18 @@ class DiaryFinalizeService {
       state.dates[date] = receipt;
       writeJsonFileAtomicSync(this.stateFile, state);
     });
+  }
+}
+
+async function callModelWithContentSkip(input) {
+  try {
+    return await callModel(input);
+  } catch (error) {
+    if (error?.code !== "inappropriate_content") throw error;
+    const filteredDraft = filterSensitiveArchiveLines(input.draft);
+    const retryDraft = filteredDraft && filteredDraft !== text(input.draft) ? filteredDraft : "";
+    const result = await callModel({ ...input, draft: retryDraft });
+    return { ...result, skippedSensitiveContent: true };
   }
 }
 
@@ -100,7 +116,14 @@ async function callModel({ fetchImpl, generation, date, draft }) {
     const raw = await response.text();
     let parsed;
     try { parsed = raw ? JSON.parse(raw) : null; } catch {}
-    if (!response.ok) throw new Error(`Diary finalize model request failed (${response.status}): ${text(parsed?.error?.message) || raw.slice(0, 500)}`);
+    if (!response.ok) {
+      const message = text(parsed?.error?.message) || raw.slice(0, 500);
+      const error = new Error(`Diary finalize model request failed (${response.status}): ${message}`);
+      if (response.status === 400 && /inappropriate|content.?policy|safety|审核|不适宜/i.test(message)) {
+        error.code = "inappropriate_content";
+      }
+      throw error;
+    }
     const content = parsed?.choices?.[0]?.message?.content;
     if (!text(content)) throw new Error("Diary finalize model returned empty content.");
     return { id: parsed?.id, content, usage: parsed?.usage || {} };

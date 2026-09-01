@@ -231,7 +231,8 @@ async function main() {
   if (command === "tool-mcp-server") {
     const runtimeId = readFlagValue(argv.slice(1), "--runtime-id") || "";
     const workspaceRoot = readFlagValue(argv.slice(1), "--workspace-root") || process.cwd();
-    const { toolHost } = createProjectTooling(config);
+    const toolSurface = readFlagValue(argv.slice(1), "--tool-surface") || "legacy";
+    const { toolHost } = createProjectTooling(config, { toolSurface });
     runToolMcpServer({ toolHost, runtimeId, workspaceRoot });
     return;
   }

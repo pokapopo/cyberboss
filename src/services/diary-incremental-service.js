@@ -1,9 +1,11 @@
 const crypto = require("node:crypto");
 
+const { PRIVATE_ADULT_ARCHIVE_CONTEXT, isLikelySensitiveArchiveText } = require("../core/private-archive-context");
 const { createTaskEnvelope, createModelRequestEnvelope } = require("../runtime/optimization/task-envelope");
 
 const SYSTEM_PROMPT = [
   "你是 Cyberboss 的增量日记整理器，只生成当天尚未收尾的事实碎片。",
+  ...PRIVATE_ADULT_ARCHIVE_CONTEXT,
   "日记由 CC 第一人称写给 uu：保留共同经历、CC 注意到的情绪和想对她说的话，避免流水账。",
   "只能依据输入的 DELTA EVENTS；不得补充、猜测或虚构事实。",
   "这是原始碎片，不是最终日记：不得输出 Markdown 标题、日期、签名或 `CC 的想法` 收尾。",
@@ -46,7 +48,7 @@ class DiaryIncrementalService {
       fixedPrefixFingerprint: crypto.createHash("sha256").update(SYSTEM_PROMPT).digest("hex"),
       retryPolicy: { maxAttempts: 1 },
     });
-    const invoke = async () => callDiaryModel({
+    const invoke = async () => callDiaryModelWithContentSkip({
       fetchImpl: this.fetchImpl,
       generation,
       events: batch.events,
@@ -79,13 +81,45 @@ class DiaryIncrementalService {
       });
     }
     return {
-      status: "completed",
+      status: modelResult.skippedEventIds?.length ? "completed_with_content_skip" : "completed",
       processedCursor: Number(batch.events.at(-1)?.seq) || 0,
       processedEventCount: batch.events.length,
       appended: Boolean(decision.shouldAppend),
+      skippedEventCount: modelResult.skippedEventIds?.length || 0,
+      skippedEventIds: modelResult.skippedEventIds || [],
       appendResult,
       date: batch.date,
     };
+  }
+}
+
+async function callDiaryModelWithContentSkip(input) {
+  try {
+    return await callDiaryModel(input);
+  } catch (error) {
+    if (error?.code !== "inappropriate_content") throw error;
+    const skippedEvents = input.events.filter((event) => isLikelySensitiveArchiveText(event.text));
+    const safeEvents = input.events.filter((event) => !skippedEvents.includes(event));
+    if (!skippedEvents.length || !safeEvents.length) {
+      return {
+        id: "",
+        content: JSON.stringify({ shouldAppend: false, entry: "", title: "", sourceEventIds: [] }),
+        usage: {},
+        skippedEventIds: input.events.map((event) => event.id),
+      };
+    }
+    try {
+      const result = await callDiaryModel({ ...input, events: safeEvents });
+      return { ...result, skippedEventIds: skippedEvents.map((event) => event.id) };
+    } catch (retryError) {
+      if (retryError?.code !== "inappropriate_content") throw retryError;
+      return {
+        id: "",
+        content: JSON.stringify({ shouldAppend: false, entry: "", title: "", sourceEventIds: [] }),
+        usage: {},
+        skippedEventIds: input.events.map((event) => event.id),
+      };
+    }
   }
 }
 
@@ -137,7 +171,12 @@ async function callDiaryModel({ fetchImpl, generation, events }) {
     let parsed = null;
     try { parsed = raw ? JSON.parse(raw) : null; } catch {}
     if (!response.ok) {
-      throw new Error(`Diary model request failed (${response.status}): ${normalizeText(parsed?.error?.message) || raw.slice(0, 500)}`);
+      const message = normalizeText(parsed?.error?.message) || raw.slice(0, 500);
+      const error = new Error(`Diary model request failed (${response.status}): ${message}`);
+      if (response.status === 400 && /inappropriate|content.?policy|safety|审核|不适宜/i.test(message)) {
+        error.code = "inappropriate_content";
+      }
+      throw error;
     }
     const content = parsed?.choices?.[0]?.message?.content;
     if (!normalizeText(content)) throw new Error("Diary model returned empty content.");

@@ -205,7 +205,7 @@ function executeNcp({ command, cwd, timeoutMs, call, maxOutputChars = 64_000 }) 
         NCP_ENABLE_SKILLS: "true",
         NCP_ENABLE_PHOTON_RUNTIME: "true",
         NCP_ENABLE_SCHEDULE_MCP: "false",
-        NCP_ENABLE_MCP_MANAGEMENT: "true",
+        NCP_ENABLE_MCP_MANAGEMENT: "false",
         NCP_DIRECT_RUN: "true",
       },
     });

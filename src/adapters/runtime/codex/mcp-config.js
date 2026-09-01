@@ -13,7 +13,7 @@ function resolveCodexProjectToolMcpServerConfig({ cyberbossHome = "" } = {}) {
   return {
     name: "cyberboss_tools",
     command: process.execPath,
-    args: [scriptPath, "tool-mcp-server", "--runtime-id", "codex"],
+    args: [scriptPath, "tool-mcp-server", "--runtime-id", "codex", "--tool-surface", "legacy"],
   };
 }
 

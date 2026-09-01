@@ -77,3 +77,31 @@ test("one-shot diary rejects final-format headings and unknown evidence", () => 
     shouldAppend: true, entry: "一段正文", title: "", sourceEventIds: ["missing"],
   }), events), /unknown source event/);
 });
+
+test("one-shot diary skips a rejected adult item and continues with safe events", async () => {
+  let calls = 0;
+  const appends = [];
+  const service = new DiaryIncrementalService({
+    config: { diaryGeneration: { apiBaseUrl: "https://example.test/v1", model: "diary-model" } },
+    diaryService: { async append(args) { appends.push(args); return {}; } },
+    fetchImpl: async (url, init) => {
+      calls += 1;
+      const body = JSON.parse(init.body);
+      assert.match(body.messages[0].content, /均为成年人/);
+      if (calls === 1) {
+        return { ok: false, status: 400, async text() { return JSON.stringify({ error: { message: "Input data may contain inappropriate content" } }); } };
+      }
+      assert.doesNotMatch(body.messages[1].content, /做爱/);
+      return { ok: true, async text() { return JSON.stringify({ choices: [{ message: { content: JSON.stringify({ shouldAppend: true, entry: "后来出去吃了饭。", title: "出门吃饭", sourceEventIds: ["safe"] }) } }] }); } };
+    },
+  });
+  const result = await service.process({ events: [
+    { id: "adult", seq: 1, at: "2026-08-25T02:00:00Z", kind: "weixin.user", text: "刚才在做爱" },
+    { id: "safe", seq: 2, at: "2026-08-25T03:00:00Z", kind: "weixin.user", text: "后来出去吃饭" },
+  ] });
+  assert.equal(calls, 2);
+  assert.equal(result.status, "completed_with_content_skip");
+  assert.equal(result.skippedEventCount, 1);
+  assert.equal(result.processedCursor, 2);
+  assert.equal(appends.length, 1);
+});

@@ -1,8 +1,9 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { writeJsonFileAtomicSync } = require("../../../core/json-state-file");
 
-function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "" } = {}) {
+function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "", stateDir = "" } = {}) {
   const normalizedWorkspaceRoot = normalizeText(workspaceRoot);
   if (!normalizedWorkspaceRoot) {
     throw new Error("workspaceRoot is required to configure Claude project tools.");
@@ -10,10 +11,22 @@ function ensureClaudeProjectMcpConfig({ workspaceRoot, cyberbossHome = "" } = {}
 
   const configPath = path.join(normalizedWorkspaceRoot, ".mcp.json");
   const current = readJsonObject(configPath);
+  const currentServers = current.mcpServers && typeof current.mcpServers === "object" ? current.mcpServers : {};
+  const nextServers = { ...currentServers };
+  const stableCore = process.env.CYBERBOSS_MAIN_TOOL_SURFACE === "core-v1";
+  const retireDynamicDiscovery = stableCore && normalizeText(process.env.ENABLE_TOOL_SEARCH).toLowerCase() === "false";
+  if (retireDynamicDiscovery && nextServers["ombre-brain"]) {
+    const privateStateDir = normalizeText(stateDir) || process.env.CYBERBOSS_STATE_DIR || path.join(os.homedir(), ".cyberboss");
+    fs.mkdirSync(privateStateDir, { recursive: true });
+    const upstreamFile = path.join(privateStateDir, "ombre-upstream.json");
+    writeJsonFileAtomicSync(upstreamFile, nextServers["ombre-brain"]);
+    fs.chmodSync(upstreamFile, 0o600);
+    delete nextServers["ombre-brain"];
+  }
   const next = {
     ...current,
     mcpServers: {
-      ...(current.mcpServers && typeof current.mcpServers === "object" ? current.mcpServers : {}),
+      ...nextServers,
       cyberboss_tools: buildClaudeProjectMcpServerConfig({
         workspaceRoot: normalizedWorkspaceRoot,
         cyberbossHome,
@@ -41,7 +54,11 @@ function buildClaudeProjectMcpServerConfig({ workspaceRoot, cyberbossHome = "" }
   }
   return {
     command: process.execPath,
-    args: [scriptPath, "tool-mcp-server", "--runtime-id", "claudecode", "--workspace-root", normalizedWorkspaceRoot],
+    args: [
+      scriptPath, "tool-mcp-server", "--runtime-id", "claudecode",
+      "--workspace-root", normalizedWorkspaceRoot,
+      "--tool-surface", process.env.CYBERBOSS_MAIN_TOOL_SURFACE === "core-v1" ? "core-v1" : "legacy",
+    ],
   };
 }
 

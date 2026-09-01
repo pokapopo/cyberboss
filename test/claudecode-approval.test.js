@@ -1150,6 +1150,93 @@ test("interactive guard cancels on the third scoped recovery call and deduplicat
   assert.deepEqual(cancellations, ["interactive_tool_limit:3/2", "interactive_token_limit:61/60"]);
 });
 
+test("interactive guard discounts cached input and handles Codex snapshots cumulatively", async () => {
+  const runKey = "thread-budget::turn-budget";
+  const request = { task: { source: "user_chat" } };
+  const cancellations = [];
+  const appLike = {
+    interactiveGuardByRunKey: new Map(),
+    async cancelInteractiveGuard(payload) {
+      cancellations.push(payload.reason);
+      payload.guard.cancelRequested = true;
+      return true;
+    },
+  };
+  const usageEvent = (payload) => ({
+    payload: {
+      threadId: "thread-budget",
+      turnId: "turn-budget",
+      ...payload,
+    },
+  });
+
+  const claudeGuard = {
+    hardTokens: 250_000,
+    tokens: 0,
+    usageEventIds: new Set(),
+    cancelRequested: false,
+  };
+  appLike.interactiveGuardByRunKey.set(runKey, claudeGuard);
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, {
+    event: usageEvent({
+      runtimeId: "claudecode",
+      usageEventId: "claude-one",
+      currentTokens: 160_273,
+      cacheReadInputTokens: 26_368,
+    }),
+    request,
+    runKey,
+  });
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, {
+    event: usageEvent({
+      runtimeId: "claudecode",
+      usageEventId: "claude-two",
+      currentTokens: 160_974,
+      cacheReadInputTokens: 160_256,
+    }),
+    request,
+    runKey,
+  });
+  assert.equal(claudeGuard.tokens, 134_623);
+  assert.deepEqual(cancellations, []);
+
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, {
+    event: usageEvent({
+      runtimeId: "claudecode",
+      usageEventId: "claude-three",
+      currentTokens: 120_000,
+      cacheReadInputTokens: 0,
+    }),
+    request,
+    runKey,
+  });
+  assert.deepEqual(cancellations, ["interactive_token_limit:254623/250000"]);
+
+  const codexGuard = {
+    hardTokens: 100,
+    tokens: 0,
+    usageEventIds: new Set(),
+    cancelRequested: false,
+  };
+  appLike.interactiveGuardByRunKey.set(runKey, codexGuard);
+  cancellations.length = 0;
+  for (const [currentTokens, cachedInputTokens] of [[60, 20], [90, 30]]) {
+    await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, {
+      event: usageEvent({ runtimeId: "codex", currentTokens, cachedInputTokens }),
+      request,
+      runKey,
+    });
+  }
+  assert.equal(codexGuard.tokens, 60);
+  assert.deepEqual(cancellations, []);
+  await CyberbossApp.prototype.enforceInteractiveTokenLimit.call(appLike, {
+    event: usageEvent({ runtimeId: "codex", currentTokens: 130, cachedInputTokens: 20 }),
+    request,
+    runKey,
+  });
+  assert.deepEqual(cancellations, ["interactive_token_limit:110/100"]);
+});
+
 test("handleCompactCommand invokes runtime compaction for the current thread", async () => {
   const calls = [];
   const appLike = {

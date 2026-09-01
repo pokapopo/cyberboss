@@ -26,3 +26,17 @@ test("incremental consumers commit independent cursors and deduplicate event ids
   const reloaded = new IncrementalEventStore({ filePath });
   assert.equal(reloaded.getCursor({ consumer: "checkin", scope: "scope" }), checkin.cursor);
 });
+
+test("incremental store can read one Shanghai day without changing any consumer cursor", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-delta-day-"));
+  const store = new IncrementalEventStore({ filePath: path.join(dir, "events.json") });
+  store.append({ id: "before", scope: "scope", kind: "weixin.user", text: "before", at: "2026-08-24T15:59:00Z" });
+  store.append({ id: "today", scope: "scope", kind: "weixin.user", text: "today", at: "2026-08-24T16:01:00Z" });
+  store.append({ id: "other", scope: "other", kind: "weixin.user", text: "other", at: "2026-08-24T16:02:00Z" });
+  store.commit({ consumer: "diary_incremental", scope: "scope", cursor: 2 });
+
+  const events = store.readDate({ scope: "scope", date: "2026-08-25" });
+  assert.deepEqual(events.map((event) => event.id), ["today"]);
+  assert.equal(store.getCursor({ consumer: "diary_incremental", scope: "scope" }), 2);
+  assert.equal(store.getCursor({ consumer: "timeline_incremental", scope: "scope" }), 0);
+});

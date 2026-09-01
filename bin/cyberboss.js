@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+if (!process.env.CYBERBOSS_MAIN_TOOL_SURFACE) {
+  process.env.CYBERBOSS_MAIN_TOOL_SURFACE = "core-v1";
+}
+
 const { main } = require("../src/index");
 
 main().catch((error) => {

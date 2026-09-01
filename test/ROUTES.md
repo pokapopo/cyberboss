@@ -11,7 +11,8 @@ Use the smallest relevant route while iterating, then run `npm test` before hand
 | `src/adapters/runtime/codex/` | `test/codex-rpc-client.test.js`, `test/codex-reconnect.test.js`, `test/codex-approval.test.js` |
 | `src/adapters/runtime/claudecode/` | `test/claudecode-approval.test.js`, `test/claudecode-project-settings.test.js` |
 | Project tools / MCP host | `test/tool-host.test.js` |
-| Timeline integration/service | `test/timeline-integration.test.js`, `test/timeline-service.test.js` |
+| Native NCP registry, workspace boundary, or Ombré facade | `test/ncp-native.test.js`, `test/ncp-native-server.test.js`, `test/ombre-core.test.js`, `test/tool-host.test.js` |
+| Timeline integration/service | `test/timeline-integration.test.js`, `test/timeline-service.test.js`, `test/timeline-incremental-service.test.js` |
 | Stickers | `test/sticker-service.test.js` |
 | Check-in and background system messages | `test/checkin-config.test.js`, `test/system-inbound.test.js` |
 | CLI, startup, PID handling | `test/index.test.js`, `test/command-cli.test.js` |

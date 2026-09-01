@@ -183,6 +183,13 @@ const COMMAND_GROUPS = [
         status: "active",
       },
       {
+        action: "model.effort",
+        summary: "Inspect or set Claude thinking effort for this chat",
+        terminal: [],
+        weixin: ["/effort", "/effort <low|medium|high|max>"],
+        status: "active",
+      },
+      {
         action: "channel.send_file",
         summary: "Send a local file back to the current chat as an attachment",
         terminal: [],

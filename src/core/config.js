@@ -100,6 +100,15 @@ function readConfig() {
       maxFinalizeInputChars: readIntEnv("CYBERBOSS_DIARY_FINALIZE_MAX_INPUT_CHARS") || 24_000,
       maxFinalizeOutputTokens: readIntEnv("CYBERBOSS_DIARY_FINALIZE_MAX_OUTPUT_TOKENS") || 1_800,
     },
+    timelineGeneration: {
+      apiBaseUrl: readTextEnv("CYBERBOSS_TIMELINE_API_BASE_URL") || readTextEnv("CYBERBOSS_DIARY_API_BASE_URL") || visionApiBaseUrl,
+      apiKey: readTextEnv("CYBERBOSS_TIMELINE_API_KEY") || readTextEnv("CYBERBOSS_DIARY_API_KEY") || visionApiKey,
+      model: readTextEnv("CYBERBOSS_TIMELINE_MODEL") || readTextEnv("CYBERBOSS_DIARY_MODEL") || readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "deepseek-v4-flash",
+      timeoutMs: readIntEnv("CYBERBOSS_TIMELINE_TIMEOUT_MS") || 45_000,
+      maxEventChars: readIntEnv("CYBERBOSS_TIMELINE_MAX_EVENT_CHARS") || 16_000,
+      maxFinalizeEventChars: readIntEnv("CYBERBOSS_TIMELINE_FINALIZE_MAX_EVENT_CHARS") || 32_000,
+      maxOutputTokens: readIntEnv("CYBERBOSS_TIMELINE_MAX_OUTPUT_TOKENS") || 1_600,
+    },
     checkinGeneration: {
       apiBaseUrl: readTextEnv("CYBERBOSS_CHECKIN_API_BASE_URL") || readTextEnv("CYBERBOSS_DIARY_API_BASE_URL") || visionApiBaseUrl,
       apiKey: readTextEnv("CYBERBOSS_CHECKIN_API_KEY") || readTextEnv("CYBERBOSS_DIARY_API_KEY") || visionApiKey,

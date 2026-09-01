@@ -77,6 +77,7 @@ class ModelGateway {
       estimatedCostMicros: estimateCostMicros(usage, this.prices[selectedModel]),
       fixedPrefixFingerprint: envelope.fixedPrefixFingerprint,
       toolCatalogFingerprint: envelope.toolCatalogFingerprint,
+      contextBreakdown: envelope.contextBreakdown,
       recordedAt: new Date().toISOString(),
       eventType: "usage",
     };
@@ -109,6 +110,7 @@ class ModelGateway {
       estimatedCostMicros: 0,
       fixedPrefixFingerprint: envelope.fixedPrefixFingerprint,
       toolCatalogFingerprint: envelope.toolCatalogFingerprint,
+      contextBreakdown: envelope.contextBreakdown,
       recordedAt: new Date().toISOString(),
       eventType: "lifecycle",
       retryCount,

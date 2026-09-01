@@ -1,9 +1,21 @@
+const { PRIVATE_ADULT_ARCHIVE_CONTEXT } = require("./private-archive-context");
+
 const PIPELINE_KINDS = Object.freeze({
   DIARY_INCREMENTAL: "diary_incremental",
   TIMELINE_INCREMENTAL: "timeline_incremental",
   DIARY_FINALIZE: "diary_finalize",
   TIMELINE_FINALIZE: "timeline_finalize",
 });
+
+const TIMELINE_INTERPRETATION_RULES = Object.freeze([
+  "Use only the supplied DELTA EVENTS and current-day state. Do not write the diary.",
+  "Treat stable event ids as authoritative evidence and cite every supporting sourceEventId.",
+  "Recognize concrete activities, moods/states, completed work, and transitions mentioned by uu or CC.",
+  "For transitions, pair defensible boundaries when possible: going to sleep starts sleep; waking ends it.",
+  "Use timePrecision=approximate when dialogue supports an approximate range; do not require exact timestamps.",
+  "Do not invent activities or times. Omit an event only when no defensible range can be inferred.",
+  "Preserve existing same-day events and avoid producing duplicates for the same activity range.",
+]);
 
 function buildDiaryIncrementalPrompt(timeHeader, events = [], hasMore = false) {
   return [...timeHeader,
@@ -25,7 +37,7 @@ function buildTimelineIncrementalPrompt(timeHeader, events = [], hasMore = false
   return [...timeHeader,
     "TIMELINE MODE — evidence capture and reconciliation only.",
     "",
-    "Use only DELTA EVENTS below. Do not write the diary in this turn.",
+    ...TIMELINE_INTERPRETATION_RULES,
     "Capture concrete activity evidence with its supporting sourceEventIds.",
     "For transitions use boundaryType and boundaryAt explicitly:",
     "- going to sleep at 05:02 is activityType=sleep, boundaryType=start",
@@ -39,6 +51,18 @@ function buildTimelineIncrementalPrompt(timeHeader, events = [], hasMore = false
     "",
     ...formatDeltaEvents(events, hasMore),
   ].join("\n").trim();
+}
+
+function buildTimelineOneShotSystemPrompt() {
+  return [
+    "你是 Cyberboss 的增量时间轴整理器，恢复 2026-08-02 的记录密度，同时保持证据边界。",
+    ...PRIVATE_ADULT_ARCHIVE_CONTEXT,
+    ...TIMELINE_INTERPRETATION_RULES,
+    "输出一个 JSON 对象：shouldWrite(boolean)、events(array)。",
+    "每个 event 必须包含 startAt、endAt、title、note、timePrecision、sourceEventIds；可选 categoryId、subcategoryId、eventNodeId、tags。",
+    "startAt/endAt 必须是带时区的 ISO 时间且 endAt 晚于 startAt。sourceEventIds 只能来自输入 DELTA EVENTS。",
+    "没有可写事件时 shouldWrite=false 且 events=[]。不要输出 Markdown 或 JSON 之外的文字。",
+  ].join("\n");
 }
 
 function buildTimelineFinalizePrompt(timeHeader) {
@@ -69,8 +93,10 @@ function clean(value) {
 
 module.exports = {
   PIPELINE_KINDS,
+  TIMELINE_INTERPRETATION_RULES,
   buildDiaryIncrementalPrompt,
   buildTimelineIncrementalPrompt,
+  buildTimelineOneShotSystemPrompt,
   buildTimelineFinalizePrompt,
   formatDeltaEvents,
 };
